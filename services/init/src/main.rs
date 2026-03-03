@@ -1,15 +1,98 @@
 #![no_std]
 #![no_main]
 
+use sotos_common::sys;
+use sotos_common::spsc;
+
+/// Shared memory page for the SPSC ring buffer.
+const RING_ADDR: u64 = 0xA00000;
+/// Producer thread stack base (1 page).
+const PRODUCER_STACK_BASE: u64 = 0xA10000;
+/// Producer thread stack top.
+const PRODUCER_STACK_TOP: u64 = PRODUCER_STACK_BASE + 0x1000;
+/// Number of messages to send through the ring.
+const MSG_COUNT: u64 = 1000;
+/// WRITABLE flag for map syscall (bit 1).
+const MAP_WRITABLE: u64 = 2;
+
+fn print(s: &[u8]) {
+    for &b in s {
+        sys::debug_print(b);
+    }
+}
+
+fn print_u64(mut n: u64) {
+    if n == 0 {
+        sys::debug_print(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 0;
+    while n > 0 {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        sys::debug_print(buf[i]);
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    for &b in b"ELF!\n" {
-        sotos_common::sys::debug_print(b);
+    // 1. Allocate and map shared page for ring buffer
+    let ring_frame = sys::frame_alloc().unwrap_or_else(|_| panic_halt());
+    sys::map(RING_ADDR, ring_frame, MAP_WRITABLE).unwrap_or_else(|_| panic_halt());
+
+    // 2. Create notification objects (empty = consumer waits, full = producer waits)
+    let empty_cap = sys::notify_create().unwrap_or_else(|_| panic_halt());
+    let full_cap = sys::notify_create().unwrap_or_else(|_| panic_halt());
+
+    // 3. Initialize SPSC ring at shared address
+    let ring = unsafe {
+        spsc::SpscRing::init(RING_ADDR as *mut u8, 128, empty_cap as u32, full_cap as u32)
+    };
+
+    // 4. Allocate and map producer stack
+    let stack_frame = sys::frame_alloc().unwrap_or_else(|_| panic_halt());
+    sys::map(PRODUCER_STACK_BASE, stack_frame, MAP_WRITABLE).unwrap_or_else(|_| panic_halt());
+
+    // 5. Spawn producer thread
+    let _thread_cap = sys::thread_create(producer as *const () as u64, PRODUCER_STACK_TOP)
+        .unwrap_or_else(|_| panic_halt());
+
+    // 6. Consumer loop: receive MSG_COUNT values and sum them
+    let mut sum: u64 = 0;
+    for _ in 0..MSG_COUNT {
+        sum += spsc::recv(ring);
     }
-    sotos_common::sys::thread_exit();
+
+    // 7. Print result: expected sum = 0+1+2+...+999 = 499500
+    print(b"SPSC: sum=");
+    print_u64(sum);
+    print(b"\n");
+
+    sys::thread_exit();
+}
+
+/// Producer entry point — runs in a separate thread, same address space.
+#[unsafe(no_mangle)]
+pub extern "C" fn producer() -> ! {
+    let ring = unsafe { spsc::SpscRing::from_ptr(RING_ADDR as *mut u8) };
+    for i in 0..MSG_COUNT {
+        spsc::send(ring, i);
+    }
+    sys::thread_exit();
+}
+
+fn panic_halt() -> ! {
+    print(b"PANIC\n");
+    loop {}
 }
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
+    print(b"PANIC\n");
     loop {}
 }

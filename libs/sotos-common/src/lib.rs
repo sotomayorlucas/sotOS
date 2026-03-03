@@ -6,6 +6,8 @@
 
 #![no_std]
 
+pub mod spsc;
+
 /// Syscall numbers. The kernel exposes exactly these operations.
 #[repr(u64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,10 +128,86 @@ pub mod sys {
         ret
     }
 
+    #[inline(always)]
+    pub fn syscall2(nr: u64, a1: u64, a2: u64) -> u64 {
+        let ret: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") nr => ret,
+                in("rdi") a1,
+                in("rsi") a2,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    #[inline(always)]
+    pub fn syscall3(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+        let ret: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") nr => ret,
+                in("rdi") a1,
+                in("rsi") a2,
+                in("rdx") a3,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
     /// Write a single byte to the kernel debug serial port.
     #[inline(always)]
     pub fn debug_print(byte: u8) {
         syscall1(super::Syscall::DebugPrint as u64, byte as u64);
+    }
+
+    /// Allocate a physical frame. Returns the frame capability ID.
+    #[inline(always)]
+    pub fn frame_alloc() -> Result<u64, i64> {
+        let ret = syscall0(super::Syscall::FrameAlloc as u64);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+    }
+
+    /// Map a frame into the caller's address space.
+    /// `flags`: bit 1 = WRITABLE, bit 63 = NO_EXECUTE.
+    #[inline(always)]
+    pub fn map(vaddr: u64, frame_cap: u64, flags: u64) -> Result<(), i64> {
+        let ret = syscall3(super::Syscall::Map as u64, vaddr, frame_cap, flags);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
+    /// Create a notification object. Returns the notification capability ID.
+    #[inline(always)]
+    pub fn notify_create() -> Result<u64, i64> {
+        let ret = syscall0(super::Syscall::NotifyCreate as u64);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+    }
+
+    /// Wait on a notification (blocks if not pending).
+    #[inline(always)]
+    pub fn notify_wait(cap: u64) {
+        syscall1(super::Syscall::NotifyWait as u64, cap);
+    }
+
+    /// Signal a notification (wakes waiter or sets pending).
+    #[inline(always)]
+    pub fn notify_signal(cap: u64) {
+        syscall1(super::Syscall::NotifySignal as u64, cap);
+    }
+
+    /// Create a new thread. Returns the thread capability ID.
+    #[inline(always)]
+    pub fn thread_create(rip: u64, rsp: u64) -> Result<u64, i64> {
+        let ret = syscall2(super::Syscall::ThreadCreate as u64, rip, rsp);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
     }
 
     /// Terminate the current thread (never returns).

@@ -108,6 +108,13 @@ fn msg_to_frame(frame: &mut TrapFrame, msg: &Message) {
 /// Main syscall dispatcher — called from assembly with IF=0.
 #[no_mangle]
 pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
+    // Save user RSP from per-CPU storage to the kernel stack.
+    // If this syscall blocks (context switch), another thread's syscall
+    // entry will overwrite percpu.user_rsp_save. This local survives the
+    // context switch because it lives on the per-thread kernel stack.
+    use crate::arch::x86_64::percpu;
+    let saved_user_rsp = percpu::current_percpu().user_rsp_save;
+
     match frame.rax {
         // SYS_YIELD — give up remaining timeslice
         0 => {
@@ -513,4 +520,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
             frame.rax = SysError::InvalidArg as i64 as u64;
         }
     }
+
+    // Restore user RSP to per-CPU storage before the asm exit path reads it.
+    percpu::current_percpu().user_rsp_save = saved_user_rsp;
 }
