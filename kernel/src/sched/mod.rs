@@ -7,8 +7,10 @@
 
 pub mod thread;
 
-pub use thread::{ThreadId, ThreadState};
+pub use thread::{IpcRole, ThreadId, ThreadState};
 use thread::{Thread, MAX_THREADS};
+
+use crate::ipc::endpoint::Message;
 
 use crate::kprintln;
 use spin::Mutex;
@@ -199,6 +201,103 @@ pub fn spawn_user(user_rip: u64, user_rsp: u64, cr3: u64) -> ThreadId {
     let tid = sched.threads[slot].id;
     sched.enqueue(slot);
     tid
+}
+
+/// Terminate the current thread and switch away.
+///
+/// Marks the current thread as Dead (so `schedule()` won't re-enqueue it),
+/// then calls `schedule()` to switch to the next runnable thread.
+pub fn exit_current() -> ! {
+    {
+        let mut sched = SCHEDULER.lock();
+        if let Some(idx) = sched.current {
+            sched.threads[idx].state = ThreadState::Dead;
+        }
+    }
+    schedule();
+    // Safety net if run queue was empty (idle thread should always be present).
+    crate::arch::halt_loop();
+}
+
+/// Return the current thread's ID.
+pub fn current_tid() -> Option<ThreadId> {
+    let sched = SCHEDULER.lock();
+    sched.current.map(|idx| sched.threads[idx].id)
+}
+
+/// Block the current thread (set to Blocked) and switch away.
+/// The caller must have already set the IPC state via `set_current_ipc()`.
+pub fn block_current() {
+    {
+        let mut sched = SCHEDULER.lock();
+        if let Some(idx) = sched.current {
+            sched.threads[idx].state = ThreadState::Blocked;
+        }
+    }
+    schedule();
+}
+
+/// Wake a blocked thread: set to Ready, reset timeslice, enqueue.
+pub fn wake(tid: ThreadId) {
+    let mut sched = SCHEDULER.lock();
+    for i in 0..MAX_THREADS {
+        if sched.threads[i].id == tid && sched.threads[i].state == ThreadState::Blocked {
+            sched.threads[i].state = ThreadState::Ready;
+            sched.threads[i].timeslice = TIMESLICE;
+            sched.enqueue(i);
+            return;
+        }
+    }
+}
+
+/// Store IPC state on the current thread before blocking.
+pub fn set_current_ipc(ep_id: u32, role: IpcRole, msg: Message) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(idx) = sched.current {
+        sched.threads[idx].ipc_endpoint = Some(ep_id);
+        sched.threads[idx].ipc_role = role;
+        sched.threads[idx].ipc_msg = msg;
+    }
+}
+
+/// Clear IPC state on the current thread after waking.
+pub fn clear_current_ipc() {
+    let mut sched = SCHEDULER.lock();
+    if let Some(idx) = sched.current {
+        sched.threads[idx].ipc_endpoint = None;
+        sched.threads[idx].ipc_role = IpcRole::None;
+    }
+}
+
+/// Write a message into a specific thread's IPC buffer.
+pub fn write_ipc_msg(tid: ThreadId, msg: Message) {
+    let mut sched = SCHEDULER.lock();
+    for i in 0..MAX_THREADS {
+        if sched.threads[i].id == tid {
+            sched.threads[i].ipc_msg = msg;
+            return;
+        }
+    }
+}
+
+/// Read the message from a specific thread's IPC buffer.
+pub fn read_ipc_msg(tid: ThreadId) -> Message {
+    let sched = SCHEDULER.lock();
+    for i in 0..MAX_THREADS {
+        if sched.threads[i].id == tid {
+            return sched.threads[i].ipc_msg;
+        }
+    }
+    Message::empty()
+}
+
+/// Read the current thread's own IPC message buffer (after being woken).
+pub fn current_ipc_msg() -> Message {
+    let sched = SCHEDULER.lock();
+    if let Some(idx) = sched.current {
+        return sched.threads[idx].ipc_msg;
+    }
+    Message::empty()
 }
 
 /// Called from the timer interrupt handler on every tick.

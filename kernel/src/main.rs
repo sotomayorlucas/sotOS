@@ -14,6 +14,7 @@
 mod arch;
 mod cap;
 mod ipc;
+mod irq;
 mod mm;
 mod panic;
 mod sched;
@@ -114,51 +115,106 @@ extern "C" fn kmain() -> ! {
     }
 }
 
-/// Create the user address space and spawn the init process.
+/// Create the user address space and spawn two threads for IPC testing.
+///
+/// - Sender at 0x400000: prints "INIT\n", sends IPC message, prints "OK\n"
+/// - Receiver at 0x401000: receives IPC message, prints "IPC!\n"
+/// - Both share one address space and one IPC endpoint (ep 0).
+/// - Receiver spawned first so it blocks on Recv before sender runs.
 fn spawn_init_process() {
     use mm::paging::{AddressSpace, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
 
     let addr_space = AddressSpace::new_user();
+    let hhdm = mm::hhdm_offset();
+    let cr3 = addr_space.cr3();
 
-    // Copy init code into a user-accessible page.
-    let code = user_init::init_code();
-    let code_frame = mm::alloc_frame().expect("no frame for init code");
-    let code_phys = code_frame.addr();
-    let code_virt_hhdm = code_phys + mm::hhdm_offset();
+    // --- Copy sender code to 0x400000 ---
+    let sender_code = user_init::init_code();
+    let sender_frame = mm::alloc_frame().expect("no frame for sender code");
+    let sender_phys = sender_frame.addr();
     unsafe {
-        // Zero the page first, then copy code.
-        core::ptr::write_bytes(code_virt_hhdm as *mut u8, 0, 4096);
-        core::ptr::copy_nonoverlapping(code.as_ptr(), code_virt_hhdm as *mut u8, code.len());
+        core::ptr::write_bytes((sender_phys + hhdm) as *mut u8, 0, 4096);
+        core::ptr::copy_nonoverlapping(
+            sender_code.as_ptr(),
+            (sender_phys + hhdm) as *mut u8,
+            sender_code.len(),
+        );
     }
+    let sender_addr: u64 = 0x400000;
+    addr_space.map_page(sender_addr, sender_phys, PAGE_PRESENT | PAGE_USER);
 
-    // Map code at 0x400000 (user, present, not writable).
-    let user_code_addr: u64 = 0x400000;
-    addr_space.map_page(user_code_addr, code_phys, PAGE_PRESENT | PAGE_USER);
-
-    // Allocate and map a user stack page at 0x800000.
-    let stack_frame = mm::alloc_frame().expect("no frame for init stack");
-    let stack_phys = stack_frame.addr();
-    // Zero the stack page.
+    // --- Copy receiver code to 0x401000 ---
+    let recv_code = user_init::recv_code();
+    let recv_frame = mm::alloc_frame().expect("no frame for receiver code");
+    let recv_phys = recv_frame.addr();
     unsafe {
-        core::ptr::write_bytes((stack_phys + mm::hhdm_offset()) as *mut u8, 0, 4096);
+        core::ptr::write_bytes((recv_phys + hhdm) as *mut u8, 0, 4096);
+        core::ptr::copy_nonoverlapping(
+            recv_code.as_ptr(),
+            (recv_phys + hhdm) as *mut u8,
+            recv_code.len(),
+        );
     }
+    let recv_addr: u64 = 0x401000;
+    addr_space.map_page(recv_addr, recv_phys, PAGE_PRESENT | PAGE_USER);
 
-    let user_stack_base: u64 = 0x800000;
-    addr_space.map_page(
-        user_stack_base,
-        stack_phys,
-        PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER,
-    );
+    // --- Allocate sender stack at 0x800000 ---
+    let stack1_frame = mm::alloc_frame().expect("no frame for sender stack");
+    let stack1_phys = stack1_frame.addr();
+    unsafe {
+        core::ptr::write_bytes((stack1_phys + hhdm) as *mut u8, 0, 4096);
+    }
+    let stack1_base: u64 = 0x800000;
+    addr_space.map_page(stack1_base, stack1_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+    let stack1_top = stack1_base + 0x1000;
 
-    // Stack grows downward — top is base + 4 KiB.
-    let user_stack_top = user_stack_base + 0x1000;
+    // --- Allocate receiver stack at 0x802000 ---
+    let stack2_frame = mm::alloc_frame().expect("no frame for receiver stack");
+    let stack2_phys = stack2_frame.addr();
+    unsafe {
+        core::ptr::write_bytes((stack2_phys + hhdm) as *mut u8, 0, 4096);
+    }
+    let stack2_base: u64 = 0x802000;
+    addr_space.map_page(stack2_base, stack2_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+    let stack2_top = stack2_base + 0x1000;
+
+    // --- Create IPC endpoint 0 ---
+    let ep = ipc::endpoint::create().expect("failed to create endpoint");
+    kprintln!("  ipc: endpoint {} created", ep.0);
 
     kprintln!(
-        "  init: code @ {:#x}, stack @ {:#x}, cr3 = {:#x}",
-        user_code_addr,
-        user_stack_top,
-        addr_space.cr3()
+        "  init: receiver @ {:#x}, sender @ {:#x}, cr3 = {:#x}",
+        recv_addr, sender_addr, cr3
     );
 
-    sched::spawn_user(user_code_addr, user_stack_top, addr_space.cr3());
+    // --- Copy keyboard driver code to 0x402000 ---
+    let kb_code = user_init::kb_code();
+    let kb_frame = mm::alloc_frame().expect("no frame for kb code");
+    let kb_phys = kb_frame.addr();
+    unsafe {
+        core::ptr::write_bytes((kb_phys + hhdm) as *mut u8, 0, 4096);
+        core::ptr::copy_nonoverlapping(
+            kb_code.as_ptr(),
+            (kb_phys + hhdm) as *mut u8,
+            kb_code.len(),
+        );
+    }
+    let kb_addr: u64 = 0x402000;
+    addr_space.map_page(kb_addr, kb_phys, PAGE_PRESENT | PAGE_USER);
+
+    // --- Allocate keyboard driver stack at 0x804000 ---
+    let stack3_frame = mm::alloc_frame().expect("no frame for kb stack");
+    let stack3_phys = stack3_frame.addr();
+    unsafe {
+        core::ptr::write_bytes((stack3_phys + hhdm) as *mut u8, 0, 4096);
+    }
+    let stack3_base: u64 = 0x804000;
+    addr_space.map_page(stack3_base, stack3_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+    let stack3_top = stack3_base + 0x1000;
+
+    // Spawn receiver FIRST — it will block on Recv(ep 0), then sender runs.
+    // Keyboard driver spawned last — it registers for IRQ 1 and blocks.
+    sched::spawn_user(recv_addr, stack2_top, cr3);
+    sched::spawn_user(sender_addr, stack1_top, cr3);
+    sched::spawn_user(kb_addr, stack3_top, cr3);
 }

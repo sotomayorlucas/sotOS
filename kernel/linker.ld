@@ -42,6 +42,14 @@ SECTIONS
         KEEP(*(.user_init))
     } :data
 
+    .user_recv : {
+        KEEP(*(.user_recv))
+    } :data
+
+    .user_kb : {
+        KEEP(*(.user_kb))
+    } :data
+
     .bss : {
         *(.bss .bss.*)
         *(COMMON)

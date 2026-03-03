@@ -40,6 +40,8 @@ pub enum Syscall {
     IrqRegister = 50,
     /// Acknowledge an IRQ.
     IrqAck = 51,
+    /// Read a byte from an I/O port (temporary debug).
+    PortIn = 60,
 }
 
 /// Error codes returned by syscalls.

@@ -81,6 +81,20 @@ pub fn unmask(irq: u8) {
     }
 }
 
+/// Mask (disable) a specific IRQ line.
+pub fn mask(irq: u8) {
+    unsafe {
+        if irq < 8 {
+            let val = inb(PIC1_DATA) | (1 << irq);
+            outb(PIC1_DATA, val);
+        } else {
+            let val = inb(PIC2_DATA) | (1 << (irq - 8));
+            outb(PIC2_DATA, val);
+            // Do NOT re-mask IRQ2 (cascade) — other slave IRQs may still be active.
+        }
+    }
+}
+
 /// Send End-Of-Interrupt to the appropriate PIC(s).
 pub fn send_eoi(irq: u8) {
     unsafe {

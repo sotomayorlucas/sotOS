@@ -61,6 +61,13 @@ fn alloc_table_frame() -> u64 {
     frame.addr()
 }
 
+/// Invalidate the TLB entry for a single page.
+pub fn invlpg(vaddr: u64) {
+    unsafe {
+        core::arch::asm!("invlpg [{}]", in(reg) vaddr, options(nostack, preserves_flags));
+    }
+}
+
 /// If the entry is present, extract its physical address.
 /// Otherwise allocate a new table frame, write the entry, and return its address.
 fn ensure_table(entry: &mut u64, flags: u64) -> u64 {
@@ -83,6 +90,11 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
+    /// Reconstruct an AddressSpace from a CR3 value.
+    pub fn from_cr3(cr3: u64) -> Self {
+        Self { pml4_phys: cr3 & !0xFFF }
+    }
+
     /// Create a new user address space.
     ///
     /// Allocates a fresh PML4 and copies the kernel-half entries (256..512)
@@ -140,5 +152,47 @@ impl AddressSpace {
         unsafe {
             *pt.add(pt_index(virt)) = (phys & !0xFFF) | flags;
         }
+    }
+
+    /// Unmap a single 4 KiB page.
+    ///
+    /// Walks the page table levels (read-only) and clears the leaf PTE.
+    /// Returns `true` if the page was present and has been unmapped,
+    /// `false` if the walk failed (missing intermediate table or PTE not present).
+    pub fn unmap_page(&self, virt: u64) -> bool {
+        let hhdm = hhdm_offset();
+
+        // PML4 → PDP
+        let pml4 = (self.pml4_phys + hhdm) as *const u64;
+        let pml4e = unsafe { *pml4.add(pml4_index(virt)) };
+        if pml4e & PAGE_PRESENT == 0 {
+            return false;
+        }
+        let pdp_phys = pml4e & 0x000F_FFFF_FFFF_F000;
+
+        // PDP → PD
+        let pdp = (pdp_phys + hhdm) as *const u64;
+        let pdpe = unsafe { *pdp.add(pdp_index(virt)) };
+        if pdpe & PAGE_PRESENT == 0 {
+            return false;
+        }
+        let pd_phys = pdpe & 0x000F_FFFF_FFFF_F000;
+
+        // PD → PT
+        let pd = (pd_phys + hhdm) as *const u64;
+        let pde = unsafe { *pd.add(pd_index(virt)) };
+        if pde & PAGE_PRESENT == 0 {
+            return false;
+        }
+        let pt_phys = pde & 0x000F_FFFF_FFFF_F000;
+
+        // Clear leaf PTE
+        let pt = (pt_phys + hhdm) as *mut u64;
+        let pte = unsafe { &mut *pt.add(pt_index(virt)) };
+        if *pte & PAGE_PRESENT == 0 {
+            return false;
+        }
+        *pte = 0;
+        true
     }
 }

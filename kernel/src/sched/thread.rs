@@ -4,7 +4,21 @@
 //! priority, and a reference to its capability space.
 
 use crate::cap::CapId;
+use crate::ipc::endpoint::Message;
 use crate::mm;
+
+/// IPC role of a thread (when blocked on an endpoint).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcRole {
+    /// Not participating in IPC.
+    None,
+    /// Blocked waiting to send.
+    Sender,
+    /// Blocked waiting to receive.
+    Receiver,
+    /// Blocked in a call (send then receive).
+    Caller,
+}
 
 /// Thread identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +86,12 @@ pub struct Thread {
     pub user_rsp: u64,
     /// Physical address of PML4 (0 = kernel thread, use boot CR3).
     pub cr3: u64,
+    /// IPC message buffer (carried by the thread while blocked).
+    pub ipc_msg: Message,
+    /// Endpoint this thread is blocked on (if any).
+    pub ipc_endpoint: Option<u32>,
+    /// IPC role while blocked.
+    pub ipc_role: IpcRole,
 }
 
 impl Thread {
@@ -89,6 +109,9 @@ impl Thread {
             user_rip: 0,
             user_rsp: 0,
             cr3: 0,
+            ipc_msg: Message::empty(),
+            ipc_endpoint: None,
+            ipc_role: IpcRole::None,
         }
     }
 
@@ -128,6 +151,9 @@ impl Thread {
             user_rip: 0,
             user_rsp: 0,
             cr3: 0,
+            ipc_msg: Message::empty(),
+            ipc_endpoint: None,
+            ipc_role: IpcRole::None,
         }
     }
 
@@ -172,6 +198,9 @@ impl Thread {
             user_rip,
             user_rsp,
             cr3,
+            ipc_msg: Message::empty(),
+            ipc_endpoint: None,
+            ipc_role: IpcRole::None,
         }
     }
 }
