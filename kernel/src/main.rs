@@ -178,9 +178,11 @@ fn spawn_init_process() {
     addr_space.map_page(stack2_base, stack2_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
     let stack2_top = stack2_base + 0x1000;
 
-    // --- Create IPC endpoint 0 ---
+    // --- Create IPC endpoint 0 and its root capability ---
     let ep = ipc::endpoint::create().expect("failed to create endpoint");
-    kprintln!("  ipc: endpoint {} created", ep.0);
+    let ep_cap = cap::insert(cap::CapObject::Endpoint { id: ep.0 }, cap::Rights::ALL, None)
+        .expect("failed to create endpoint cap");
+    kprintln!("  ipc: endpoint {} created (cap {})", ep.0, ep_cap.index());
 
     kprintln!(
         "  init: receiver @ {:#x}, sender @ {:#x}, cr3 = {:#x}",
@@ -212,9 +214,106 @@ fn spawn_init_process() {
     addr_space.map_page(stack3_base, stack3_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
     let stack3_top = stack3_base + 0x1000;
 
-    // Spawn receiver FIRST — it will block on Recv(ep 0), then sender runs.
-    // Keyboard driver spawned last — it registers for IRQ 1 and blocks.
+    // --- Copy async producer code to 0x403000 ---
+    let tx_code = user_init::async_tx_code();
+    let tx_frame = mm::alloc_frame().expect("no frame for async tx code");
+    let tx_phys = tx_frame.addr();
+    unsafe {
+        core::ptr::write_bytes((tx_phys + hhdm) as *mut u8, 0, 4096);
+        core::ptr::copy_nonoverlapping(
+            tx_code.as_ptr(),
+            (tx_phys + hhdm) as *mut u8,
+            tx_code.len(),
+        );
+    }
+    let tx_addr: u64 = 0x403000;
+    addr_space.map_page(tx_addr, tx_phys, PAGE_PRESENT | PAGE_USER);
+
+    // --- Copy async consumer code to 0x404000 ---
+    let rx_code = user_init::async_rx_code();
+    let rx_frame = mm::alloc_frame().expect("no frame for async rx code");
+    let rx_phys = rx_frame.addr();
+    unsafe {
+        core::ptr::write_bytes((rx_phys + hhdm) as *mut u8, 0, 4096);
+        core::ptr::copy_nonoverlapping(
+            rx_code.as_ptr(),
+            (rx_phys + hhdm) as *mut u8,
+            rx_code.len(),
+        );
+    }
+    let rx_addr: u64 = 0x404000;
+    addr_space.map_page(rx_addr, rx_phys, PAGE_PRESENT | PAGE_USER);
+
+    // --- Allocate async producer stack at 0x806000 ---
+    let stack4_frame = mm::alloc_frame().expect("no frame for async tx stack");
+    let stack4_phys = stack4_frame.addr();
+    unsafe {
+        core::ptr::write_bytes((stack4_phys + hhdm) as *mut u8, 0, 4096);
+    }
+    let stack4_base: u64 = 0x806000;
+    addr_space.map_page(stack4_base, stack4_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+    let stack4_top = stack4_base + 0x1000;
+
+    // --- Allocate async consumer stack at 0x808000 ---
+    let stack5_frame = mm::alloc_frame().expect("no frame for async rx stack");
+    let stack5_phys = stack5_frame.addr();
+    unsafe {
+        core::ptr::write_bytes((stack5_phys + hhdm) as *mut u8, 0, 4096);
+    }
+    let stack5_base: u64 = 0x808000;
+    addr_space.map_page(stack5_base, stack5_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+    let stack5_top = stack5_base + 0x1000;
+
+    // --- Copy child thread code to 0x405000 ---
+    let child_code = user_init::child_code();
+    let child_frame = mm::alloc_frame().expect("no frame for child code");
+    let child_phys = child_frame.addr();
+    unsafe {
+        core::ptr::write_bytes((child_phys + hhdm) as *mut u8, 0, 4096);
+        core::ptr::copy_nonoverlapping(
+            child_code.as_ptr(),
+            (child_phys + hhdm) as *mut u8,
+            child_code.len(),
+        );
+    }
+    let child_addr: u64 = 0x405000;
+    addr_space.map_page(child_addr, child_phys, PAGE_PRESENT | PAGE_USER);
+
+    // --- Allocate child thread stack at 0x80A000 ---
+    let stack6_frame = mm::alloc_frame().expect("no frame for child stack");
+    let stack6_phys = stack6_frame.addr();
+    unsafe {
+        core::ptr::write_bytes((stack6_phys + hhdm) as *mut u8, 0, 4096);
+    }
+    let stack6_base: u64 = 0x80A000;
+    addr_space.map_page(stack6_base, stack6_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+    // Stack top = 0x80B000 (used by SYS_THREAD_CREATE from sender)
+
+    // --- Create async channel 0 and its root capability ---
+    let ch = ipc::channel::create().expect("failed to create channel");
+    let ch_cap = cap::insert(cap::CapObject::Channel { id: ch.0 }, cap::Rights::ALL, None)
+        .expect("failed to create channel cap");
+    kprintln!("  ipc: channel {} created (cap {})", ch.0, ch_cap.index());
+
+    // --- Create root capability for IRQ 1 (keyboard) ---
+    let irq_cap = cap::insert(cap::CapObject::Irq { line: 1 }, cap::Rights::ALL, None)
+        .expect("failed to create irq cap");
+    kprintln!("  irq: keyboard cap {}", irq_cap.index());
+
+    // --- Create root capability for I/O port 0x60 (keyboard data) ---
+    let port_cap = cap::insert(cap::CapObject::IoPort { base: 0x60, count: 1 }, cap::Rights::ALL, None)
+        .expect("failed to create ioport cap");
+    kprintln!("  ioport: 0x60 cap {}", port_cap.index());
+
+    // Spawn order:
+    //   1. Sync receiver — blocks on Recv(ep 0)
+    //   2. Sync sender — runs, rendezvous with receiver
+    //   3. Keyboard driver — registers IRQ 1, blocks
+    //   4. Async consumer — blocks on empty channel
+    //   5. Async producer — sends 5 messages, consumer wakes
     sched::spawn_user(recv_addr, stack2_top, cr3);
     sched::spawn_user(sender_addr, stack1_top, cr3);
     sched::spawn_user(kb_addr, stack3_top, cr3);
+    sched::spawn_user(rx_addr, stack5_top, cr3);
+    sched::spawn_user(tx_addr, stack4_top, cr3);
 }

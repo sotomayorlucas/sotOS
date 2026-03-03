@@ -8,6 +8,7 @@ pub mod table;
 
 pub use table::{CapId, CapObject, CapabilityTable, Rights};
 use crate::kprintln;
+use sotos_common::SysError;
 
 use spin::Mutex;
 
@@ -32,4 +33,20 @@ pub fn lookup(id: CapId) -> Option<(CapObject, Rights)> {
 /// Revoke a capability and all its derivatives.
 pub fn revoke(id: CapId) {
     CAP_TABLE.lock().revoke(id);
+}
+
+/// Validate a capability: check existence, liveness, and required rights.
+pub fn validate(cap_id: u32, required: Rights) -> Result<CapObject, SysError> {
+    CAP_TABLE.lock().validate(CapId::new(cap_id), required)
+}
+
+/// Grant (delegate) a capability with restricted rights.
+/// Validates GRANT right on source, creates a child cap with rights = src & mask.
+pub fn grant(source_id: u32, rights_mask: u32) -> Result<CapId, SysError> {
+    let mut table = CAP_TABLE.lock();
+    let src = CapId::new(source_id);
+    let _obj = table.validate(src, Rights::GRANT)?;
+    let (obj, src_rights) = table.lookup(src).ok_or(SysError::InvalidCap)?;
+    let new_rights = src_rights.restrict(Rights::from_raw(rights_mask));
+    table.insert(obj, new_rights, Some(src)).ok_or(SysError::OutOfResources)
 }

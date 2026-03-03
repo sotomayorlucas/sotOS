@@ -291,6 +291,15 @@ pub fn read_ipc_msg(tid: ThreadId) -> Message {
     Message::empty()
 }
 
+/// Write a message into the current thread's IPC buffer (without touching endpoint/role).
+/// Used by async channels before blocking a sender.
+pub fn set_current_msg(msg: Message) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(idx) = sched.current {
+        sched.threads[idx].ipc_msg = msg;
+    }
+}
+
 /// Read the current thread's own IPC message buffer (after being woken).
 pub fn current_ipc_msg() -> Message {
     let sched = SCHEDULER.lock();

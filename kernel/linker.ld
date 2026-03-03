@@ -50,6 +50,18 @@ SECTIONS
         KEEP(*(.user_kb))
     } :data
 
+    .user_async_tx : {
+        KEEP(*(.user_async_tx))
+    } :data
+
+    .user_async_rx : {
+        KEEP(*(.user_async_rx))
+    } :data
+
+    .user_child : {
+        KEEP(*(.user_child))
+    } :data
+
     .bss : {
         *(.bss .bss.*)
         *(COMMON)

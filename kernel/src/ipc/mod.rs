@@ -5,9 +5,12 @@
 //!   For control messages and capability transfers. Small messages (≤64 bytes)
 //!   are passed in registers during context switch — zero memory overhead.
 //!
-//! - **Channels** (future): Shared-memory ring buffers for high-throughput
-//!   data transfer. Lock-free, zero-copy, zero-syscall on the hot path.
+//! - **Channels**: Bounded ring buffers for high-throughput async data transfer.
+//!   Senders enqueue without blocking (unless full); receivers dequeue without
+//!   blocking (unless empty).
 
+pub mod channel;
 pub mod endpoint;
 
+pub use channel::ChannelId;
 pub use endpoint::{EndpointId, Message};

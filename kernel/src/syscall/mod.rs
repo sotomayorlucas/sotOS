@@ -7,16 +7,25 @@
 use crate::arch::serial;
 use crate::arch::x86_64::io;
 use crate::arch::x86_64::syscall::TrapFrame;
+use crate::cap::{self, CapId, CapObject, Rights};
 use crate::ipc::endpoint::{self, Message};
+use crate::ipc::channel;
 use crate::mm::{self, PhysFrame};
 use crate::mm::paging::{self, AddressSpace, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE, PAGE_NO_EXECUTE};
 use crate::{irq, sched};
 use sotos_common::SysError;
 
-/// Syscall numbers — IPC.
+/// Syscall numbers — IPC (sync endpoints).
 const SYS_SEND: u64 = 1;
 const SYS_RECV: u64 = 2;
 const SYS_CALL: u64 = 3;
+
+/// Syscall numbers — IPC (async channels).
+const SYS_CHANNEL_CREATE: u64 = 4;
+const SYS_CHANNEL_SEND: u64 = 5;
+const SYS_CHANNEL_RECV: u64 = 6;
+const SYS_CHANNEL_CLOSE: u64 = 7;
+
 const SYS_ENDPOINT_CREATE: u64 = 10;
 
 /// Syscall numbers — memory management.
@@ -24,6 +33,14 @@ const SYS_FRAME_ALLOC: u64 = 20;
 const SYS_FRAME_FREE: u64 = 21;
 const SYS_MAP: u64 = 22;
 const SYS_UNMAP: u64 = 23;
+
+/// Syscall numbers — capabilities.
+const SYS_CAP_GRANT: u64 = 30;
+const SYS_CAP_REVOKE: u64 = 31;
+
+/// Syscall numbers — threads.
+const SYS_THREAD_CREATE: u64 = 40;
+const SYS_THREAD_EXIT: u64 = 42;
 
 /// Syscall numbers — IRQ virtualization.
 const SYS_IRQ_REGISTER: u64 = 50;
@@ -84,88 +101,186 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
             frame.rax = 0;
         }
 
-        // SYS_SEND — synchronous send on endpoint rdi
+        // SYS_SEND — synchronous send on endpoint (cap_id in rdi, requires WRITE)
         SYS_SEND => {
-            let ep_id = frame.rdi as u32;
-            let msg = msg_from_frame(frame);
-            match endpoint::send(ep_id, msg) {
-                Ok(()) => frame.rax = 0,
+            match cap::validate(frame.rdi as u32, Rights::WRITE) {
+                Ok(CapObject::Endpoint { id }) => {
+                    let msg = msg_from_frame(frame);
+                    match endpoint::send(id, msg) {
+                        Ok(()) => frame.rax = 0,
+                        Err(e) => frame.rax = e as i64 as u64,
+                    }
+                }
+                Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
                 Err(e) => frame.rax = e as i64 as u64,
             }
         }
 
-        // SYS_RECV — synchronous receive on endpoint rdi
+        // SYS_RECV — synchronous receive on endpoint (cap_id in rdi, requires READ)
         SYS_RECV => {
-            let ep_id = frame.rdi as u32;
-            match endpoint::recv(ep_id) {
-                Ok(msg) => {
-                    frame.rax = 0;
-                    msg_to_frame(frame, &msg);
+            match cap::validate(frame.rdi as u32, Rights::READ) {
+                Ok(CapObject::Endpoint { id }) => {
+                    match endpoint::recv(id) {
+                        Ok(msg) => {
+                            frame.rax = 0;
+                            msg_to_frame(frame, &msg);
+                        }
+                        Err(e) => frame.rax = e as i64 as u64,
+                    }
                 }
+                Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
                 Err(e) => frame.rax = e as i64 as u64,
             }
         }
 
-        // SYS_CALL — send then receive on endpoint rdi
+        // SYS_CALL — send then receive on endpoint (cap_id in rdi, requires READ|WRITE)
         SYS_CALL => {
-            let ep_id = frame.rdi as u32;
-            let msg = msg_from_frame(frame);
-            match endpoint::call(ep_id, msg) {
-                Ok(reply) => {
-                    frame.rax = 0;
-                    msg_to_frame(frame, &reply);
+            match cap::validate(frame.rdi as u32, Rights::READ.or(Rights::WRITE)) {
+                Ok(CapObject::Endpoint { id }) => {
+                    let msg = msg_from_frame(frame);
+                    match endpoint::call(id, msg) {
+                        Ok(reply) => {
+                            frame.rax = 0;
+                            msg_to_frame(frame, &reply);
+                        }
+                        Err(e) => frame.rax = e as i64 as u64,
+                    }
                 }
+                Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
                 Err(e) => frame.rax = e as i64 as u64,
             }
         }
 
-        // SYS_ENDPOINT_CREATE — create a new IPC endpoint
+        // SYS_CHANNEL_CREATE — create a new async channel, return cap_id
+        SYS_CHANNEL_CREATE => {
+            match channel::create() {
+                Some(ch) => {
+                    match cap::insert(CapObject::Channel { id: ch.0 }, Rights::ALL, None) {
+                        Some(cap_id) => frame.rax = cap_id.index() as u64,
+                        None => frame.rax = SysError::OutOfResources as i64 as u64,
+                    }
+                }
+                None => frame.rax = SysError::OutOfResources as i64 as u64,
+            }
+        }
+
+        // SYS_CHANNEL_SEND — async send on channel (cap_id in rdi, requires WRITE)
+        SYS_CHANNEL_SEND => {
+            match cap::validate(frame.rdi as u32, Rights::WRITE) {
+                Ok(CapObject::Channel { id }) => {
+                    let msg = msg_from_frame(frame);
+                    match channel::send(id, msg) {
+                        Ok(()) => frame.rax = 0,
+                        Err(e) => frame.rax = e as i64 as u64,
+                    }
+                }
+                Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
+                Err(e) => frame.rax = e as i64 as u64,
+            }
+        }
+
+        // SYS_CHANNEL_RECV — async receive from channel (cap_id in rdi, requires READ)
+        SYS_CHANNEL_RECV => {
+            match cap::validate(frame.rdi as u32, Rights::READ) {
+                Ok(CapObject::Channel { id }) => {
+                    match channel::recv(id) {
+                        Ok(msg) => {
+                            frame.rax = 0;
+                            msg_to_frame(frame, &msg);
+                        }
+                        Err(e) => frame.rax = e as i64 as u64,
+                    }
+                }
+                Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
+                Err(e) => frame.rax = e as i64 as u64,
+            }
+        }
+
+        // SYS_CHANNEL_CLOSE — close async channel (cap_id in rdi, requires REVOKE)
+        SYS_CHANNEL_CLOSE => {
+            match cap::validate(frame.rdi as u32, Rights::REVOKE) {
+                Ok(CapObject::Channel { id }) => {
+                    match channel::close(id) {
+                        Ok(()) => {
+                            cap::revoke(CapId::new(frame.rdi as u32));
+                            frame.rax = 0;
+                        }
+                        Err(e) => frame.rax = e as i64 as u64,
+                    }
+                }
+                Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
+                Err(e) => frame.rax = e as i64 as u64,
+            }
+        }
+
+        // SYS_ENDPOINT_CREATE — create a new IPC endpoint, return cap_id
         SYS_ENDPOINT_CREATE => {
             match endpoint::create() {
-                Some(ep) => frame.rax = ep.0 as u64,
+                Some(ep) => {
+                    match cap::insert(CapObject::Endpoint { id: ep.0 }, Rights::ALL, None) {
+                        Some(cap_id) => frame.rax = cap_id.index() as u64,
+                        None => frame.rax = SysError::OutOfResources as i64 as u64,
+                    }
+                }
                 None => frame.rax = SysError::OutOfResources as i64 as u64,
             }
         }
 
-        // SYS_FRAME_ALLOC — allocate a physical frame
+        // SYS_FRAME_ALLOC — allocate a physical frame, return cap_id
         SYS_FRAME_ALLOC => {
             match mm::alloc_frame() {
-                Some(f) => frame.rax = f.addr(),
+                Some(f) => {
+                    match cap::insert(CapObject::Memory { base: f.addr(), size: 4096 }, Rights::ALL, None) {
+                        Some(cap_id) => frame.rax = cap_id.index() as u64,
+                        None => {
+                            mm::free_frame(f);
+                            frame.rax = SysError::OutOfResources as i64 as u64;
+                        }
+                    }
+                }
                 None => frame.rax = SysError::OutOfResources as i64 as u64,
             }
         }
 
-        // SYS_FRAME_FREE — free a physical frame
+        // SYS_FRAME_FREE — free a physical frame (cap_id in rdi, requires WRITE)
         SYS_FRAME_FREE => {
-            let paddr = frame.rdi;
-            if paddr & 0xFFF != 0 {
-                frame.rax = SysError::InvalidArg as i64 as u64;
-            } else {
-                mm::free_frame(PhysFrame::from_addr(paddr));
-                frame.rax = 0;
+            match cap::validate(frame.rdi as u32, Rights::WRITE) {
+                Ok(CapObject::Memory { base, .. }) => {
+                    mm::free_frame(PhysFrame::from_addr(base));
+                    cap::revoke(CapId::new(frame.rdi as u32));
+                    frame.rax = 0;
+                }
+                Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
+                Err(e) => frame.rax = e as i64 as u64,
             }
         }
 
         // SYS_MAP — map a frame into the caller's address space
+        // rdi = vaddr, rsi = frame_cap_id, rdx = user_flags
         SYS_MAP => {
             let vaddr = frame.rdi;
-            let paddr = frame.rsi;
+            let frame_cap = frame.rsi as u32;
             let user_flags = frame.rdx;
 
-            if vaddr & 0xFFF != 0 || paddr & 0xFFF != 0 || vaddr >= USER_ADDR_LIMIT {
-                frame.rax = SysError::InvalidArg as i64 as u64;
-            } else {
-                // Build leaf flags: force PRESENT | USER, allow user WRITABLE | NO_EXECUTE.
-                let flags = PAGE_PRESENT | PAGE_USER | (user_flags & USER_FLAG_MASK);
-                let cr3 = paging::read_cr3();
-                let aspace = AddressSpace::from_cr3(cr3);
-                aspace.map_page(vaddr, paddr, flags);
-                paging::invlpg(vaddr);
-                frame.rax = 0;
+            match cap::validate(frame_cap, Rights::READ) {
+                Ok(CapObject::Memory { base: paddr, .. }) => {
+                    if vaddr & 0xFFF != 0 || vaddr >= USER_ADDR_LIMIT {
+                        frame.rax = SysError::InvalidArg as i64 as u64;
+                    } else {
+                        let flags = PAGE_PRESENT | PAGE_USER | (user_flags & USER_FLAG_MASK);
+                        let cr3 = paging::read_cr3();
+                        let aspace = AddressSpace::from_cr3(cr3);
+                        aspace.map_page(vaddr, paddr, flags);
+                        paging::invlpg(vaddr);
+                        frame.rax = 0;
+                    }
+                }
+                Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
+                Err(e) => frame.rax = e as i64 as u64,
             }
         }
 
-        // SYS_UNMAP — unmap a page from the caller's address space
+        // SYS_UNMAP — unmap a page from the caller's address space (no cap needed)
         SYS_UNMAP => {
             let vaddr = frame.rdi;
             if vaddr & 0xFFF != 0 || vaddr >= USER_ADDR_LIMIT {
@@ -182,26 +297,87 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
             }
         }
 
-        // SYS_IRQ_REGISTER — bind current thread to an IRQ line
+        // SYS_IRQ_REGISTER — bind current thread to an IRQ line (cap_id in rdi, requires READ)
         SYS_IRQ_REGISTER => {
-            match irq::register(frame.rdi as u8) {
-                Ok(()) => frame.rax = 0,
+            match cap::validate(frame.rdi as u32, Rights::READ) {
+                Ok(CapObject::Irq { line }) => {
+                    match irq::register(line as u8) {
+                        Ok(()) => frame.rax = 0,
+                        Err(e) => frame.rax = e as i64 as u64,
+                    }
+                }
+                Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
                 Err(e) => frame.rax = e as i64 as u64,
             }
         }
 
-        // SYS_IRQ_ACK — acknowledge IRQ, unmask, block until next
+        // SYS_IRQ_ACK — acknowledge IRQ, unmask, block until next (cap_id in rdi, requires READ)
         SYS_IRQ_ACK => {
-            match irq::ack_and_wait(frame.rdi as u8) {
-                Ok(()) => frame.rax = 0,
+            match cap::validate(frame.rdi as u32, Rights::READ) {
+                Ok(CapObject::Irq { line }) => {
+                    match irq::ack_and_wait(line as u8) {
+                        Ok(()) => frame.rax = 0,
+                        Err(e) => frame.rax = e as i64 as u64,
+                    }
+                }
+                Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
                 Err(e) => frame.rax = e as i64 as u64,
             }
         }
 
-        // SYS_PORT_IN — read a byte from an I/O port (temporary debug)
+        // SYS_PORT_IN — read a byte from an I/O port (cap_id in rdi, requires READ)
         SYS_PORT_IN => {
-            let val = unsafe { io::inb(frame.rdi as u16) };
-            frame.rax = val as u64;
+            match cap::validate(frame.rdi as u32, Rights::READ) {
+                Ok(CapObject::IoPort { base, .. }) => {
+                    let val = unsafe { io::inb(base) };
+                    frame.rax = val as u64;
+                }
+                Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
+                Err(e) => frame.rax = e as i64 as u64,
+            }
+        }
+
+        // SYS_CAP_GRANT — delegate a capability with restricted rights
+        // rdi = source cap_id, rsi = rights mask
+        SYS_CAP_GRANT => {
+            match cap::grant(frame.rdi as u32, frame.rsi as u32) {
+                Ok(cap_id) => frame.rax = cap_id.index() as u64,
+                Err(e) => frame.rax = e as i64 as u64,
+            }
+        }
+
+        // SYS_CAP_REVOKE — revoke a capability and all derivatives
+        // rdi = cap_id (requires REVOKE right)
+        SYS_CAP_REVOKE => {
+            match cap::validate(frame.rdi as u32, Rights::REVOKE) {
+                Ok(_) => {
+                    cap::revoke(CapId::new(frame.rdi as u32));
+                    frame.rax = 0;
+                }
+                Err(e) => frame.rax = e as i64 as u64,
+            }
+        }
+
+        // SYS_THREAD_CREATE — create a new user thread in caller's address space
+        // rdi = entry RIP, rsi = stack RSP; returns thread cap_id
+        SYS_THREAD_CREATE => {
+            let rip = frame.rdi;
+            let rsp = frame.rsi;
+            if rip == 0 || rsp == 0 || rip >= USER_ADDR_LIMIT || rsp >= USER_ADDR_LIMIT {
+                frame.rax = SysError::InvalidArg as i64 as u64;
+            } else {
+                let cr3 = paging::read_cr3();
+                let tid = sched::spawn_user(rip, rsp, cr3);
+                match cap::insert(CapObject::Thread { id: tid.0 }, Rights::ALL, None) {
+                    Some(cap_id) => frame.rax = cap_id.index() as u64,
+                    None => frame.rax = SysError::OutOfResources as i64 as u64,
+                }
+            }
+        }
+
+        // SYS_THREAD_EXIT — terminate the current thread (never returns)
+        SYS_THREAD_EXIT => {
+            sched::exit_current();
         }
 
         // SYS_DEBUG_PRINT — write a single byte to serial (temporary)

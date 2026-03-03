@@ -4,6 +4,8 @@
 //! The Capability Derivation Tree (CDT) tracks parent-child
 //! relationships for O(n) revocation of all derivatives.
 
+use sotos_common::SysError;
+
 /// Maximum number of capabilities in the system.
 pub const MAX_CAPS: usize = 4096;
 
@@ -12,6 +14,10 @@ pub const MAX_CAPS: usize = 4096;
 pub struct CapId(u32);
 
 impl CapId {
+    pub fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
     pub fn index(self) -> usize {
         self.0 as usize
     }
@@ -33,8 +39,16 @@ impl Rights {
         Self(0)
     }
 
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
+    }
+
+    pub const fn or(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
 
     /// Derive new rights that are a subset of the current rights.
@@ -50,6 +64,8 @@ pub enum CapObject {
     Memory { base: u64, size: u64 },
     /// IPC endpoint.
     Endpoint { id: u32 },
+    /// Async IPC channel.
+    Channel { id: u32 },
     /// Thread.
     Thread { id: u32 },
     /// Hardware IRQ line.
@@ -118,6 +134,22 @@ impl CapabilityTable {
             }
         }
         None
+    }
+
+    /// Validate a capability: look up by ID, check alive, check rights.
+    pub fn validate(&self, id: CapId, required: Rights) -> Result<CapObject, SysError> {
+        let idx = id.index();
+        if idx >= MAX_CAPS {
+            return Err(SysError::InvalidCap);
+        }
+        let entry = &self.entries[idx];
+        if !entry.alive {
+            return Err(SysError::InvalidCap);
+        }
+        if !entry.rights.contains(required) {
+            return Err(SysError::NoRights);
+        }
+        Ok(entry.object)
     }
 
     /// Look up a capability by ID. Returns None if not found or revoked.

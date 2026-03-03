@@ -18,6 +18,14 @@ pub enum Syscall {
     Recv = 2,
     /// Combined send+receive (call semantics).
     Call = 3,
+    /// Create a new async IPC channel.
+    ChannelCreate = 4,
+    /// Send a message on an async channel.
+    ChannelSend = 5,
+    /// Receive a message from an async channel.
+    ChannelRecv = 6,
+    /// Close an async channel.
+    ChannelClose = 7,
     /// Create a new IPC endpoint.
     EndpointCreate = 10,
     /// Allocate a physical frame.
@@ -36,6 +44,8 @@ pub enum Syscall {
     ThreadCreate = 40,
     /// Destroy a thread.
     ThreadDestroy = 41,
+    /// Exit the current thread.
+    ThreadExit = 42,
     /// Register an IRQ handler (userspace driver).
     IrqRegister = 50,
     /// Acknowledge an IRQ.
