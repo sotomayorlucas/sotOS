@@ -9,14 +9,21 @@
 //!   0x28 — TSS            (16-byte descriptor)
 //!
 //! SYSRET requires User Data immediately before User Code.
+//!
+//! Two initialization paths:
+//! - `init()`: early boot (before heap). Uses static Lazy GDT+TSS.
+//! - `init_percpu()`: after heap init. Heap-allocates per-CPU GDT+TSS.
 
 use core::cell::UnsafeCell;
+use alloc::boxed::Box;
 use spin::Lazy;
 use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
 use x86_64::instructions::tables::load_tss;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
+
+use super::percpu::PerCpu;
 
 // ---------------------------------------------------------------------------
 // Selector constants (including RPL bits)
@@ -30,17 +37,20 @@ pub const USER_DS: u16 = 0x1B;
 pub const USER_CS: u16 = 0x23;
 
 // ---------------------------------------------------------------------------
-// IST / Double-fault stack
+// IST / Double-fault stack (static, for early boot only)
 // ---------------------------------------------------------------------------
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
+/// Double-fault stack size per CPU (20 KiB).
+const DF_STACK_SIZE: usize = 4096 * 5;
+
 #[repr(align(16))]
-struct DoubleFaultStack([u8; 4096 * 5]);
-static DOUBLE_FAULT_STACK: DoubleFaultStack = DoubleFaultStack([0; 4096 * 5]);
+struct DoubleFaultStack([u8; DF_STACK_SIZE]);
+static DOUBLE_FAULT_STACK: DoubleFaultStack = DoubleFaultStack([0; DF_STACK_SIZE]);
 
 // ---------------------------------------------------------------------------
-// TSS — mutable for rsp0 updates on context switch
+// TSS — static for early boot, replaced by per-CPU heap TSS later
 // ---------------------------------------------------------------------------
 
 #[repr(align(16))]
@@ -53,19 +63,8 @@ fn tss() -> &'static TaskStateSegment {
     unsafe { &*TSS_STORAGE.0.get() }
 }
 
-/// Set TSS.privilege_stack_table[0] (RSP0) — the stack used by the CPU
-/// when an interrupt arrives while in Ring 3.
-///
-/// # Safety
-/// Must be called with interrupts disabled, single-core.
-pub unsafe fn set_tss_rsp0(rsp0: u64) {
-    unsafe {
-        (*TSS_STORAGE.0.get()).privilege_stack_table[0] = VirtAddr::new(rsp0);
-    }
-}
-
 // ---------------------------------------------------------------------------
-// GDT
+// Early-boot GDT (Lazy, before heap is available)
 // ---------------------------------------------------------------------------
 
 struct Selectors {
@@ -108,6 +107,7 @@ static GDT: Lazy<(GlobalDescriptorTable, Selectors)> = Lazy::new(|| {
     )
 });
 
+/// Early-boot GDT init (before heap). Uses static Lazy GDT + TSS.
 pub fn init() {
     GDT.0.load();
     unsafe {
@@ -116,5 +116,49 @@ pub fn init() {
         DS::set_reg(GDT.1.data);
         ES::set_reg(GDT.1.data);
         load_tss(GDT.1.tss);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-CPU GDT + TSS (heap-allocated, for SMP)
+// ---------------------------------------------------------------------------
+
+/// Initialize a per-CPU GDT and TSS for the given CPU.
+///
+/// Heap-allocates a TSS and GDT, sets up the double-fault IST,
+/// and loads the new GDT+TSS, replacing the early-boot static GDT.
+/// The old Lazy GDT is still referenced by static but no longer loaded.
+pub fn init_percpu(percpu: &mut PerCpu) {
+    // Allocate TSS
+    let mut tss = Box::new(TaskStateSegment::new());
+
+    // Allocate double-fault IST stack via frame allocator (too large for slab).
+    let df_frames = DF_STACK_SIZE / 4096;
+    let df_base = crate::mm::alloc_contiguous(df_frames)
+        .expect("out of frames for double-fault stack");
+    let df_virt = df_base.addr() + crate::mm::hhdm_offset();
+    let df_stack_top = VirtAddr::new(df_virt + DF_STACK_SIZE as u64);
+    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = df_stack_top;
+
+    let tss = Box::leak(tss);
+    percpu.tss = tss as *mut TaskStateSegment;
+
+    // Allocate GDT with identical segment layout
+    let mut gdt = Box::new(GlobalDescriptorTable::new());
+    let code = gdt.append(Descriptor::kernel_code_segment()); // 0x08
+    let data = gdt.append(Descriptor::kernel_data_segment()); // 0x10
+    let _user_data = gdt.append(Descriptor::user_data_segment()); // 0x18
+    let _user_code = gdt.append(Descriptor::user_code_segment()); // 0x20
+    let tss_sel = gdt.append(Descriptor::tss_segment(tss)); // 0x28
+
+    let gdt = Box::leak(gdt);
+    gdt.load();
+
+    unsafe {
+        CS::set_reg(code);
+        SS::set_reg(data);
+        DS::set_reg(data);
+        ES::set_reg(data);
+        load_tss(tss_sel);
     }
 }

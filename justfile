@@ -39,6 +39,16 @@ run: image
         -no-reboot \
         -m 256M
 
+# Run with SMP (4 CPUs)
+run-smp: image
+    "{{QEMU}}" \
+        -drive format=raw,file={{IMAGE}} \
+        -serial stdio \
+        -display none \
+        -no-reboot \
+        -m 256M \
+        -smp 4
+
 # Run with QEMU display window (for framebuffer/Limine menu)
 run-gui: image
     "{{QEMU}}" \

@@ -2,36 +2,15 @@
 //!
 //! Programs the four MSRs (EFER, STAR, LSTAR, FMASK) and provides
 //! the syscall_entry trampoline that saves/restores user state.
+//!
+//! Per-CPU state (kernel stack, user RSP save) is accessed via GS base
+//! rather than RIP-relative globals, making this SMP-safe.
 
 use super::gdt;
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
 use x86_64::structures::gdt::SegmentSelector;
 use x86_64::VirtAddr;
-
-// ---------------------------------------------------------------------------
-// Per-CPU globals (single-core, accessed only with IF=0)
-// ---------------------------------------------------------------------------
-
-/// Kernel RSP loaded on SYSCALL entry. Set by the scheduler on every
-/// context switch to the current thread's kernel_stack_top.
-#[no_mangle]
-static mut KERNEL_STACK_TOP: u64 = 0;
-
-/// Scratch space to save the user RSP across a syscall.
-#[no_mangle]
-static mut USER_RSP_SAVE: u64 = 0;
-
-/// Set the kernel stack pointer used by SYSCALL entry.
-///
-/// # Safety
-/// Must be called with interrupts disabled, single-core.
-#[allow(static_mut_refs)]
-pub unsafe fn set_kernel_stack_top(rsp0: u64) {
-    unsafe {
-        KERNEL_STACK_TOP = rsp0;
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Trap frame — matches the push/pop order in syscall_entry
@@ -59,18 +38,18 @@ pub struct TrapFrame {
 }
 
 // ---------------------------------------------------------------------------
-// SYSCALL entry/exit assembly
+// SYSCALL entry/exit assembly — GS-relative per-CPU access
 // ---------------------------------------------------------------------------
 
 core::arch::global_asm!(
     ".global syscall_entry",
     "syscall_entry:",
     // CPU did: RCX = user RIP, R11 = user RFLAGS, CS/SS = kernel
-    // IF=0 (FMASK cleared it). Single-core, safe to use globals.
+    // IF=0 (FMASK cleared it). GS base points to PerCpu.
 
-    // Save user RSP, switch to kernel stack
-    "    mov [rip + USER_RSP_SAVE], rsp",
-    "    mov rsp, [rip + KERNEL_STACK_TOP]",
+    // Save user RSP to percpu.user_rsp_save (offset 16), load kernel stack
+    "    mov gs:[16], rsp",       // percpu.user_rsp_save
+    "    mov rsp, gs:[8]",        // percpu.kernel_stack_top
 
     // Push trap frame (matches TrapFrame struct, low-to-high)
     "    push r15",
@@ -111,7 +90,7 @@ core::arch::global_asm!(
     "    pop r15",
 
     // Restore user RSP and return to Ring 3
-    "    mov rsp, [rip + USER_RSP_SAVE]",
+    "    mov rsp, gs:[16]",       // percpu.user_rsp_save
     "    sysretq",
 );
 
@@ -124,6 +103,7 @@ extern "C" {
 }
 
 /// Program SYSCALL/SYSRET MSRs. Call once during boot, after GDT init.
+/// On SMP, each CPU must call this (MSRs are per-CPU).
 pub fn init() {
     // Enable SYSCALL/SYSRET in EFER.
     unsafe {
@@ -133,14 +113,6 @@ pub fn init() {
     }
 
     // STAR: segment selectors for SYSCALL (kernel) and SYSRET (user).
-    //
-    // SYSRET: CS = STAR[63:48]+16, SS = STAR[63:48]+8
-    //   We want CS=0x20|3=0x23 (User Code), SS=0x18|3=0x1B (User Data)
-    //   So STAR[63:48] = 0x1B-8 = 0x13  →  0x13+16=0x23 ✓, 0x13+8=0x1B ✓
-    //
-    // SYSCALL: CS = STAR[47:32], SS = STAR[47:32]+8
-    //   We want CS=0x08 (Kernel Code), SS=0x10 (Kernel Data)
-    //   So STAR[47:32] = 0x08  →  0x08+8=0x10 ✓
     Star::write(
         SegmentSelector(gdt::USER_CS),  // cs_sysret  = 0x23
         SegmentSelector(gdt::USER_DS),  // ss_sysret  = 0x1B

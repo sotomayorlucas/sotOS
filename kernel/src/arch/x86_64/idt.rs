@@ -1,6 +1,7 @@
 //! Interrupt Descriptor Table setup.
 //!
-//! Registers CPU exception handlers and hardware interrupt handlers.
+//! Registers CPU exception handlers, hardware IRQ handlers (PIC),
+//! and LAPIC timer/spurious handlers.
 
 use crate::kprintln;
 use spin::Lazy;
@@ -9,15 +10,27 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, Pag
 
 use super::gdt::DOUBLE_FAULT_IST_INDEX;
 use super::pic;
+use super::lapic;
 
-/// Timer interrupt vector (IRQ0 after PIC remap).
-pub const TIMER_VECTOR: u8 = 32;
+/// PIT timer interrupt vector (IRQ0 after PIC remap). Kept for PIC fallback.
+pub const PIT_TIMER_VECTOR: u8 = 32;
+
+/// LAPIC timer interrupt vector.
+pub const LAPIC_TIMER_VECTOR: u8 = lapic::TIMER_VECTOR; // 48
+
+/// LAPIC spurious interrupt vector.
+pub const SPURIOUS_VECTOR: u8 = lapic::SPURIOUS_VECTOR; // 0xFF
 
 /// Generate an IRQ handler for a hardware IRQ line (1-15).
-/// Each handler: send_eoi → mask → notify → iretq.
+/// PIC IRQs are routed to BSP only. If an AP somehow receives one
+/// (spurious), just EOI the LAPIC and return.
 macro_rules! irq_handler {
     ($name:ident, $irq:expr) => {
         extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
+            if !super::percpu::current_percpu().is_bsp() {
+                lapic::eoi();
+                return;
+            }
             pic::send_eoi($irq);
             pic::mask($irq);
             crate::irq::notify($irq);
@@ -56,7 +69,8 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         .set_handler_fn(general_protection_handler);
     idt.page_fault.set_handler_fn(page_fault_handler);
 
-    idt[TIMER_VECTOR].set_handler_fn(timer_handler);
+    // PIT timer (vector 32) — still registered for fallback / early boot
+    idt[PIT_TIMER_VECTOR].set_handler_fn(pit_timer_handler);
 
     // Hardware IRQ handlers for IRQ 1-15 (vectors 33-47).
     idt[33].set_handler_fn(irq1_handler);
@@ -75,12 +89,28 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[46].set_handler_fn(irq14_handler);
     idt[47].set_handler_fn(irq15_handler);
 
+    // LAPIC timer (vector 48)
+    idt[LAPIC_TIMER_VECTOR].set_handler_fn(lapic_timer_handler);
+
+    // LAPIC spurious interrupt (vector 0xFF)
+    idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
+
     idt
 });
 
+/// Initialize the IDT (first call forces Lazy init and loads IDTR).
 pub fn init() {
     IDT.load();
 }
+
+/// Reload the IDTR on the current CPU (for APs sharing the same IDT).
+pub fn load() {
+    IDT.load();
+}
+
+// ---------------------------------------------------------------------------
+// Exception handlers
+// ---------------------------------------------------------------------------
 
 extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
     kprintln!("EXCEPTION: breakpoint\n{:#?}", frame);
@@ -112,7 +142,6 @@ extern "x86-interrupt" fn page_fault_handler(
             crate::sched::exit_current();
         }
     } else {
-        // Kernel-mode page fault — this is a bug.
         panic!(
             "page fault (kernel): addr={:#x} code={:?}\n{:#?}",
             addr, code, frame
@@ -120,7 +149,23 @@ extern "x86-interrupt" fn page_fault_handler(
     }
 }
 
-extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
+// ---------------------------------------------------------------------------
+// Timer handlers
+// ---------------------------------------------------------------------------
+
+/// PIT timer handler (vector 32). Used during early boot before LAPIC.
+extern "x86-interrupt" fn pit_timer_handler(_frame: InterruptStackFrame) {
     pic::send_eoi(0);
     crate::sched::tick();
+}
+
+/// LAPIC timer handler (vector 48). Per-CPU preemption timer.
+extern "x86-interrupt" fn lapic_timer_handler(_frame: InterruptStackFrame) {
+    lapic::eoi();
+    crate::sched::tick();
+}
+
+/// LAPIC spurious interrupt handler. No-op.
+extern "x86-interrupt" fn spurious_handler(_frame: InterruptStackFrame) {
+    // Spurious interrupts do NOT require an EOI.
 }

@@ -27,8 +27,9 @@ mod sched;
 mod syscall;
 mod user_init;
 
+use core::sync::atomic::{AtomicU32, Ordering};
 use limine::BaseRevision;
-use limine::request::{HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker, RequestsStartMarker};
+use limine::request::{HhdmRequest, MemoryMapRequest, ModuleRequest, MpRequest, RequestsEndMarker, RequestsStartMarker};
 
 #[used]
 #[link_section = ".requests_start_marker"]
@@ -58,6 +59,14 @@ static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 #[used]
 #[link_section = ".requests"]
 static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
+
+/// Request SMP info from the bootloader (AP processor list).
+#[used]
+#[link_section = ".requests"]
+static MP_REQUEST: MpRequest = MpRequest::new();
+
+/// Counter for APs that have finished initialization.
+static APS_READY: AtomicU32 = AtomicU32::new(0);
 
 /// Kernel entry point — called by the Limine bootloader.
 #[no_mangle]
@@ -93,6 +102,14 @@ extern "C" fn kmain() -> ! {
     mm::slab::init();
     kprintln!("[ok] Slab allocator");
 
+    // Per-CPU data (GS base). Must be after slab init (heap-allocated).
+    let bsp_percpu = arch::percpu::init_bsp();
+    kprintln!("[ok] PerCpu (BSP)");
+
+    // Per-CPU GDT + TSS (replaces early-boot static GDT).
+    arch::gdt::init_percpu(bsp_percpu);
+    kprintln!("[ok] Per-CPU GDT+TSS (BSP)");
+
     // Smoke test: prove alloc works.
     {
         let mut v = alloc::vec::Vec::new();
@@ -122,8 +139,12 @@ extern "C" fn kmain() -> ! {
     arch::pic::init();
     kprintln!("[ok] PIC");
 
-    arch::pit::init();
-    kprintln!("[ok] PIT");
+    // LAPIC: per-CPU timer (replaces PIT for preemption).
+    arch::lapic::init();
+    kprintln!("[ok] LAPIC");
+
+    let lapic_ticks = arch::lapic::calibrate();
+    kprintln!("[ok] LAPIC calibrated ({} ticks/10ms)", lapic_ticks);
 
     // Spawn init process (first userspace code).
     let user_cr3 = spawn_init_process();
@@ -133,12 +154,116 @@ extern "C" fn kmain() -> ! {
     load_initrd(user_cr3);
     kprintln!("[ok] Initrd");
 
-    // Enable timer IRQ and interrupts.
-    arch::pic::unmask(0);
+    // Mask PIT IRQ (no longer needed — using LAPIC timer).
+    arch::pic::mask(0);
+
+    // Boot Application Processors (before enabling interrupts on BSP).
+    boot_aps();
+
+    // Start BSP LAPIC timer (~100 Hz periodic).
+    arch::lapic::start_timer(lapic_ticks);
+
+    // Enable interrupts.
     x86_64::instructions::interrupts::enable();
     kprintln!("Kernel ready — entering idle loop");
 
     // Idle loop (thread 0). Timer interrupts cause preemptive switching.
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SMP: Application Processor boot
+// ---------------------------------------------------------------------------
+
+/// Boot all Application Processors via the Limine MP protocol.
+fn boot_aps() {
+    let response = match MP_REQUEST.get_response() {
+        Some(r) => r,
+        None => {
+            kprintln!("  smp: no MP response (single CPU)");
+            return;
+        }
+    };
+
+    let bsp_lapic_id = response.bsp_lapic_id();
+    let cpus = response.cpus();
+
+    // Update BSP percpu with correct LAPIC ID from ACPI.
+    let bsp_percpu = arch::percpu::current_percpu();
+    bsp_percpu.lapic_id = bsp_lapic_id;
+
+    let ap_count = cpus.iter().filter(|c| c.lapic_id != bsp_lapic_id).count();
+    if ap_count == 0 {
+        kprintln!("  smp: BSP only (LAPIC ID {})", bsp_lapic_id);
+        return;
+    }
+    kprintln!("  smp: {} CPUs detected, booting {} APs...", cpus.len(), ap_count);
+
+    let mut cpu_index: u32 = 1; // BSP is 0
+    for cpu in cpus.iter() {
+        if cpu.lapic_id == bsp_lapic_id {
+            continue; // Skip BSP
+        }
+
+        // Allocate PerCpu for this AP.
+        let percpu = arch::percpu::alloc_ap(cpu_index, cpu.lapic_id);
+
+        // Create an idle thread for this AP.
+        let idle_idx = sched::create_idle_thread();
+        percpu.idle_thread = idle_idx;
+        percpu.current_thread = idle_idx;
+
+        // Store PerCpu pointer in the extra field for the AP to pick up.
+        let percpu_addr = percpu as *mut _ as u64;
+        cpu.extra.store(percpu_addr, Ordering::Release);
+
+        // Launch the AP.
+        cpu.goto_address.write(ap_entry);
+
+        cpu_index += 1;
+    }
+
+    // Spin-wait for all APs to signal ready.
+    while APS_READY.load(Ordering::Acquire) < ap_count as u32 {
+        core::hint::spin_loop();
+    }
+    kprintln!("  smp: all {} APs online", ap_count);
+}
+
+/// Entry point for Application Processors, called by Limine after goto_address.write().
+unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
+    // Read PerCpu pointer from extra field.
+    let percpu_addr = cpu.extra.load(Ordering::Acquire);
+    let percpu = unsafe { &mut *(percpu_addr as *mut arch::percpu::PerCpu) };
+
+    // Set GS base for this CPU.
+    arch::percpu::write_gs_base(percpu_addr);
+
+    // Load the shared IDT.
+    arch::idt::load();
+
+    // Allocate per-CPU GDT + TSS.
+    arch::gdt::init_percpu(percpu);
+
+    // Program SYSCALL/SYSRET MSRs (per-CPU).
+    arch::syscall::init();
+
+    // Initialize LAPIC (reads APIC base MSR, maps MMIO if needed, enables).
+    arch::lapic::init();
+
+    // Start LAPIC timer with BSP-calibrated tick count.
+    let ticks = arch::lapic::calibrated_ticks();
+    arch::lapic::start_timer(ticks);
+
+    // Signal BSP that this AP is ready.
+    APS_READY.fetch_add(1, Ordering::Release);
+
+    kprintln!("  CPU {} online (LAPIC {})", percpu.cpu_index, percpu.lapic_id);
+
+    // Enable interrupts and enter idle HLT loop.
+    x86_64::instructions::interrupts::enable();
     loop {
         x86_64::instructions::hlt();
     }

@@ -2,7 +2,11 @@
 //! COM1 at I/O port 0x3F8.
 
 use core::fmt;
+use spin::Mutex;
 use super::io::{inb, outb};
+
+/// Lock protecting serial output from concurrent access on multiple CPUs.
+static SERIAL_LOCK: Mutex<()> = Mutex::new(());
 
 const COM1: u16 = 0x3F8;
 
@@ -43,9 +47,11 @@ impl fmt::Write for SerialWriter {
 }
 
 /// Internal print function used by the kprint!/kprintln! macros.
+/// Protected by a spinlock for SMP safety.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
+    let _guard = SERIAL_LOCK.lock();
     SerialWriter.write_fmt(args).unwrap();
 }
 

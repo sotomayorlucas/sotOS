@@ -4,6 +4,9 @@
 //! Currently implements simple round-robin as the foundation.
 //!
 //! **Level 2 (userspace)**: Scheduling Domains (future).
+//!
+//! Per-CPU state (current thread index) lives in `PerCpu` accessed via GS base.
+//! The global `Scheduler` holds the thread pool and shared run queue.
 
 pub mod thread;
 
@@ -11,11 +14,13 @@ pub use thread::{IpcRole, ThreadId, ThreadState};
 use thread::Thread;
 
 use alloc::collections::VecDeque;
+use crate::arch::x86_64::percpu;
 use crate::ipc::endpoint::Message;
 use crate::pool::Pool;
 
 use crate::kprintln;
 use spin::Mutex;
+use x86_64::VirtAddr;
 
 /// Timeslice in ticks (100 ms at 100 Hz).
 const TIMESLICE: u32 = 10;
@@ -54,44 +59,82 @@ core::arch::global_asm!(
 );
 
 // ---------------------------------------------------------------------------
-// Thread trampolines
+// Thread trampolines — call finish_switch() before entering thread code
 // ---------------------------------------------------------------------------
 
-/// Trampoline for kernel threads. Enables interrupts and jumps to entry.
+/// Trampoline for kernel threads. Called after context_switch pops regs.
+/// r12 = entry function pointer.
 #[unsafe(naked)]
 unsafe extern "C" fn thread_trampoline() -> ! {
     core::arch::naked_asm!(
-        "sti",
-        "jmp r12",
+        "mov rdi, r12",             // pass entry fn as arg
+        "jmp {finish_kernel}",
+        finish_kernel = sym finish_switch_and_enter_kernel,
     );
 }
 
-/// Trampoline for user threads. Switches to user address space and
-/// enters Ring 3 via sysretq.
-///
-/// Registers from initial stack frame:
-///   r12 = user RIP, r13 = user RSP, r14 = CR3
+/// Trampoline for user threads. Called after context_switch pops regs.
+/// r12 = user RIP, r13 = user RSP, r14 = CR3.
 #[unsafe(naked)]
 unsafe extern "C" fn user_thread_trampoline() -> ! {
     core::arch::naked_asm!(
-        "mov cr3, r14",         // switch to user address space
-        "mov rcx, r12",         // user RIP → RCX for sysretq
-        "mov r11, 0x202",       // user RFLAGS (IF=1) → R11 for sysretq
-        "mov rsp, r13",         // user RSP
-        "sysretq",              // enter Ring 3
+        "mov rdi, r12",             // user RIP
+        "mov rsi, r13",             // user RSP
+        "mov rdx, r14",             // CR3
+        "jmp {finish_user}",
+        finish_user = sym finish_switch_and_enter_user,
     );
+}
+
+/// Post-switch handler for kernel threads: finish_switch, then sti + call entry.
+extern "C" fn finish_switch_and_enter_kernel(entry: u64) -> ! {
+    let entry: fn() -> ! = unsafe { core::mem::transmute(entry) };
+    finish_switch();
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+    entry()
+}
+
+/// Post-switch handler for user threads: finish_switch, then sysretq.
+extern "C" fn finish_switch_and_enter_user(user_rip: u64, user_rsp: u64, cr3: u64) -> ! {
+    finish_switch();
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {cr3}",
+            "mov rcx, {rip}",
+            "mov r11, 0x202",       // RFLAGS with IF=1
+            "mov rsp, {rsp}",
+            "sysretq",
+            cr3 = in(reg) cr3,
+            rip = in(reg) user_rip,
+            rsp = in(reg) user_rsp,
+            options(noreturn),
+        );
+    }
+}
+
+/// Complete the post-switch protocol: if the old thread needs re-enqueue,
+/// lock the scheduler and enqueue it now (after context_switch returned,
+/// so the old thread's RSP is safely saved).
+fn finish_switch() {
+    let percpu = percpu::current_percpu();
+    if percpu.switch_needs_enqueue {
+        percpu.switch_needs_enqueue = false;
+        let old_idx = percpu.switch_old_idx;
+        if old_idx != usize::MAX {
+            let mut sched = SCHEDULER.lock();
+            sched.enqueue(old_idx);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Scheduler state
 // ---------------------------------------------------------------------------
 
-struct Scheduler {
-    threads: Pool<Thread>,
+pub struct Scheduler {
+    pub threads: Pool<Thread>,
     /// Run queue of pool indices.
     run_queue: VecDeque<usize>,
-    /// Index of the currently running thread in `threads` (None before first schedule).
-    current: Option<usize>,
     next_id: u32,
 }
 
@@ -100,12 +143,11 @@ impl Scheduler {
         Self {
             threads: Pool::new(),
             run_queue: VecDeque::new(),
-            current: None,
             next_id: 0,
         }
     }
 
-    fn enqueue(&mut self, idx: usize) {
+    pub fn enqueue(&mut self, idx: usize) {
         self.run_queue.push_back(idx);
     }
 
@@ -114,19 +156,18 @@ impl Scheduler {
     }
 }
 
-static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
+pub static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Initialize the scheduler and create the idle thread (thread 0).
+/// Initialize the scheduler and create the idle thread (thread 0) for the BSP.
 pub fn init() {
     let mut sched = SCHEDULER.lock();
+    let percpu = percpu::current_percpu();
 
-    // Thread 0 = idle thread.
-    // It doesn't get a real stack via Thread::new — it will run on the
-    // boot stack. We just need a slot to save its context into.
+    // Thread 0 = BSP idle thread.
     let idle = Thread {
         id: ThreadId(sched.next_id),
         state: ThreadState::Running,
@@ -146,9 +187,36 @@ pub fn init() {
     };
     let slot = sched.threads.alloc(idle) as usize;
     sched.next_id += 1;
-    sched.current = Some(slot);
 
-    kprintln!("  scheduler: preemptive round-robin (single core)");
+    percpu.idle_thread = slot;
+    percpu.current_thread = slot;
+
+    kprintln!("  scheduler: preemptive round-robin (SMP-ready)");
+}
+
+/// Create an idle thread for an AP. Returns the pool index.
+pub fn create_idle_thread() -> usize {
+    let mut sched = SCHEDULER.lock();
+    let idle = Thread {
+        id: ThreadId(sched.next_id),
+        state: ThreadState::Running,
+        priority: 255,
+        context: thread::CpuContext::zero(),
+        cap_space: None,
+        kernel_stack_base: 0,
+        kernel_stack_top: 0,
+        timeslice: TIMESLICE,
+        is_user: false,
+        user_rip: 0,
+        user_rsp: 0,
+        cr3: 0,
+        ipc_msg: Message::empty(),
+        ipc_endpoint: None,
+        ipc_role: IpcRole::None,
+    };
+    let slot = sched.threads.alloc(idle) as usize;
+    sched.next_id += 1;
+    slot
 }
 
 /// Spawn a new kernel thread.
@@ -182,36 +250,39 @@ pub fn spawn_user(user_rip: u64, user_rsp: u64, cr3: u64) -> ThreadId {
 }
 
 /// Terminate the current thread and switch away.
-///
-/// Marks the current thread as Dead (so `schedule()` won't re-enqueue it),
-/// then calls `schedule()` to switch to the next runnable thread.
-/// The dead thread's pool slot is freed after the context switch completes.
 pub fn exit_current() -> ! {
     {
-        let mut sched = SCHEDULER.lock();
-        if let Some(idx) = sched.current {
+        let percpu = percpu::current_percpu();
+        let idx = percpu.current_thread;
+        if idx != usize::MAX {
+            let mut sched = SCHEDULER.lock();
             if let Some(t) = sched.threads.get_mut(idx as u32) {
                 t.state = ThreadState::Dead;
             }
         }
     }
     schedule();
-    // Safety net if run queue was empty (idle thread should always be present).
     crate::arch::halt_loop();
 }
 
 /// Return the current thread's ID.
 pub fn current_tid() -> Option<ThreadId> {
+    let percpu = percpu::current_percpu();
+    let idx = percpu.current_thread;
+    if idx == usize::MAX {
+        return None;
+    }
     let sched = SCHEDULER.lock();
-    sched.current.and_then(|idx| sched.threads.get(idx as u32).map(|t| t.id))
+    sched.threads.get(idx as u32).map(|t| t.id)
 }
 
 /// Block the current thread (set to Blocked) and switch away.
-/// The caller must have already set the IPC state via `set_current_ipc()`.
 pub fn block_current() {
     {
-        let mut sched = SCHEDULER.lock();
-        if let Some(idx) = sched.current {
+        let percpu = percpu::current_percpu();
+        let idx = percpu.current_thread;
+        if idx != usize::MAX {
+            let mut sched = SCHEDULER.lock();
             if let Some(t) = sched.threads.get_mut(idx as u32) {
                 t.state = ThreadState::Blocked;
             }
@@ -221,11 +292,12 @@ pub fn block_current() {
 }
 
 /// Suspend the current thread due to a page fault and switch away.
-/// The VMM server will resolve the fault and call `resume_faulted()`.
 pub fn fault_current() {
     {
-        let mut sched = SCHEDULER.lock();
-        if let Some(idx) = sched.current {
+        let percpu = percpu::current_percpu();
+        let idx = percpu.current_thread;
+        if idx != usize::MAX {
+            let mut sched = SCHEDULER.lock();
             if let Some(t) = sched.threads.get_mut(idx as u32) {
                 t.state = ThreadState::Faulted;
             }
@@ -235,7 +307,6 @@ pub fn fault_current() {
 }
 
 /// Resume a faulted thread: set to Ready, reset timeslice, enqueue.
-/// Returns true if the thread was found in Faulted state.
 pub fn resume_faulted(tid: ThreadId) -> bool {
     let mut sched = SCHEDULER.lock();
     let mut found = None;
@@ -259,7 +330,6 @@ pub fn resume_faulted(tid: ThreadId) -> bool {
 /// Wake a blocked thread: set to Ready, reset timeslice, enqueue.
 pub fn wake(tid: ThreadId) {
     let mut sched = SCHEDULER.lock();
-    // Find index first to avoid borrow conflict.
     let mut found = None;
     for (i, t) in sched.threads.iter() {
         if t.id == tid && t.state == ThreadState::Blocked {
@@ -277,8 +347,10 @@ pub fn wake(tid: ThreadId) {
 
 /// Store IPC state on the current thread before blocking.
 pub fn set_current_ipc(ep_id: u32, role: IpcRole, msg: Message) {
-    let mut sched = SCHEDULER.lock();
-    if let Some(idx) = sched.current {
+    let percpu = percpu::current_percpu();
+    let idx = percpu.current_thread;
+    if idx != usize::MAX {
+        let mut sched = SCHEDULER.lock();
         if let Some(t) = sched.threads.get_mut(idx as u32) {
             t.ipc_endpoint = Some(ep_id);
             t.ipc_role = role;
@@ -289,8 +361,10 @@ pub fn set_current_ipc(ep_id: u32, role: IpcRole, msg: Message) {
 
 /// Clear IPC state on the current thread after waking.
 pub fn clear_current_ipc() {
-    let mut sched = SCHEDULER.lock();
-    if let Some(idx) = sched.current {
+    let percpu = percpu::current_percpu();
+    let idx = percpu.current_thread;
+    if idx != usize::MAX {
+        let mut sched = SCHEDULER.lock();
         if let Some(t) = sched.threads.get_mut(idx as u32) {
             t.ipc_endpoint = None;
             t.ipc_role = IpcRole::None;
@@ -325,10 +399,11 @@ pub fn read_ipc_msg(tid: ThreadId) -> Message {
 }
 
 /// Write a message into the current thread's IPC buffer (without touching endpoint/role).
-/// Used by async channels before blocking a sender.
 pub fn set_current_msg(msg: Message) {
-    let mut sched = SCHEDULER.lock();
-    if let Some(idx) = sched.current {
+    let percpu = percpu::current_percpu();
+    let idx = percpu.current_thread;
+    if idx != usize::MAX {
+        let mut sched = SCHEDULER.lock();
         if let Some(t) = sched.threads.get_mut(idx as u32) {
             t.ipc_msg = msg;
         }
@@ -337,8 +412,10 @@ pub fn set_current_msg(msg: Message) {
 
 /// Read the current thread's own IPC message buffer (after being woken).
 pub fn current_ipc_msg() -> Message {
-    let sched = SCHEDULER.lock();
-    if let Some(idx) = sched.current {
+    let percpu = percpu::current_percpu();
+    let idx = percpu.current_thread;
+    if idx != usize::MAX {
+        let sched = SCHEDULER.lock();
         if let Some(t) = sched.threads.get(idx as u32) {
             return t.ipc_msg;
         }
@@ -347,10 +424,16 @@ pub fn current_ipc_msg() -> Message {
 }
 
 /// Called from the timer interrupt handler on every tick.
+/// Uses try_lock to avoid deadlock if the timer fires while SCHEDULER is held.
 pub fn tick() {
     let needs_reschedule = {
-        let mut sched = SCHEDULER.lock();
-        if let Some(idx) = sched.current {
+        let mut sched = match SCHEDULER.try_lock() {
+            Some(s) => s,
+            None => return, // Lock contended — skip this tick
+        };
+        let percpu = percpu::current_percpu();
+        let idx = percpu.current_thread;
+        if idx != usize::MAX {
             if let Some(t) = sched.threads.get_mut(idx as u32) {
                 if t.timeslice > 0 {
                     t.timeslice -= 1;
@@ -371,48 +454,78 @@ pub fn tick() {
 
 /// Pick the next thread and switch to it.
 ///
-/// **Callers are responsible for interrupt state.** This function does NOT
-/// enable or disable interrupts — each call site restores IF naturally:
-/// - Timer handler: iretq restores RFLAGS (IF=1)
-/// - Syscall yield: sysretq restores R11 (IF=1)
-/// - New thread trampoline: sti / sysretq
+/// Uses the post-switch re-enqueue pattern: the old thread is NOT put back
+/// in the run queue until after context_switch completes (when finish_switch
+/// is called by the new thread). This avoids a race where another CPU could
+/// dequeue and run the old thread before its RSP is saved.
 pub fn schedule() {
+    // Stack-local dummy for dead threads (whose slot is freed before switch).
+    let mut dummy_rsp: u64 = 0;
+
     let switch_info: Option<(*mut u64, u64)> = {
         let mut sched = SCHEDULER.lock();
+        let percpu = percpu::current_percpu();
 
-        let old_idx = match sched.current {
-            Some(idx) => idx,
-            None => return,
-        };
+        let old_idx = percpu.current_thread;
+        if old_idx == usize::MAX {
+            return;
+        }
 
         // Try to dequeue a ready thread.
         let new_idx = match sched.dequeue() {
             Some(idx) => idx,
             None => {
-                // No other thread ready — reset timeslice and continue.
-                if let Some(t) = sched.threads.get_mut(old_idx as u32) {
-                    t.timeslice = TIMESLICE;
+                // No other thread ready.
+                let old_t = match sched.threads.get_mut(old_idx as u32) {
+                    Some(t) => t,
+                    None => return,
+                };
+
+                if old_t.state == ThreadState::Running {
+                    // Still running, just reset timeslice.
+                    old_t.timeslice = TIMESLICE;
+                    return;
                 }
-                return;
+
+                // Current thread is blocked/dead/faulted but run queue is empty.
+                // Switch to idle thread.
+                let idle_idx = percpu.idle_thread;
+                if old_idx == idle_idx {
+                    // Already idle, nothing to do.
+                    return;
+                }
+                idle_idx
             }
         };
 
-        // Grab old_rsp_ptr before any slot manipulation (Dead threads may be freed).
+        // Handle old thread state.
         let old_is_dead = sched.threads.get(old_idx as u32)
             .map_or(false, |t| t.state == ThreadState::Dead);
-        let old_rsp_ptr = &mut sched.threads.get_mut(old_idx as u32).unwrap().context.rsp as *mut u64;
 
-        // Re-enqueue the old thread if it's still runnable.
-        // Dead threads get their slot freed to reclaim pool space.
-        if old_is_dead {
+        let old_rsp_ptr = if old_is_dead {
+            // Dead thread: free the slot, use stack dummy for RSP save.
             sched.threads.free(old_idx as u32);
-        } else if let Some(old_t) = sched.threads.get_mut(old_idx as u32) {
-            if old_t.state == ThreadState::Running {
-                old_t.state = ThreadState::Ready;
-                old_t.timeslice = TIMESLICE;
-                sched.enqueue(old_idx);
+            percpu.switch_needs_enqueue = false;
+            percpu.switch_old_idx = usize::MAX;
+            &mut dummy_rsp as *mut u64
+        } else {
+            let old_rsp_ptr = &mut sched.threads.get_mut(old_idx as u32).unwrap().context.rsp as *mut u64;
+            let is_idle = old_idx == percpu.idle_thread;
+            if let Some(old_t) = sched.threads.get_mut(old_idx as u32) {
+                if old_t.state == ThreadState::Running && !is_idle {
+                    old_t.state = ThreadState::Ready;
+                    old_t.timeslice = TIMESLICE;
+                    // Deferred enqueue — finish_switch() will do it
+                    percpu.switch_old_idx = old_idx;
+                    percpu.switch_needs_enqueue = true;
+                } else {
+                    // Idle/Blocked/Faulted — don't re-enqueue
+                    percpu.switch_needs_enqueue = false;
+                    percpu.switch_old_idx = usize::MAX;
+                }
             }
-        }
+            old_rsp_ptr
+        };
 
         let new_t = sched.threads.get_mut(new_idx as u32).unwrap();
         new_t.state = ThreadState::Running;
@@ -420,16 +533,17 @@ pub fn schedule() {
         let new_kstack_top = new_t.kernel_stack_top;
         let new_cr3 = new_t.cr3;
         let new_rsp = new_t.context.rsp;
-        // Done reading new_t fields — safe to reassign current.
-        sched.current = Some(new_idx);
+
+        // Update percpu with new thread info
+        percpu.current_thread = new_idx;
 
         // Update kernel stack for TSS (Ring 3 → Ring 0 on interrupt)
-        // and for SYSCALL entry.
+        // and for SYSCALL entry via percpu.
         if new_kstack_top != 0 {
             unsafe {
-                crate::arch::gdt::set_tss_rsp0(new_kstack_top);
-                crate::arch::syscall::set_kernel_stack_top(new_kstack_top);
+                (*percpu.tss).privilege_stack_table[0] = VirtAddr::new(new_kstack_top);
             }
+            percpu.kernel_stack_top = new_kstack_top;
         }
 
         // Switch address space if the new thread has a different CR3.
@@ -459,5 +573,8 @@ pub fn schedule() {
         unsafe {
             context_switch(old_rsp_ptr, new_rsp);
         }
+        // After context_switch returns, we're running as the NEW thread
+        // that was previously switched away from. Call finish_switch.
+        finish_switch();
     }
 }
