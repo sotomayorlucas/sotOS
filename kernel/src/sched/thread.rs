@@ -91,6 +91,8 @@ pub struct Thread {
     pub ipc_endpoint: Option<u32>,
     /// IPC role while blocked.
     pub ipc_role: IpcRole,
+    /// Preferred CPU for scheduling (None = any CPU).
+    pub preferred_cpu: Option<u32>,
 }
 
 impl Thread {
@@ -133,6 +135,7 @@ impl Thread {
             ipc_msg: Message::empty(),
             ipc_endpoint: None,
             ipc_role: IpcRole::None,
+            preferred_cpu: None,
         }
     }
 
@@ -180,6 +183,7 @@ impl Thread {
             ipc_msg: Message::empty(),
             ipc_endpoint: None,
             ipc_role: IpcRole::None,
+            preferred_cpu: None,
         }
     }
 }

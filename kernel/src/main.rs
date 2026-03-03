@@ -24,6 +24,7 @@ mod mm;
 mod panic;
 mod pool;
 mod sched;
+mod sync;
 mod syscall;
 mod user_init;
 
@@ -655,9 +656,9 @@ fn spawn_init_process() -> u64 {
 /// Load an ELF binary from the initramfs module (if present).
 ///
 /// The bootloader delivers the initramfs as a module. We parse the CPIO
-/// archive to find "init", load the ELF segments, allocate a stack, and
-/// spawn a user thread. The new thread shares the existing user address
-/// space (same CR3).
+/// archive to find "init", load the ELF segments, allocate a stack, write
+/// BootInfo, and spawn a user thread. The new thread shares the existing
+/// user address space (same CR3).
 fn load_initrd(cr3: u64) {
     use mm::paging::{AddressSpace, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
 
@@ -708,5 +709,51 @@ fn load_initrd(cr3: u64) {
     addr_space.map_page(stack_base, stack_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
     let stack_top = stack_base + 0x1000;
 
+    // Write BootInfo page at 0xB00000 (read-only for userspace).
+    write_boot_info(cr3, &addr_space);
+
     sched::spawn_user(entry, stack_top, cr3);
+}
+
+/// Write a BootInfo struct to 0xB00000 with all root capabilities granted to init.
+fn write_boot_info(
+    _cr3: u64,
+    addr_space: &mm::paging::AddressSpace,
+) {
+    use mm::paging::{PAGE_PRESENT, PAGE_USER};
+    use sotos_common::{BOOT_INFO_ADDR, BOOT_INFO_MAGIC, BootInfo};
+
+    let hhdm = mm::hhdm_offset();
+    let frame = mm::alloc_frame().expect("no frame for BootInfo");
+    let phys = frame.addr();
+    unsafe {
+        core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096);
+    }
+
+    // Map read-only into user address space (PAGE_PRESENT | PAGE_USER, no WRITABLE).
+    addr_space.map_page(BOOT_INFO_ADDR, phys, PAGE_PRESENT | PAGE_USER);
+
+    // Collect all existing capability IDs (caps 0..N created during spawn_init_process).
+    // We know caps 0-9 were created. Query the cap table for them.
+    let mut info = BootInfo::empty();
+    info.magic = BOOT_INFO_MAGIC;
+
+    let mut count = 0u64;
+    for i in 0..sotos_common::BOOT_INFO_MAX_CAPS as u32 {
+        if cap::lookup(cap::CapId::new(i)).is_some() {
+            if (count as usize) < sotos_common::BOOT_INFO_MAX_CAPS {
+                info.caps[count as usize] = i as u64;
+                count += 1;
+            }
+        }
+    }
+    info.cap_count = count;
+
+    // Write the struct via HHDM.
+    unsafe {
+        let ptr = (phys + hhdm) as *mut BootInfo;
+        core::ptr::write(ptr, info);
+    }
+
+    kprintln!("  bootinfo: {} caps at {:#x}", count, BOOT_INFO_ADDR);
 }

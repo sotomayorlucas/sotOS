@@ -75,10 +75,13 @@ const USER_FLAG_MASK: u64 = PAGE_WRITABLE | PAGE_NO_EXECUTE;
 /// Extract an IPC Message from the TrapFrame registers.
 ///
 /// Register convention:
-///   rsi = tag, rdx/r8/r9/r10/r12/r13/r14/r15 = msg regs 0–7
+///   rsi = tag (lower 32 bits = tag, upper 32 bits = cap transfer ID or 0)
+///   rdx/r8/r9/r10/r12/r13/r14/r15 = msg regs 0–7
 fn msg_from_frame(frame: &TrapFrame) -> Message {
+    let raw_tag = frame.rsi;
+    let cap_xfer = (raw_tag >> 32) as u32;
     Message {
-        tag: frame.rsi,
+        tag: raw_tag & 0xFFFF_FFFF,
         regs: [
             frame.rdx,
             frame.r8,
@@ -89,12 +92,14 @@ fn msg_from_frame(frame: &TrapFrame) -> Message {
             frame.r14,
             frame.r15,
         ],
+        cap_transfer: if cap_xfer != 0 { Some(cap_xfer) } else { None },
     }
 }
 
 /// Write an IPC Message back into the TrapFrame registers.
 fn msg_to_frame(frame: &mut TrapFrame, msg: &Message) {
-    frame.rsi = msg.tag;
+    let cap_hi = msg.cap_transfer.unwrap_or(0) as u64;
+    frame.rsi = (cap_hi << 32) | (msg.tag & 0xFFFF_FFFF);
     frame.rdx = msg.regs[0];
     frame.r8 = msg.regs[1];
     frame.r9 = msg.regs[2];

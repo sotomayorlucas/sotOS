@@ -43,6 +43,10 @@ impl Rights {
         Self(raw)
     }
 
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }

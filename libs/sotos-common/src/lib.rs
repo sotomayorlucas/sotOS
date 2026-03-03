@@ -7,6 +7,7 @@
 #![no_std]
 
 pub mod spsc;
+pub mod typed_channel;
 
 /// Syscall numbers. The kernel exposes exactly these operations.
 #[repr(u64)]
@@ -90,6 +91,40 @@ pub enum SysError {
     WouldBlock = -5,
     /// Object not found.
     NotFound = -6,
+}
+
+/// Well-known virtual address of the BootInfo page (mapped read-only for init).
+pub const BOOT_INFO_ADDR: u64 = 0xB00000;
+
+/// Boot info magic number ("SOTOS" in ASCII, zero-extended).
+pub const BOOT_INFO_MAGIC: u64 = 0x534F544F53;
+
+/// Maximum capabilities passed to init.
+pub const BOOT_INFO_MAX_CAPS: usize = 32;
+
+/// Boot information struct passed from kernel to the init process.
+/// Located at BOOT_INFO_ADDR, mapped read-only into the init address space.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BootInfo {
+    pub magic: u64,
+    pub cap_count: u64,
+    pub caps: [u64; BOOT_INFO_MAX_CAPS],
+}
+
+impl BootInfo {
+    pub const fn empty() -> Self {
+        Self {
+            magic: 0,
+            cap_count: 0,
+            caps: [0; BOOT_INFO_MAX_CAPS],
+        }
+    }
+
+    /// Check if this BootInfo is valid.
+    pub fn is_valid(&self) -> bool {
+        self.magic == BOOT_INFO_MAGIC
+    }
 }
 
 /// Raw syscall wrappers for userspace programs.
@@ -222,5 +257,30 @@ pub mod sys {
     #[inline(always)]
     pub fn yield_now() {
         syscall0(super::Syscall::Yield as u64);
+    }
+
+    /// Read a byte from an I/O port.
+    #[inline(always)]
+    pub fn port_in(cap: u64, port: u64) -> Result<u8, i64> {
+        let ret = syscall2(super::Syscall::PortIn as u64, cap, port);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret as u8) }
+    }
+
+    /// Write a byte to an I/O port.
+    #[inline(always)]
+    pub fn port_out(cap: u64, port: u64, value: u8) -> Result<(), i64> {
+        let ret = syscall3(super::Syscall::PortOut as u64, cap, port, value as u64);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
+    /// Read the CPU timestamp counter (rdtsc).
+    #[inline(always)]
+    pub fn rdtsc() -> u64 {
+        let lo: u32;
+        let hi: u32;
+        unsafe {
+            core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
+        }
+        ((hi as u64) << 32) | lo as u64
     }
 }

@@ -3,6 +3,7 @@
 
 use sotos_common::sys;
 use sotos_common::spsc;
+use sotos_common::{BootInfo, BOOT_INFO_ADDR};
 
 /// Shared memory page for the SPSC ring buffer.
 const RING_ADDR: u64 = 0xA00000;
@@ -41,6 +42,19 @@ fn print_u64(mut n: u64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    // --- Phase 1: Read BootInfo ---
+    let boot_info = unsafe { &*(BOOT_INFO_ADDR as *const BootInfo) };
+    let cap_count = if boot_info.is_valid() {
+        boot_info.cap_count
+    } else {
+        0
+    };
+
+    print(b"INIT: boot complete, ");
+    print_u64(cap_count);
+    print(b" caps received\n");
+
+    // --- Phase 2: SPSC channel test ---
     // 1. Allocate and map shared page for ring buffer
     let ring_frame = sys::frame_alloc().unwrap_or_else(|_| panic_halt());
     sys::map(RING_ADDR, ring_frame, MAP_WRITABLE).unwrap_or_else(|_| panic_halt());
@@ -73,6 +87,9 @@ pub extern "C" fn _start() -> ! {
     print_u64(sum);
     print(b"\n");
 
+    // --- Phase 3: Benchmarks ---
+    run_benchmarks(ring);
+
     sys::thread_exit();
 }
 
@@ -84,6 +101,61 @@ pub extern "C" fn producer() -> ! {
         spsc::send(ring, i);
     }
     sys::thread_exit();
+}
+
+// ---------------------------------------------------------------------------
+// Benchmarks
+// ---------------------------------------------------------------------------
+
+/// Read the CPU timestamp counter.
+#[inline(always)]
+fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
+    }
+    ((hi as u64) << 32) | lo as u64
+}
+
+/// Run SPSC benchmarks after the main test completes.
+fn run_benchmarks(ring: &spsc::SpscRing) {
+    // Latency: measure try_send + try_recv round-trip (single-threaded, no contention)
+    const LAT_ITERS: u64 = 10000;
+
+    // Warm up
+    for i in 0..128 {
+        spsc::try_send(ring, i);
+    }
+    for _ in 0..128 {
+        spsc::try_recv(ring);
+    }
+
+    let start = rdtsc();
+    for i in 0..LAT_ITERS {
+        spsc::try_send(ring, i);
+        spsc::try_recv(ring);
+    }
+    let end = rdtsc();
+    let cycles_per_msg = (end - start) / LAT_ITERS;
+
+    print(b"BENCH: spsc_rt=");
+    print_u64(cycles_per_msg);
+    print(b"cy/msg\n");
+
+    // Throughput: stream 10K messages (single-threaded, no blocking)
+    const TPUT_MSGS: u64 = 10000;
+    let start = rdtsc();
+    for i in 0..TPUT_MSGS {
+        while !spsc::try_send(ring, i) {}
+        while spsc::try_recv(ring).is_none() {}
+    }
+    let end = rdtsc();
+    let tput_cy = (end - start) / TPUT_MSGS;
+
+    print(b"BENCH: spsc_tput=");
+    print_u64(tput_cy);
+    print(b"cy/msg (10000 msgs)\n");
 }
 
 fn panic_halt() -> ! {

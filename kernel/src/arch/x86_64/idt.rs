@@ -18,6 +18,9 @@ pub const PIT_TIMER_VECTOR: u8 = 32;
 /// LAPIC timer interrupt vector.
 pub const LAPIC_TIMER_VECTOR: u8 = lapic::TIMER_VECTOR; // 48
 
+/// Reschedule IPI vector.
+pub const RESCHEDULE_VECTOR: u8 = lapic::RESCHEDULE_VECTOR; // 49
+
 /// LAPIC spurious interrupt vector.
 pub const SPURIOUS_VECTOR: u8 = lapic::SPURIOUS_VECTOR; // 0xFF
 
@@ -92,6 +95,9 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // LAPIC timer (vector 48)
     idt[LAPIC_TIMER_VECTOR].set_handler_fn(lapic_timer_handler);
 
+    // Reschedule IPI (vector 49)
+    idt[RESCHEDULE_VECTOR].set_handler_fn(reschedule_ipi_handler);
+
     // LAPIC spurious interrupt (vector 0xFF)
     idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
 
@@ -163,6 +169,12 @@ extern "x86-interrupt" fn pit_timer_handler(_frame: InterruptStackFrame) {
 extern "x86-interrupt" fn lapic_timer_handler(_frame: InterruptStackFrame) {
     lapic::eoi();
     crate::sched::tick();
+}
+
+/// Reschedule IPI handler (vector 49). Triggers a schedule on receiving CPU.
+extern "x86-interrupt" fn reschedule_ipi_handler(_frame: InterruptStackFrame) {
+    lapic::eoi();
+    crate::sched::schedule();
 }
 
 /// LAPIC spurious interrupt handler. No-op.

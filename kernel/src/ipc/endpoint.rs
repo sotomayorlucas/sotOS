@@ -8,11 +8,12 @@
 //! This is the "slow path" IPC for control/setup operations.
 //! High-throughput data flows use shared-memory channels instead.
 
-use spin::Mutex;
 use sotos_common::SysError;
 
+use crate::cap;
 use crate::pool::Pool;
 use crate::sched;
+use crate::sync::ticket::TicketMutex;
 
 /// Maximum threads that can be queued waiting to send on one endpoint.
 const MAX_SEND_QUEUE: usize = 16;
@@ -31,6 +32,8 @@ pub struct Message {
     pub tag: u64,
     /// Payload registers.
     pub regs: [u64; MSG_REGS],
+    /// Optional capability to transfer (requires GRANT right on source).
+    pub cap_transfer: Option<u32>,
 }
 
 impl Message {
@@ -38,6 +41,7 @@ impl Message {
         Self {
             tag: 0,
             regs: [0; MSG_REGS],
+            cap_transfer: None,
         }
     }
 }
@@ -98,7 +102,25 @@ impl Endpoint {
     }
 }
 
-static ENDPOINTS: Mutex<Pool<Endpoint>> = Mutex::new(Pool::new());
+static ENDPOINTS: TicketMutex<Pool<Endpoint>> = TicketMutex::new(Pool::new());
+
+/// Process capability transfer: if the message carries a cap ID, derive a new cap
+/// for the receiver (GRANT right required on source). Replaces the cap_transfer
+/// field with the newly created cap ID.
+fn process_cap_transfer(msg: &mut Message) {
+    if let Some(src_cap_id) = msg.cap_transfer {
+        // Grant with ALL rights — the receiver gets a derived cap.
+        match cap::grant(src_cap_id, cap::Rights::ALL.raw()) {
+            Ok(new_cap) => {
+                msg.cap_transfer = Some(new_cap.index() as u32);
+            }
+            Err(_) => {
+                // Cap transfer failed — clear the field silently.
+                msg.cap_transfer = None;
+            }
+        }
+    }
+}
 
 /// Create a new endpoint.
 pub fn create() -> Option<EndpointId> {
@@ -139,12 +161,18 @@ pub fn send(ep_id: u32, msg: Message) -> Result<(), SysError> {
 
     match action {
         SendAction::Rendezvous(recv_tid) => {
+            // Process cap transfer before delivering.
+            let mut msg = msg;
+            process_cap_transfer(&mut msg);
             // Write our message into the receiver's buffer, then wake it.
             sched::write_ipc_msg(sched::ThreadId(recv_tid), msg);
             sched::wake(sched::ThreadId(recv_tid));
             Ok(())
         }
         SendAction::Block => {
+            // Process cap transfer before storing.
+            let mut msg = msg;
+            process_cap_transfer(&mut msg);
             // Store our message and block.
             sched::set_current_ipc(ep_id, sched::IpcRole::Sender, msg);
             sched::block_current();

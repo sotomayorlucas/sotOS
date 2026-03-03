@@ -1,12 +1,14 @@
-//! Scheduler — Preemptive Round-Robin.
+//! Scheduler — Preemptive Round-Robin with Per-Core Run Queues.
 //!
-//! **Level 1 (kernel)**: Preemptive, priority-based with deadline awareness.
-//! Currently implements simple round-robin as the foundation.
+//! **Level 1 (kernel)**: Preemptive round-robin with per-core queues and
+//! work stealing. Each CPU has its own run queue (FIFO, ticket-locked).
+//! When a CPU's queue is empty it steals from other CPUs (round-robin victim
+//! selection, steal oldest for cache warmth on the stealer).
 //!
 //! **Level 2 (userspace)**: Scheduling Domains (future).
 //!
 //! Per-CPU state (current thread index) lives in `PerCpu` accessed via GS base.
-//! The global `Scheduler` holds the thread pool and shared run queue.
+//! The global `Scheduler` holds the thread pool; run queues are per-CPU.
 
 pub mod thread;
 
@@ -17,6 +19,7 @@ use alloc::collections::VecDeque;
 use crate::arch::x86_64::percpu;
 use crate::ipc::endpoint::Message;
 use crate::pool::Pool;
+use crate::sync::ticket::TicketMutex;
 
 use crate::kprintln;
 use spin::Mutex;
@@ -121,20 +124,63 @@ fn finish_switch() {
         percpu.switch_needs_enqueue = false;
         let old_idx = percpu.switch_old_idx;
         if old_idx != usize::MAX {
-            let mut sched = SCHEDULER.lock();
+            let sched = SCHEDULER.lock();
             sched.enqueue(old_idx);
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Scheduler state
+// Per-core run queues
+// ---------------------------------------------------------------------------
+
+const MAX_CPUS: usize = 16;
+
+struct CpuQueue {
+    queue: VecDeque<usize>,
+}
+
+impl CpuQueue {
+    const fn new() -> Self {
+        Self { queue: VecDeque::new() }
+    }
+}
+
+/// Per-core run queues, each protected by a ticket lock for FIFO fairness.
+static PER_CPU_QUEUES: [TicketMutex<CpuQueue>; MAX_CPUS] = {
+    const INIT: TicketMutex<CpuQueue> = TicketMutex::new(CpuQueue::new());
+    [INIT; MAX_CPUS]
+};
+
+/// Enqueue a thread index to a specific CPU's run queue.
+fn enqueue_to_cpu(cpu: usize, idx: usize) {
+    PER_CPU_QUEUES[cpu % MAX_CPUS].lock().queue.push_back(idx);
+}
+
+/// Dequeue from the current CPU's queue, or work-steal from others.
+fn dequeue_from_any(my_cpu: usize) -> Option<usize> {
+    // Try own queue first.
+    if let Some(idx) = PER_CPU_QUEUES[my_cpu % MAX_CPUS].lock().queue.pop_front() {
+        return Some(idx);
+    }
+    // Work stealing: try other CPUs, steal oldest (pop_back = LIFO steal).
+    for offset in 1..MAX_CPUS {
+        let victim = (my_cpu + offset) % MAX_CPUS;
+        if let Some(mut q) = PER_CPU_QUEUES[victim].try_lock() {
+            if let Some(idx) = q.queue.pop_back() {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler state (thread pool + ID generator)
 // ---------------------------------------------------------------------------
 
 pub struct Scheduler {
     pub threads: Pool<Thread>,
-    /// Run queue of pool indices.
-    run_queue: VecDeque<usize>,
     next_id: u32,
 }
 
@@ -142,17 +188,16 @@ impl Scheduler {
     const fn new() -> Self {
         Self {
             threads: Pool::new(),
-            run_queue: VecDeque::new(),
             next_id: 0,
         }
     }
 
-    pub fn enqueue(&mut self, idx: usize) {
-        self.run_queue.push_back(idx);
-    }
-
-    fn dequeue(&mut self) -> Option<usize> {
-        self.run_queue.pop_front()
+    /// Enqueue a thread to its preferred CPU's queue (or current CPU if no preference).
+    pub fn enqueue(&self, idx: usize) {
+        let target_cpu = self.threads.get(idx as u32)
+            .and_then(|t| t.preferred_cpu)
+            .unwrap_or_else(|| percpu::current_percpu().cpu_index) as usize;
+        enqueue_to_cpu(target_cpu, idx);
     }
 }
 
@@ -184,6 +229,7 @@ pub fn init() {
         ipc_msg: Message::empty(),
         ipc_endpoint: None,
         ipc_role: IpcRole::None,
+        preferred_cpu: None,
     };
     let slot = sched.threads.alloc(idle) as usize;
     sched.next_id += 1;
@@ -191,7 +237,7 @@ pub fn init() {
     percpu.idle_thread = slot;
     percpu.current_thread = slot;
 
-    kprintln!("  scheduler: preemptive round-robin (SMP-ready)");
+    kprintln!("  scheduler: per-core queues with work stealing (SMP)");
 }
 
 /// Create an idle thread for an AP. Returns the pool index.
@@ -213,6 +259,7 @@ pub fn create_idle_thread() -> usize {
         ipc_msg: Message::empty(),
         ipc_endpoint: None,
         ipc_role: IpcRole::None,
+        preferred_cpu: None,
     };
     let slot = sched.threads.alloc(idle) as usize;
     sched.next_id += 1;
@@ -471,8 +518,9 @@ pub fn schedule() {
             return;
         }
 
-        // Try to dequeue a ready thread.
-        let new_idx = match sched.dequeue() {
+        // Try to dequeue a ready thread from per-core queue (with work stealing).
+        let my_cpu = percpu.cpu_index as usize;
+        let new_idx = match dequeue_from_any(my_cpu) {
             Some(idx) => idx,
             None => {
                 // No other thread ready.

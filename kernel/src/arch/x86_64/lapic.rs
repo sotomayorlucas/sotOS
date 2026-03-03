@@ -14,6 +14,9 @@ static CALIBRATED_TICKS: AtomicU32 = AtomicU32::new(0);
 /// LAPIC timer interrupt vector.
 pub const TIMER_VECTOR: u8 = 48;
 
+/// Reschedule IPI vector.
+pub const RESCHEDULE_VECTOR: u8 = 49;
+
 /// Spurious interrupt vector.
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
 
@@ -21,6 +24,8 @@ pub const SPURIOUS_VECTOR: u8 = 0xFF;
 const LAPIC_ID: u32 = 0x020;
 const LAPIC_SVR: u32 = 0x0F0;
 const LAPIC_EOI: u32 = 0x0B0;
+const LAPIC_ICR_LO: u32 = 0x300;
+const LAPIC_ICR_HI: u32 = 0x310;
 const LAPIC_TIMER_LVT: u32 = 0x320;
 const LAPIC_TIMER_INIT: u32 = 0x380;
 const LAPIC_TIMER_CURRENT: u32 = 0x390;
@@ -157,4 +162,16 @@ pub fn start_timer(ticks: u32) {
     lapic_write(LAPIC_TIMER_LVT, 0x20000 | TIMER_VECTOR as u32);
     // Initial count
     lapic_write(LAPIC_TIMER_INIT, ticks);
+}
+
+/// Send an IPI to a specific LAPIC ID.
+pub fn send_ipi(target_lapic_id: u32, vector: u8) {
+    lapic_write(LAPIC_ICR_HI, target_lapic_id << 24);
+    lapic_write(LAPIC_ICR_LO, vector as u32); // Fixed delivery, physical dest
+}
+
+/// Send IPI to all other CPUs (broadcast, exclude self).
+pub fn send_ipi_all_others(vector: u8) {
+    // Shorthand 11 = all excluding self, bits [19:18]
+    lapic_write(LAPIC_ICR_LO, 0x000C_0000 | vector as u32);
 }

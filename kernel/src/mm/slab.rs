@@ -2,7 +2,7 @@
 //!
 //! 8 power-of-2 size classes (8..1024 bytes), each backed by 4 KiB slab pages
 //! obtained from the physical frame allocator. Objects > 1024 bytes get a
-//! whole page. Objects > 4096 bytes are unsupported (panic).
+//! whole page. Objects > 4096 bytes use contiguous frame allocation.
 //!
 //! Lock ordering: SLAB → FRAME_ALLOCATOR (slab calls alloc_frame).
 
@@ -11,7 +11,7 @@ use core::ptr;
 
 use spin::Mutex;
 
-use super::{alloc_frame, free_frame, hhdm_offset};
+use super::{alloc_frame, alloc_contiguous, free_frame, hhdm_offset};
 use super::frame::{PhysFrame, FRAME_SIZE};
 
 const PAGE_SIZE: usize = FRAME_SIZE;
@@ -82,6 +82,19 @@ impl SlabAllocator {
         free_frame(PhysFrame::from_addr(phys));
     }
 
+    fn alloc_multi_page(&self, count: usize) -> *mut u8 {
+        let frame = alloc_contiguous(count).expect("slab: out of frames for multi-page alloc");
+        (frame.addr() + hhdm_offset()) as *mut u8
+    }
+
+    fn free_multi_page(&self, ptr: *mut u8, count: usize) {
+        let virt = ptr as u64;
+        let phys = virt - hhdm_offset();
+        for i in 0..count {
+            free_frame(PhysFrame::from_addr(phys + (i as u64 * PAGE_SIZE as u64)));
+        }
+    }
+
     fn init_slab(&self, page: *mut u8, obj_size: usize) -> *mut SlabHeader {
         let header = page as *mut SlabHeader;
         let header_size = core::mem::size_of::<SlabHeader>();
@@ -115,9 +128,12 @@ impl SlabAllocator {
 
         let size = layout.size().max(layout.align());
 
-        // Whole-page allocation for large objects
+        // Large allocation: multi-page or whole-page
         if size > 1024 {
-            assert!(size <= PAGE_SIZE, "slab: allocation > 4096 not supported");
+            if size > PAGE_SIZE {
+                let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+                return self.alloc_multi_page(pages);
+            }
             return self.alloc_page();
         }
 
@@ -156,7 +172,12 @@ impl SlabAllocator {
         let size = layout.size().max(layout.align());
 
         if size > 1024 {
-            self.free_page(ptr);
+            if size > PAGE_SIZE {
+                let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+                self.free_multi_page(ptr, pages);
+            } else {
+                self.free_page(ptr);
+            }
             return;
         }
 
@@ -200,6 +221,6 @@ static ALLOCATOR: KernelAllocator = KernelAllocator(Mutex::new(SlabAllocator::ne
 pub fn init() {
     use crate::kprintln;
     ALLOCATOR.0.lock().init();
-    kprintln!("  slab: {} size classes ({}..{}), page alloc for >1024",
+    kprintln!("  slab: {} size classes ({}..{}), page alloc for >1024, multi-page for >4096",
         NUM_CLASSES, SIZE_CLASSES[0], SIZE_CLASSES[NUM_CLASSES - 1]);
 }
