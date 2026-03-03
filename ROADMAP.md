@@ -9,6 +9,9 @@
 > SPSC data streaming, and IPC benchmarks. Init process receives root capabilities via
 > BootInfo page. LAPIC timer provides per-CPU preemption. IPI support for cross-core
 > notifications. Ticket spinlocks for FIFO-fair locking. Tested on 1-4 cores.
+> Technical hardening complete: generation-checked Pool<T> (ABA protection), O(1)
+> thread lookup, lock ordering enforcement, per-CPU slab caches, complete syscall
+> wrappers for assembly→Rust migration.
 
 ---
 
@@ -200,6 +203,57 @@ This phase adds the lock-free userspace-only fast path.
 
 ---
 
+## Phase 16 — Technical Hardening (DONE)
+
+**Goal**: Fix latent security bugs, eliminate performance bottlenecks, and prepare for assembly→Rust migration.
+
+### 16.1 Pool<T> Generation Counters (ABA Protection)
+- [x] `PoolHandle` type: 12-bit generation counter + 20-bit slot index packed into u32
+- [x] `Pool::alloc()` returns `PoolHandle`; `get/get_mut/free` verify generation match
+- [x] Stale handles (revoked caps, freed objects) → `None` instead of accessing wrong object
+- [x] `CapId(PoolHandle)`: userspace passes opaque u32, generation bits embedded transparently
+- [x] `get_by_index/get_mut_by_index/free_by_index` for scheduler (raw indices, guaranteed live)
+- [x] All IPC pools (endpoints, channels, notifications) use `PoolHandle` throughout
+
+### 16.2 O(1) Thread Lookup
+- [x] `tid_to_slot: [Option<u32>; 256]` mapping table in Scheduler
+- [x] `resume_faulted()`, `wake()`, `write_ipc_msg()`, `read_ipc_msg()` rewritten O(1)
+- [x] Eliminates O(n) linear scans over thread pool (was 4 functions × n threads)
+- [x] Registration on spawn, deregistration on death
+
+### 16.3 Lock Ordering Enforcement
+- [x] `LockLevel` enum with 9 levels: FaultState → IrqTable → Endpoints → Channels →
+      Notifications → CapTable → Scheduler → Slab → FrameAllocator
+- [x] Per-CPU `held_locks: u16` bitmask in PerCpu struct
+- [x] `check_lock_order()` / `mark_lock_held()` / `mark_lock_released()` with debug assertions
+- [x] All behind `#[cfg(debug_assertions)]` — zero cost in release builds
+- [x] CHANNELS and NOTIFICATIONS converted from `spin::Mutex` to `TicketMutex` (FIFO fair)
+
+### 16.4 Per-CPU Slab Caches
+- [x] `[Mutex<SlabAllocator>; 16]` — one cache per CPU, eliminates global lock contention
+- [x] `cpu_owner: u8` stamped in slab header; dealloc routes to owner's cache
+- [x] Remote free: lock only the owner CPU's cache (2-CPU contention max, not N-CPU)
+- [x] `AtomicBool` guard for early boot (slab allocates before percpu init)
+
+### 16.5 spawn_init_process() Cleanup
+- [x] `init_layout` module with named constants for all virtual addresses
+- [x] `map_code_page()` / `map_stack_page()` helper functions
+- [x] `map_all_blobs()`, `map_all_stacks()`, `create_init_caps()` sub-functions
+- [x] Main function reduced from ~375 lines to ~30 lines of orchestration
+
+### 16.6 Complete Syscall Wrappers
+- [x] `IpcMsg` struct in `sotos-common` (tag + 8 regs, full register ABI)
+- [x] `FaultInfo` struct for fault_recv return values
+- [x] 17 new wrappers: `send/recv/call` (10-register custom asm), `channel_create/send/recv/close`,
+      `endpoint_create`, `cap_grant/revoke`, `frame_free`, `unmap`, `thread_resume`,
+      `irq_register/ack`, `fault_register/recv`
+- [x] `debug_assert!` in typed_channel.rs for multi-slot capacity validation
+- [x] `SpscRing::capacity()` made public for runtime assertions
+
+### Milestone: ABA-safe object pools, O(1) scheduler lookups, lock ordering enforcement, per-CPU allocation, complete userspace syscall ABI.
+
+---
+
 ## Phase 9 — Scheduling Domains
 
 **Goal**: Userspace can implement custom schedulers for their own threads.
@@ -363,6 +417,7 @@ Phase  Scope                          Dependencies    Status
   6    ELF Loader + Initramfs         Phase 3,5       DONE (BootInfo + init ABI)
   7    Shared-Memory Channels         Phase 3         DONE (SPSC + typed wrappers + benchmarks)
   8    SMP (Multi-Core)               Phase 1         DONE (per-core queues, work stealing, IPI, ticket locks)
+ 16    Technical Hardening            Phase 8         DONE (ABA protection, O(1) lookup, lock ordering, per-CPU slab)
   9    Scheduling Domains             Phase 8         TODO
  10    LUCAS (UNIX Compat Layer)      Phase 6,7,11    TODO
  11    Filesystem + Object Store      Phase 6         TODO
@@ -402,11 +457,13 @@ Phase  Scope                          Dependencies    Status
 
 ## Immediate Next Steps
 
-Phases 0–8 are fully complete with all minor items resolved. The kernel is SMP-capable
-with per-core scheduling, lock-free userspace IPC, capability transfer, typed channels,
-IPC benchmarks, and root capability delegation to init. The next unlocked phases are:
+Phases 0–8 and Phase 16 (Technical Hardening) are complete. The kernel is SMP-capable
+with generation-checked object pools, O(1) scheduler lookups, per-CPU slab caches,
+lock ordering enforcement, and a complete syscall wrapper ABI for userspace Rust programs.
+The next unlocked phases are:
 
 - **Phase 9 (Scheduling Domains)**: now unlocked by Phase 8. Userspace custom schedulers with kernel-enforced time budgets.
 - **Phase 11 (Filesystem + Storage)**: virtio-blk driver + object store. Prerequisite for LUCAS (Phase 10).
+- **Assembly blob → Rust migration**: all syscall wrappers now available in sotos-common; init service blobs can be rewritten in Rust.
 - **Full IDL-based typed channels**: code generator from IDL → Rust stubs (Phase 7 stretch).
 - **Expand init service**: spawn VMM + drivers from config, full process lifecycle management.

@@ -127,6 +127,32 @@ impl BootInfo {
     }
 }
 
+/// IPC message for synchronous endpoint operations.
+///
+/// `tag` lower 32 bits = message tag, upper 32 bits = optional cap transfer ID.
+/// `regs[0..8]` map to rdx/r8/r9/r10/r12/r13/r14/r15 in the syscall ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct IpcMsg {
+    pub tag: u64,
+    pub regs: [u64; 8],
+}
+
+impl IpcMsg {
+    pub const fn empty() -> Self {
+        Self { tag: 0, regs: [0; 8] }
+    }
+}
+
+/// Fault information returned by `sys::fault_recv()`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FaultInfo {
+    pub addr: u64,
+    pub code: u64,
+    pub tid: u32,
+}
+
 /// Raw syscall wrappers for userspace programs.
 ///
 /// These issue the `syscall` instruction directly. Only usable from
@@ -282,5 +308,266 @@ pub mod sys {
             core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
         }
         ((hi as u64) << 32) | lo as u64
+    }
+
+    // ---------------------------------------------------------------
+    // IPC — synchronous endpoints (full register ABI)
+    // ---------------------------------------------------------------
+
+    /// Send a message on a synchronous IPC endpoint.
+    #[inline(always)]
+    pub fn send(ep_cap: u64, msg: &super::IpcMsg) -> Result<(), i64> {
+        let ret: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") super::Syscall::Send as u64 => ret,
+                in("rdi") ep_cap,
+                in("rsi") msg.tag,
+                in("rdx") msg.regs[0],
+                in("r8") msg.regs[1],
+                in("r9") msg.regs[2],
+                in("r10") msg.regs[3],
+                in("r12") msg.regs[4],
+                in("r13") msg.regs[5],
+                in("r14") msg.regs[6],
+                in("r15") msg.regs[7],
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
+    /// Receive a message from a synchronous IPC endpoint.
+    #[inline(always)]
+    pub fn recv(ep_cap: u64) -> Result<super::IpcMsg, i64> {
+        let ret: u64;
+        let tag: u64;
+        let r0: u64; let r1: u64; let r2: u64; let r3: u64;
+        let r4: u64; let r5: u64; let r6: u64; let r7: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") super::Syscall::Recv as u64 => ret,
+                in("rdi") ep_cap,
+                lateout("rsi") tag,
+                lateout("rdx") r0,
+                lateout("r8") r1,
+                lateout("r9") r2,
+                lateout("r10") r3,
+                lateout("r12") r4,
+                lateout("r13") r5,
+                lateout("r14") r6,
+                lateout("r15") r7,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
+        if (ret as i64) < 0 {
+            Err(ret as i64)
+        } else {
+            Ok(super::IpcMsg { tag, regs: [r0, r1, r2, r3, r4, r5, r6, r7] })
+        }
+    }
+
+    /// Combined send+receive (call semantics) on a synchronous IPC endpoint.
+    #[inline(always)]
+    pub fn call(ep_cap: u64, msg: &super::IpcMsg) -> Result<super::IpcMsg, i64> {
+        let ret: u64;
+        let tag: u64;
+        let r0: u64; let r1: u64; let r2: u64; let r3: u64;
+        let r4: u64; let r5: u64; let r6: u64; let r7: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") super::Syscall::Call as u64 => ret,
+                in("rdi") ep_cap,
+                inlateout("rsi") msg.tag => tag,
+                inlateout("rdx") msg.regs[0] => r0,
+                inlateout("r8") msg.regs[1] => r1,
+                inlateout("r9") msg.regs[2] => r2,
+                inlateout("r10") msg.regs[3] => r3,
+                inlateout("r12") msg.regs[4] => r4,
+                inlateout("r13") msg.regs[5] => r5,
+                inlateout("r14") msg.regs[6] => r6,
+                inlateout("r15") msg.regs[7] => r7,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
+        if (ret as i64) < 0 {
+            Err(ret as i64)
+        } else {
+            Ok(super::IpcMsg { tag, regs: [r0, r1, r2, r3, r4, r5, r6, r7] })
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // IPC — async channels
+    // ---------------------------------------------------------------
+
+    /// Create a new async IPC channel. Returns the channel capability ID.
+    #[inline(always)]
+    pub fn channel_create() -> Result<u64, i64> {
+        let ret = syscall0(super::Syscall::ChannelCreate as u64);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+    }
+
+    /// Send a tag on an async channel.
+    #[inline(always)]
+    pub fn channel_send(cap: u64, tag: u64) -> Result<(), i64> {
+        let ret = syscall2(super::Syscall::ChannelSend as u64, cap, tag);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
+    /// Receive a tag from an async channel.
+    #[inline(always)]
+    pub fn channel_recv(cap: u64) -> Result<u64, i64> {
+        let ret: u64;
+        let tag: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") super::Syscall::ChannelRecv as u64 => ret,
+                in("rdi") cap,
+                lateout("rsi") tag,
+                lateout("rcx") _,
+                lateout("r11") _,
+                lateout("rdx") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r10") _,
+                lateout("r12") _,
+                lateout("r13") _,
+                lateout("r14") _,
+                lateout("r15") _,
+                options(nostack),
+            );
+        }
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(tag) }
+    }
+
+    /// Close an async channel.
+    #[inline(always)]
+    pub fn channel_close(cap: u64) -> Result<(), i64> {
+        let ret = syscall1(super::Syscall::ChannelClose as u64, cap);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
+    // ---------------------------------------------------------------
+    // Endpoints
+    // ---------------------------------------------------------------
+
+    /// Create a new IPC endpoint. Returns the endpoint capability ID.
+    #[inline(always)]
+    pub fn endpoint_create() -> Result<u64, i64> {
+        let ret = syscall0(super::Syscall::EndpointCreate as u64);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+    }
+
+    // ---------------------------------------------------------------
+    // Capabilities
+    // ---------------------------------------------------------------
+
+    /// Grant (delegate) a capability with restricted rights.
+    #[inline(always)]
+    pub fn cap_grant(source: u64, rights_mask: u64) -> Result<u64, i64> {
+        let ret = syscall2(super::Syscall::CapGrant as u64, source, rights_mask);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+    }
+
+    /// Revoke a capability and all its derivatives.
+    #[inline(always)]
+    pub fn cap_revoke(cap: u64) -> Result<(), i64> {
+        let ret = syscall1(super::Syscall::CapRevoke as u64, cap);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
+    // ---------------------------------------------------------------
+    // Memory
+    // ---------------------------------------------------------------
+
+    /// Free a physical frame capability.
+    #[inline(always)]
+    pub fn frame_free(cap: u64) -> Result<(), i64> {
+        let ret = syscall1(super::Syscall::FrameFree as u64, cap);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
+    /// Unmap a virtual page.
+    #[inline(always)]
+    pub fn unmap(vaddr: u64) -> Result<(), i64> {
+        let ret = syscall1(super::Syscall::Unmap as u64, vaddr);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
+    // ---------------------------------------------------------------
+    // Threads
+    // ---------------------------------------------------------------
+
+    /// Resume a faulted thread.
+    #[inline(always)]
+    pub fn thread_resume(tid: u64) -> Result<(), i64> {
+        let ret = syscall1(super::Syscall::ThreadResume as u64, tid);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
+    // ---------------------------------------------------------------
+    // IRQ
+    // ---------------------------------------------------------------
+
+    /// Register an IRQ handler notification.
+    #[inline(always)]
+    pub fn irq_register(irq_cap: u64, notify_cap: u64) -> Result<(), i64> {
+        let ret = syscall2(super::Syscall::IrqRegister as u64, irq_cap, notify_cap);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
+    /// Acknowledge an IRQ (unmask the line).
+    #[inline(always)]
+    pub fn irq_ack(cap: u64) -> Result<(), i64> {
+        let ret = syscall1(super::Syscall::IrqAck as u64, cap);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
+    // ---------------------------------------------------------------
+    // Faults (VMM)
+    // ---------------------------------------------------------------
+
+    /// Register a notification for page fault delivery.
+    #[inline(always)]
+    pub fn fault_register(notify_cap: u64) -> Result<(), i64> {
+        let ret = syscall1(super::Syscall::FaultRegister as u64, notify_cap);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
+    /// Receive the next pending page fault.
+    #[inline(always)]
+    pub fn fault_recv() -> Result<super::FaultInfo, i64> {
+        let ret: u64;
+        let addr: u64;
+        let code: u64;
+        let tid: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") super::Syscall::FaultRecv as u64 => ret,
+                lateout("rdi") addr,
+                lateout("rsi") code,
+                lateout("rdx") tid,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
+        if (ret as i64) < 0 {
+            Err(ret as i64)
+        } else {
+            Ok(super::FaultInfo { addr, code, tid: tid as u32 })
+        }
     }
 }

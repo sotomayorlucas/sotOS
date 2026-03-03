@@ -6,18 +6,18 @@
 //!
 //! Lock ordering: CHANNELS → drop → SCHEDULER helpers (same as ENDPOINTS).
 
-use spin::Mutex;
 use sotos_common::SysError;
 
 use crate::ipc::endpoint::Message;
-use crate::pool::Pool;
+use crate::pool::{Pool, PoolHandle};
 use crate::sched::{self, ThreadId};
+use crate::sync::ticket::TicketMutex;
 
 const CHANNEL_CAPACITY: usize = 16;
 
-/// Channel identifier.
+/// Channel identifier (wraps a generation-checked PoolHandle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChannelId(pub u32);
+pub struct ChannelId(pub PoolHandle);
 
 struct Channel {
     buffer: [Message; CHANNEL_CAPACITY],
@@ -62,13 +62,13 @@ impl Channel {
     }
 }
 
-static CHANNELS: Mutex<Pool<Channel>> = Mutex::new(Pool::new());
+static CHANNELS: TicketMutex<Pool<Channel>> = TicketMutex::new(Pool::new());
 
 /// Allocate a new channel.
 pub fn create() -> Option<ChannelId> {
     let mut chs = CHANNELS.lock();
-    let id = chs.alloc(Channel::new());
-    Some(ChannelId(id))
+    let handle = chs.alloc(Channel::new());
+    Some(ChannelId(handle))
 }
 
 /// Action decided under CHANNELS lock, executed after drop.
@@ -82,10 +82,10 @@ enum SendAction {
 }
 
 /// Send a message on a channel.
-pub fn send(ch_id: u32, msg: Message) -> Result<(), SysError> {
+pub fn send(ch_handle: PoolHandle, msg: Message) -> Result<(), SysError> {
     let action = {
         let mut chs = CHANNELS.lock();
-        let ch = chs.get_mut(ch_id).ok_or(SysError::NotFound)?;
+        let ch = chs.get_mut(ch_handle).ok_or(SysError::NotFound)?;
 
         if !ch.is_full() {
             if ch.is_empty() {
@@ -134,10 +134,10 @@ enum RecvAction {
 }
 
 /// Receive a message from a channel.
-pub fn recv(ch_id: u32) -> Result<Message, SysError> {
+pub fn recv(ch_handle: PoolHandle) -> Result<Message, SysError> {
     let action = {
         let mut chs = CHANNELS.lock();
-        let ch = chs.get_mut(ch_id).ok_or(SysError::NotFound)?;
+        let ch = chs.get_mut(ch_handle).ok_or(SysError::NotFound)?;
 
         if !ch.is_empty() {
             let msg = ch.dequeue();
@@ -164,7 +164,7 @@ pub fn recv(ch_id: u32) -> Result<Message, SysError> {
             // Re-acquire CHANNELS to enqueue sender's message.
             {
                 let mut chs = CHANNELS.lock();
-                if let Some(ch) = chs.get_mut(ch_id) {
+                if let Some(ch) = chs.get_mut(ch_handle) {
                     ch.enqueue(sender_msg);
                 }
             }
@@ -182,13 +182,13 @@ pub fn recv(ch_id: u32) -> Result<Message, SysError> {
 }
 
 /// Close a channel — free slot, wake any blocked threads.
-pub fn close(ch_id: u32) -> Result<(), SysError> {
+pub fn close(ch_handle: PoolHandle) -> Result<(), SysError> {
     let (wake_sender, wake_receiver) = {
         let mut chs = CHANNELS.lock();
-        let ch = chs.get_mut(ch_id).ok_or(SysError::NotFound)?;
+        let ch = chs.get_mut(ch_handle).ok_or(SysError::NotFound)?;
         let s = ch.waiting_sender.take();
         let r = ch.waiting_receiver.take();
-        chs.free(ch_id);
+        chs.free(ch_handle);
         (s, r)
     };
 

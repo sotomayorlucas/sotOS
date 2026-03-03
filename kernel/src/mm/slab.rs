@@ -1,13 +1,17 @@
-//! Slab allocator for kernel heap.
+//! Per-CPU slab allocator for kernel heap.
 //!
 //! 8 power-of-2 size classes (8..1024 bytes), each backed by 4 KiB slab pages
 //! obtained from the physical frame allocator. Objects > 1024 bytes get a
 //! whole page. Objects > 4096 bytes use contiguous frame allocation.
 //!
+//! Each CPU has its own `SlabAllocator` to minimize contention. The `cpu_owner`
+//! field in each slab header routes frees to the owning CPU's cache.
+//!
 //! Lock ordering: SLAB → FRAME_ALLOCATOR (slab calls alloc_frame).
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use spin::Mutex;
 
@@ -17,6 +21,24 @@ use super::frame::{PhysFrame, FRAME_SIZE};
 const PAGE_SIZE: usize = FRAME_SIZE;
 const NUM_CLASSES: usize = 8;
 const SIZE_CLASSES: [usize; NUM_CLASSES] = [8, 16, 32, 64, 128, 256, 512, 1024];
+const MAX_CPUS: usize = 16;
+
+/// Set to true after percpu::init_bsp() completes.
+static PERCPU_READY: AtomicBool = AtomicBool::new(false);
+
+/// Mark percpu as ready (called from percpu::init_bsp).
+pub fn mark_percpu_ready() {
+    PERCPU_READY.store(true, Ordering::Release);
+}
+
+/// Get the current CPU index (0 during early boot).
+fn current_cpu_index() -> usize {
+    if PERCPU_READY.load(Ordering::Acquire) {
+        crate::arch::x86_64::percpu::current_percpu().cpu_index as usize
+    } else {
+        0 // BSP during early boot
+    }
+}
 
 #[repr(C)]
 struct SlabHeader {
@@ -24,7 +46,8 @@ struct SlabHeader {
     obj_size: u16,
     total: u16,
     used: u16,
-    _pad: u16,
+    cpu_owner: u8,
+    _pad: u8,
     free_list: *mut u8,
 }
 
@@ -95,7 +118,7 @@ impl SlabAllocator {
         }
     }
 
-    fn init_slab(&self, page: *mut u8, obj_size: usize) -> *mut SlabHeader {
+    fn init_slab(&self, page: *mut u8, obj_size: usize, cpu: u8) -> *mut SlabHeader {
         let header = page as *mut SlabHeader;
         let header_size = core::mem::size_of::<SlabHeader>();
         let data_start = (header_size + obj_size - 1) & !(obj_size - 1);
@@ -106,6 +129,7 @@ impl SlabAllocator {
             (*header).obj_size = obj_size as u16;
             (*header).total = count as u16;
             (*header).used = 0;
+            (*header).cpu_owner = cpu;
             (*header).free_list = ptr::null_mut();
 
             // Build free list (last object first so first object is at head)
@@ -121,14 +145,14 @@ impl SlabAllocator {
         header
     }
 
-    fn allocate(&mut self, layout: Layout) -> *mut u8 {
+    fn allocate(&mut self, layout: Layout, cpu: u8) -> *mut u8 {
         if !self.ready {
             return ptr::null_mut();
         }
 
         let size = layout.size().max(layout.align());
 
-        // Large allocation: multi-page or whole-page
+        // Large allocation: multi-page or whole-page (bypass per-CPU caches)
         if size > 1024 {
             if size > PAGE_SIZE {
                 let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -143,7 +167,7 @@ impl SlabAllocator {
         // Need a new slab?
         if self.classes[idx].partial.is_null() {
             let page = self.alloc_page();
-            let slab = self.init_slab(page, obj_size);
+            let slab = self.init_slab(page, obj_size, cpu);
             self.classes[idx].partial = slab;
         }
 
@@ -203,24 +227,48 @@ impl SlabAllocator {
     }
 }
 
-pub struct KernelAllocator(Mutex<SlabAllocator>);
+/// Per-CPU slab caches — one SlabAllocator per CPU.
+static CPU_CACHES: [Mutex<SlabAllocator>; MAX_CPUS] = {
+    const INIT: Mutex<SlabAllocator> = Mutex::new(SlabAllocator::new());
+    [INIT; MAX_CPUS]
+};
+
+pub struct KernelAllocator;
 
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.0.lock().allocate(layout)
+        let cpu = current_cpu_index();
+        CPU_CACHES[cpu].lock().allocate(layout, cpu as u8)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.0.lock().deallocate(ptr, layout);
+        let size = layout.size().max(layout.align());
+
+        // Large allocs bypass per-CPU caches — free directly.
+        if size > 1024 {
+            let cpu = current_cpu_index();
+            CPU_CACHES[cpu].lock().deallocate(ptr, layout);
+            return;
+        }
+
+        // Determine owner CPU from slab header.
+        let slab = (ptr as usize & !(PAGE_SIZE - 1)) as *mut SlabHeader;
+        let owner = unsafe { (*slab).cpu_owner } as usize;
+
+        // Free to the owner's cache (may be remote).
+        CPU_CACHES[owner % MAX_CPUS].lock().deallocate(ptr, layout);
     }
 }
 
 #[global_allocator]
-static ALLOCATOR: KernelAllocator = KernelAllocator(Mutex::new(SlabAllocator::new()));
+static ALLOCATOR: KernelAllocator = KernelAllocator;
 
 pub fn init() {
     use crate::kprintln;
-    ALLOCATOR.0.lock().init();
-    kprintln!("  slab: {} size classes ({}..{}), page alloc for >1024, multi-page for >4096",
-        NUM_CLASSES, SIZE_CLASSES[0], SIZE_CLASSES[NUM_CLASSES - 1]);
+    // Initialize all CPU caches (only CPU 0 is active at this point).
+    for cache in CPU_CACHES.iter() {
+        cache.lock().init();
+    }
+    kprintln!("  slab: {} size classes ({}..{}), per-CPU caches ({} CPUs), multi-page for >4096",
+        NUM_CLASSES, SIZE_CLASSES[0], SIZE_CLASSES[NUM_CLASSES - 1], MAX_CPUS);
 }

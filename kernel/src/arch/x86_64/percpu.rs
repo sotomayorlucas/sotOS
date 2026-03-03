@@ -38,8 +38,10 @@ pub struct PerCpu {
     pub switch_old_idx: usize,
     /// offset 56: whether the old thread needs re-enqueue after switch
     pub switch_needs_enqueue: bool,
-    // Padding to align tss pointer
-    _pad: [u8; 7],
+    // Padding
+    _pad: [u8; 5],
+    /// offset 62: bitmask of held lock levels (for debug lock ordering)
+    pub held_locks: u16,
     /// offset 64: pointer to this CPU's TSS (not accessed from asm)
     pub tss: *mut TaskStateSegment,
 }
@@ -59,7 +61,8 @@ impl PerCpu {
             idle_thread: usize::MAX,
             switch_old_idx: usize::MAX,
             switch_needs_enqueue: false,
-            _pad: [0; 7],
+            _pad: [0; 5],
+            held_locks: 0,
             tss: core::ptr::null_mut(),
         }
     }
@@ -79,6 +82,9 @@ pub fn init_bsp() -> &'static mut PerCpu {
 
     // Set IA32_GS_BASE to point at PerCpu
     write_gs_base(addr);
+
+    // Signal to slab allocator that percpu is ready for CPU index lookups.
+    crate::mm::slab::mark_percpu_ready();
 
     crate::kprintln!("  percpu: BSP gs_base = {:#x}", addr);
     percpu

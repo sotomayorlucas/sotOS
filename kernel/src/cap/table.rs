@@ -3,23 +3,33 @@
 //! Pool-backed table mapping CapId → (Object, Rights, Parent).
 //! The Capability Derivation Tree (CDT) tracks parent-child
 //! relationships for O(n) revocation of all derivatives.
+//!
+//! CapId wraps a PoolHandle, so stale capabilities (pointing at
+//! recycled slots) are detected by generation check.
 
 use alloc::vec::Vec;
 use sotos_common::SysError;
 
-use crate::pool::Pool;
+use crate::pool::{Pool, PoolHandle};
 
-/// Unique capability identifier.
+/// Unique capability identifier (wraps a generation-checked PoolHandle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CapId(u32);
+pub struct CapId(PoolHandle);
 
 impl CapId {
+    /// Construct from raw u32 (e.g. from userspace syscall argument).
     pub fn new(raw: u32) -> Self {
-        Self(raw)
+        Self(PoolHandle::from_raw(raw))
     }
 
-    pub fn index(self) -> usize {
-        self.0 as usize
+    /// Return the raw u32 representation (opaque to userspace).
+    pub fn raw(self) -> u32 {
+        self.0.raw()
+    }
+
+    /// Return the underlying PoolHandle.
+    pub fn handle(self) -> PoolHandle {
+        self.0
     }
 }
 
@@ -88,7 +98,7 @@ struct CapEntry {
     object: CapObject,
     rights: Rights,
     /// Parent capability (for the CDT). None = root capability.
-    parent: Option<CapId>,
+    parent: Option<PoolHandle>,
 }
 
 /// The kernel's capability table.
@@ -110,17 +120,17 @@ impl CapabilityTable {
         rights: Rights,
         parent: Option<CapId>,
     ) -> Option<CapId> {
-        let id = self.entries.alloc(CapEntry {
+        let handle = self.entries.alloc(CapEntry {
             object,
             rights,
-            parent,
+            parent: parent.map(|c| c.handle()),
         });
-        Some(CapId(id))
+        Some(CapId(handle))
     }
 
     /// Validate a capability: look up by ID, check rights.
     pub fn validate(&self, id: CapId, required: Rights) -> Result<CapObject, SysError> {
-        let entry = self.entries.get(id.0).ok_or(SysError::InvalidCap)?;
+        let entry = self.entries.get(id.handle()).ok_or(SysError::InvalidCap)?;
         if !entry.rights.contains(required) {
             return Err(SysError::NoRights);
         }
@@ -129,32 +139,32 @@ impl CapabilityTable {
 
     /// Look up a capability by ID. Returns None if not found.
     pub fn lookup(&self, id: CapId) -> Option<(CapObject, Rights)> {
-        let entry = self.entries.get(id.0)?;
+        let entry = self.entries.get(id.handle())?;
         Some((entry.object, entry.rights))
     }
 
     /// Revoke a capability and all capabilities derived from it (CDT walk).
     pub fn revoke(&mut self, id: CapId) {
-        if self.entries.free(id.0).is_none() {
+        if self.entries.free(id.handle()).is_none() {
             return;
         }
 
         // Walk the pool and revoke all children whose parent was revoked.
         // This is O(n*depth) in the worst case — acceptable for now.
-        let mut to_revoke: Vec<u32> = Vec::new();
+        let mut to_revoke: Vec<PoolHandle> = Vec::new();
         let mut changed = true;
         while changed {
             changed = false;
-            for (i, entry) in self.entries.iter() {
-                if let Some(parent) = entry.parent {
-                    if self.entries.get(parent.0).is_none() {
-                        to_revoke.push(i);
+            for (handle, entry) in self.entries.iter() {
+                if let Some(parent_handle) = entry.parent {
+                    if self.entries.get(parent_handle).is_none() {
+                        to_revoke.push(handle);
                         changed = true;
                     }
                 }
             }
-            for id in to_revoke.drain(..) {
-                self.entries.free(id);
+            for h in to_revoke.drain(..) {
+                self.entries.free(h);
             }
         }
     }

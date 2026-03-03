@@ -179,9 +179,14 @@ fn dequeue_from_any(my_cpu: usize) -> Option<usize> {
 // Scheduler state (thread pool + ID generator)
 // ---------------------------------------------------------------------------
 
+/// Maximum threads the scheduler can track.
+const MAX_THREADS: usize = 256;
+
 pub struct Scheduler {
     pub threads: Pool<Thread>,
     next_id: u32,
+    /// O(1) lookup: tid_to_slot[tid] = Some(pool_index) for live threads.
+    tid_to_slot: [Option<u32>; MAX_THREADS],
 }
 
 impl Scheduler {
@@ -189,15 +194,39 @@ impl Scheduler {
         Self {
             threads: Pool::new(),
             next_id: 0,
+            tid_to_slot: [None; MAX_THREADS],
         }
     }
 
     /// Enqueue a thread to its preferred CPU's queue (or current CPU if no preference).
     pub fn enqueue(&self, idx: usize) {
-        let target_cpu = self.threads.get(idx as u32)
+        let target_cpu = self.threads.get_by_index(idx as u32)
             .and_then(|t| t.preferred_cpu)
             .unwrap_or_else(|| percpu::current_percpu().cpu_index) as usize;
         enqueue_to_cpu(target_cpu, idx);
+    }
+
+    /// Get pool slot index for a ThreadId. O(1).
+    pub fn slot_of(&self, tid: ThreadId) -> Option<u32> {
+        if (tid.0 as usize) < MAX_THREADS {
+            self.tid_to_slot[tid.0 as usize]
+        } else {
+            None
+        }
+    }
+
+    /// Register a tid→slot mapping.
+    fn register_tid(&mut self, tid: ThreadId, slot: usize) {
+        if (tid.0 as usize) < MAX_THREADS {
+            self.tid_to_slot[tid.0 as usize] = Some(slot as u32);
+        }
+    }
+
+    /// Unregister a tid→slot mapping (on thread death).
+    fn unregister_tid(&mut self, tid: ThreadId) {
+        if (tid.0 as usize) < MAX_THREADS {
+            self.tid_to_slot[tid.0 as usize] = None;
+        }
     }
 }
 
@@ -231,7 +260,10 @@ pub fn init() {
         ipc_role: IpcRole::None,
         preferred_cpu: None,
     };
-    let slot = sched.threads.alloc(idle) as usize;
+    let tid = ThreadId(sched.next_id);
+    let handle = sched.threads.alloc(idle);
+    let slot = handle.index();
+    sched.register_tid(tid, slot);
     sched.next_id += 1;
 
     percpu.idle_thread = slot;
@@ -243,8 +275,9 @@ pub fn init() {
 /// Create an idle thread for an AP. Returns the pool index.
 pub fn create_idle_thread() -> usize {
     let mut sched = SCHEDULER.lock();
+    let tid = ThreadId(sched.next_id);
     let idle = Thread {
-        id: ThreadId(sched.next_id),
+        id: tid,
         state: ThreadState::Running,
         priority: 255,
         context: thread::CpuContext::zero(),
@@ -261,7 +294,9 @@ pub fn create_idle_thread() -> usize {
         ipc_role: IpcRole::None,
         preferred_cpu: None,
     };
-    let slot = sched.threads.alloc(idle) as usize;
+    let handle = sched.threads.alloc(idle);
+    let slot = handle.index();
+    sched.register_tid(tid, slot);
     sched.next_id += 1;
     slot
 }
@@ -276,7 +311,9 @@ pub fn spawn(entry: fn() -> !) -> ThreadId {
     t.timeslice = TIMESLICE;
     let tid = t.id;
 
-    let slot = sched.threads.alloc(t) as usize;
+    let handle = sched.threads.alloc(t);
+    let slot = handle.index();
+    sched.register_tid(tid, slot);
     sched.enqueue(slot);
     tid
 }
@@ -291,7 +328,9 @@ pub fn spawn_user(user_rip: u64, user_rsp: u64, cr3: u64) -> ThreadId {
     t.timeslice = TIMESLICE;
     let tid = t.id;
 
-    let slot = sched.threads.alloc(t) as usize;
+    let handle = sched.threads.alloc(t);
+    let slot = handle.index();
+    sched.register_tid(tid, slot);
     sched.enqueue(slot);
     tid
 }
@@ -303,7 +342,7 @@ pub fn exit_current() -> ! {
         let idx = percpu.current_thread;
         if idx != usize::MAX {
             let mut sched = SCHEDULER.lock();
-            if let Some(t) = sched.threads.get_mut(idx as u32) {
+            if let Some(t) = sched.threads.get_mut_by_index(idx as u32) {
                 t.state = ThreadState::Dead;
             }
         }
@@ -320,7 +359,7 @@ pub fn current_tid() -> Option<ThreadId> {
         return None;
     }
     let sched = SCHEDULER.lock();
-    sched.threads.get(idx as u32).map(|t| t.id)
+    sched.threads.get_by_index(idx as u32).map(|t| t.id)
 }
 
 /// Block the current thread (set to Blocked) and switch away.
@@ -330,7 +369,7 @@ pub fn block_current() {
         let idx = percpu.current_thread;
         if idx != usize::MAX {
             let mut sched = SCHEDULER.lock();
-            if let Some(t) = sched.threads.get_mut(idx as u32) {
+            if let Some(t) = sched.threads.get_mut_by_index(idx as u32) {
                 t.state = ThreadState::Blocked;
             }
         }
@@ -345,7 +384,7 @@ pub fn fault_current() {
         let idx = percpu.current_thread;
         if idx != usize::MAX {
             let mut sched = SCHEDULER.lock();
-            if let Some(t) = sched.threads.get_mut(idx as u32) {
+            if let Some(t) = sched.threads.get_mut_by_index(idx as u32) {
                 t.state = ThreadState::Faulted;
             }
         }
@@ -353,42 +392,33 @@ pub fn fault_current() {
     schedule();
 }
 
-/// Resume a faulted thread: set to Ready, reset timeslice, enqueue.
+/// Resume a faulted thread: set to Ready, reset timeslice, enqueue. O(1).
 pub fn resume_faulted(tid: ThreadId) -> bool {
     let mut sched = SCHEDULER.lock();
-    let mut found = None;
-    for (i, t) in sched.threads.iter() {
-        if t.id == tid && t.state == ThreadState::Faulted {
-            found = Some(i);
-            break;
+    if let Some(slot) = sched.slot_of(tid) {
+        if let Some(t) = sched.threads.get_mut_by_index(slot) {
+            if t.state == ThreadState::Faulted {
+                t.state = ThreadState::Ready;
+                t.timeslice = TIMESLICE;
+                sched.enqueue(slot as usize);
+                return true;
+            }
         }
     }
-    if let Some(i) = found {
-        let t = sched.threads.get_mut(i).unwrap();
-        t.state = ThreadState::Ready;
-        t.timeslice = TIMESLICE;
-        sched.enqueue(i as usize);
-        true
-    } else {
-        false
-    }
+    false
 }
 
-/// Wake a blocked thread: set to Ready, reset timeslice, enqueue.
+/// Wake a blocked thread: set to Ready, reset timeslice, enqueue. O(1).
 pub fn wake(tid: ThreadId) {
     let mut sched = SCHEDULER.lock();
-    let mut found = None;
-    for (i, t) in sched.threads.iter() {
-        if t.id == tid && t.state == ThreadState::Blocked {
-            found = Some(i);
-            break;
+    if let Some(slot) = sched.slot_of(tid) {
+        if let Some(t) = sched.threads.get_mut_by_index(slot) {
+            if t.state == ThreadState::Blocked {
+                t.state = ThreadState::Ready;
+                t.timeslice = TIMESLICE;
+                sched.enqueue(slot as usize);
+            }
         }
-    }
-    if let Some(i) = found {
-        let t = sched.threads.get_mut(i).unwrap();
-        t.state = ThreadState::Ready;
-        t.timeslice = TIMESLICE;
-        sched.enqueue(i as usize);
     }
 }
 
@@ -398,7 +428,7 @@ pub fn set_current_ipc(ep_id: u32, role: IpcRole, msg: Message) {
     let idx = percpu.current_thread;
     if idx != usize::MAX {
         let mut sched = SCHEDULER.lock();
-        if let Some(t) = sched.threads.get_mut(idx as u32) {
+        if let Some(t) = sched.threads.get_mut_by_index(idx as u32) {
             t.ipc_endpoint = Some(ep_id);
             t.ipc_role = role;
             t.ipc_msg = msg;
@@ -412,33 +442,28 @@ pub fn clear_current_ipc() {
     let idx = percpu.current_thread;
     if idx != usize::MAX {
         let mut sched = SCHEDULER.lock();
-        if let Some(t) = sched.threads.get_mut(idx as u32) {
+        if let Some(t) = sched.threads.get_mut_by_index(idx as u32) {
             t.ipc_endpoint = None;
             t.ipc_role = IpcRole::None;
         }
     }
 }
 
-/// Write a message into a specific thread's IPC buffer.
+/// Write a message into a specific thread's IPC buffer. O(1).
 pub fn write_ipc_msg(tid: ThreadId, msg: Message) {
     let mut sched = SCHEDULER.lock();
-    let mut found = None;
-    for (i, t) in sched.threads.iter() {
-        if t.id == tid {
-            found = Some(i);
-            break;
+    if let Some(slot) = sched.slot_of(tid) {
+        if let Some(t) = sched.threads.get_mut_by_index(slot) {
+            t.ipc_msg = msg;
         }
-    }
-    if let Some(i) = found {
-        sched.threads.get_mut(i).unwrap().ipc_msg = msg;
     }
 }
 
-/// Read the message from a specific thread's IPC buffer.
+/// Read the message from a specific thread's IPC buffer. O(1).
 pub fn read_ipc_msg(tid: ThreadId) -> Message {
     let sched = SCHEDULER.lock();
-    for (_, t) in sched.threads.iter() {
-        if t.id == tid {
+    if let Some(slot) = sched.slot_of(tid) {
+        if let Some(t) = sched.threads.get_by_index(slot) {
             return t.ipc_msg;
         }
     }
@@ -451,7 +476,7 @@ pub fn set_current_msg(msg: Message) {
     let idx = percpu.current_thread;
     if idx != usize::MAX {
         let mut sched = SCHEDULER.lock();
-        if let Some(t) = sched.threads.get_mut(idx as u32) {
+        if let Some(t) = sched.threads.get_mut_by_index(idx as u32) {
             t.ipc_msg = msg;
         }
     }
@@ -463,7 +488,7 @@ pub fn current_ipc_msg() -> Message {
     let idx = percpu.current_thread;
     if idx != usize::MAX {
         let sched = SCHEDULER.lock();
-        if let Some(t) = sched.threads.get(idx as u32) {
+        if let Some(t) = sched.threads.get_by_index(idx as u32) {
             return t.ipc_msg;
         }
     }
@@ -481,7 +506,7 @@ pub fn tick() {
         let percpu = percpu::current_percpu();
         let idx = percpu.current_thread;
         if idx != usize::MAX {
-            if let Some(t) = sched.threads.get_mut(idx as u32) {
+            if let Some(t) = sched.threads.get_mut_by_index(idx as u32) {
                 if t.timeslice > 0 {
                     t.timeslice -= 1;
                 }
@@ -524,7 +549,7 @@ pub fn schedule() {
             Some(idx) => idx,
             None => {
                 // No other thread ready.
-                let old_t = match sched.threads.get_mut(old_idx as u32) {
+                let old_t = match sched.threads.get_mut_by_index(old_idx as u32) {
                     Some(t) => t,
                     None => return,
                 };
@@ -547,19 +572,23 @@ pub fn schedule() {
         };
 
         // Handle old thread state.
-        let old_is_dead = sched.threads.get(old_idx as u32)
+        let old_is_dead = sched.threads.get_by_index(old_idx as u32)
             .map_or(false, |t| t.state == ThreadState::Dead);
 
         let old_rsp_ptr = if old_is_dead {
-            // Dead thread: free the slot, use stack dummy for RSP save.
-            sched.threads.free(old_idx as u32);
+            // Dead thread: unregister tid, free the slot, use stack dummy for RSP save.
+            let dead_tid = sched.threads.get_by_index(old_idx as u32).map(|t| t.id);
+            if let Some(tid) = dead_tid {
+                sched.unregister_tid(tid);
+            }
+            sched.threads.free_by_index(old_idx as u32);
             percpu.switch_needs_enqueue = false;
             percpu.switch_old_idx = usize::MAX;
             &mut dummy_rsp as *mut u64
         } else {
-            let old_rsp_ptr = &mut sched.threads.get_mut(old_idx as u32).unwrap().context.rsp as *mut u64;
+            let old_rsp_ptr = &mut sched.threads.get_mut_by_index(old_idx as u32).unwrap().context.rsp as *mut u64;
             let is_idle = old_idx == percpu.idle_thread;
-            if let Some(old_t) = sched.threads.get_mut(old_idx as u32) {
+            if let Some(old_t) = sched.threads.get_mut_by_index(old_idx as u32) {
                 if old_t.state == ThreadState::Running && !is_idle {
                     old_t.state = ThreadState::Ready;
                     old_t.timeslice = TIMESLICE;
@@ -575,7 +604,7 @@ pub fn schedule() {
             old_rsp_ptr
         };
 
-        let new_t = sched.threads.get_mut(new_idx as u32).unwrap();
+        let new_t = sched.threads.get_mut_by_index(new_idx as u32).unwrap();
         new_t.state = ThreadState::Running;
         new_t.timeslice = TIMESLICE;
         let new_kstack_top = new_t.kernel_stack_top;

@@ -9,6 +9,7 @@
 
 use crate::arch::x86_64::pic;
 use crate::ipc::notify;
+use crate::pool::PoolHandle;
 use sotos_common::SysError;
 use spin::Mutex;
 
@@ -18,13 +19,13 @@ const MAX_IRQ: usize = 16;
 /// Per-IRQ binding: maps an IRQ line to a notification object.
 #[derive(Clone, Copy)]
 struct IrqBinding {
-    /// Bound notification (None = unbound).
-    notify_id: Option<u32>,
+    /// Bound notification handle (None = unbound).
+    notify_handle: Option<PoolHandle>,
 }
 
 impl IrqBinding {
     const fn empty() -> Self {
-        Self { notify_id: None }
+        Self { notify_handle: None }
     }
 }
 
@@ -33,7 +34,7 @@ static IRQ_TABLE: Mutex<[IrqBinding; MAX_IRQ]> = Mutex::new([IrqBinding::empty()
 /// Bind an IRQ line to a notification object and unmask the line.
 ///
 /// Rejects IRQ 0 (kernel timer) and already-bound lines.
-pub fn register(irq: u8, notify_id: u32) -> Result<(), SysError> {
+pub fn register(irq: u8, notify_handle: PoolHandle) -> Result<(), SysError> {
     if irq == 0 || irq as usize >= MAX_IRQ {
         return Err(SysError::InvalidArg);
     }
@@ -41,11 +42,11 @@ pub fn register(irq: u8, notify_id: u32) -> Result<(), SysError> {
     let mut table = IRQ_TABLE.lock();
     let entry = &mut table[irq as usize];
 
-    if entry.notify_id.is_some() {
+    if entry.notify_handle.is_some() {
         return Err(SysError::OutOfResources);
     }
 
-    entry.notify_id = Some(notify_id);
+    entry.notify_handle = Some(notify_handle);
     pic::unmask(irq);
     Ok(())
 }
@@ -71,13 +72,13 @@ pub fn notify(irq: u8) {
         return;
     }
 
-    let notify_id = {
+    let notify_handle = {
         let table = IRQ_TABLE.lock();
-        table[irq as usize].notify_id
+        table[irq as usize].notify_handle
     };
     // IRQ_TABLE lock dropped — safe to call into notify subsystem.
 
-    if let Some(id) = notify_id {
-        let _ = notify::signal(id);
+    if let Some(handle) = notify_handle {
+        let _ = notify::signal(handle);
     }
 }

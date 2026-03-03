@@ -14,6 +14,7 @@ use crate::ipc::channel;
 use crate::ipc::notify;
 use crate::mm::{self, PhysFrame};
 use crate::mm::paging::{self, AddressSpace, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE, PAGE_NO_EXECUTE};
+use crate::pool::PoolHandle;
 use crate::sched::ThreadId;
 use crate::{irq, sched};
 use sotos_common::SysError;
@@ -132,7 +133,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
             match cap::validate(frame.rdi as u32, Rights::WRITE) {
                 Ok(CapObject::Endpoint { id }) => {
                     let msg = msg_from_frame(frame);
-                    match endpoint::send(id, msg) {
+                    match endpoint::send(PoolHandle::from_raw(id), msg) {
                         Ok(()) => frame.rax = 0,
                         Err(e) => frame.rax = e as i64 as u64,
                     }
@@ -146,7 +147,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         SYS_RECV => {
             match cap::validate(frame.rdi as u32, Rights::READ) {
                 Ok(CapObject::Endpoint { id }) => {
-                    match endpoint::recv(id) {
+                    match endpoint::recv(PoolHandle::from_raw(id)) {
                         Ok(msg) => {
                             frame.rax = 0;
                             msg_to_frame(frame, &msg);
@@ -164,7 +165,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
             match cap::validate(frame.rdi as u32, Rights::READ.or(Rights::WRITE)) {
                 Ok(CapObject::Endpoint { id }) => {
                     let msg = msg_from_frame(frame);
-                    match endpoint::call(id, msg) {
+                    match endpoint::call(PoolHandle::from_raw(id), msg) {
                         Ok(reply) => {
                             frame.rax = 0;
                             msg_to_frame(frame, &reply);
@@ -181,8 +182,8 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         SYS_CHANNEL_CREATE => {
             match channel::create() {
                 Some(ch) => {
-                    match cap::insert(CapObject::Channel { id: ch.0 }, Rights::ALL, None) {
-                        Some(cap_id) => frame.rax = cap_id.index() as u64,
+                    match cap::insert(CapObject::Channel { id: ch.0.raw() }, Rights::ALL, None) {
+                        Some(cap_id) => frame.rax = cap_id.raw() as u64,
                         None => frame.rax = SysError::OutOfResources as i64 as u64,
                     }
                 }
@@ -195,7 +196,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
             match cap::validate(frame.rdi as u32, Rights::WRITE) {
                 Ok(CapObject::Channel { id }) => {
                     let msg = msg_from_frame(frame);
-                    match channel::send(id, msg) {
+                    match channel::send(PoolHandle::from_raw(id), msg) {
                         Ok(()) => frame.rax = 0,
                         Err(e) => frame.rax = e as i64 as u64,
                     }
@@ -209,7 +210,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         SYS_CHANNEL_RECV => {
             match cap::validate(frame.rdi as u32, Rights::READ) {
                 Ok(CapObject::Channel { id }) => {
-                    match channel::recv(id) {
+                    match channel::recv(PoolHandle::from_raw(id)) {
                         Ok(msg) => {
                             frame.rax = 0;
                             msg_to_frame(frame, &msg);
@@ -226,7 +227,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         SYS_CHANNEL_CLOSE => {
             match cap::validate(frame.rdi as u32, Rights::REVOKE) {
                 Ok(CapObject::Channel { id }) => {
-                    match channel::close(id) {
+                    match channel::close(PoolHandle::from_raw(id)) {
                         Ok(()) => {
                             cap::revoke(CapId::new(frame.rdi as u32));
                             frame.rax = 0;
@@ -243,8 +244,8 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         SYS_ENDPOINT_CREATE => {
             match endpoint::create() {
                 Some(ep) => {
-                    match cap::insert(CapObject::Endpoint { id: ep.0 }, Rights::ALL, None) {
-                        Some(cap_id) => frame.rax = cap_id.index() as u64,
+                    match cap::insert(CapObject::Endpoint { id: ep.0.raw() }, Rights::ALL, None) {
+                        Some(cap_id) => frame.rax = cap_id.raw() as u64,
                         None => frame.rax = SysError::OutOfResources as i64 as u64,
                     }
                 }
@@ -257,7 +258,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
             match mm::alloc_frame() {
                 Some(f) => {
                     match cap::insert(CapObject::Memory { base: f.addr(), size: 4096 }, Rights::ALL, None) {
-                        Some(cap_id) => frame.rax = cap_id.index() as u64,
+                        Some(cap_id) => frame.rax = cap_id.raw() as u64,
                         None => {
                             mm::free_frame(f);
                             frame.rax = SysError::OutOfResources as i64 as u64;
@@ -329,7 +330,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
                 Ok(CapObject::Irq { line }) => {
                     match cap::validate(frame.rsi as u32, Rights::WRITE) {
                         Ok(CapObject::Notification { id }) => {
-                            match irq::register(line as u8, id) {
+                            match irq::register(line as u8, PoolHandle::from_raw(id)) {
                                 Ok(()) => frame.rax = 0,
                                 Err(e) => frame.rax = e as i64 as u64,
                             }
@@ -395,7 +396,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         // rdi = source cap_id, rsi = rights mask
         SYS_CAP_GRANT => {
             match cap::grant(frame.rdi as u32, frame.rsi as u32) {
-                Ok(cap_id) => frame.rax = cap_id.index() as u64,
+                Ok(cap_id) => frame.rax = cap_id.raw() as u64,
                 Err(e) => frame.rax = e as i64 as u64,
             }
         }
@@ -423,7 +424,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
                 let cr3 = paging::read_cr3();
                 let tid = sched::spawn_user(rip, rsp, cr3);
                 match cap::insert(CapObject::Thread { id: tid.0 }, Rights::ALL, None) {
-                    Some(cap_id) => frame.rax = cap_id.index() as u64,
+                    Some(cap_id) => frame.rax = cap_id.raw() as u64,
                     None => frame.rax = SysError::OutOfResources as i64 as u64,
                 }
             }
@@ -448,8 +449,8 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         SYS_NOTIFY_CREATE => {
             match notify::create() {
                 Some(n) => {
-                    match cap::insert(CapObject::Notification { id: n.0 }, Rights::ALL, None) {
-                        Some(cap_id) => frame.rax = cap_id.index() as u64,
+                    match cap::insert(CapObject::Notification { id: n.0.raw() }, Rights::ALL, None) {
+                        Some(cap_id) => frame.rax = cap_id.raw() as u64,
                         None => frame.rax = SysError::OutOfResources as i64 as u64,
                     }
                 }
@@ -461,7 +462,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         SYS_NOTIFY_WAIT => {
             match cap::validate(frame.rdi as u32, Rights::READ) {
                 Ok(CapObject::Notification { id }) => {
-                    match notify::wait(id) {
+                    match notify::wait(PoolHandle::from_raw(id)) {
                         Ok(()) => frame.rax = 0,
                         Err(e) => frame.rax = e as i64 as u64,
                     }
@@ -475,7 +476,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         SYS_NOTIFY_SIGNAL => {
             match cap::validate(frame.rdi as u32, Rights::WRITE) {
                 Ok(CapObject::Notification { id }) => {
-                    match notify::signal(id) {
+                    match notify::signal(PoolHandle::from_raw(id)) {
                         Ok(()) => frame.rax = 0,
                         Err(e) => frame.rax = e as i64 as u64,
                     }
@@ -490,7 +491,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         SYS_FAULT_REGISTER => {
             match cap::validate(frame.rdi as u32, Rights::WRITE) {
                 Ok(CapObject::Notification { id }) => {
-                    fault::register(id);
+                    fault::register(PoolHandle::from_raw(id));
                     frame.rax = 0;
                 }
                 Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,

@@ -76,7 +76,7 @@ impl SpscRing {
     }
 
     #[inline(always)]
-    fn capacity(&self) -> u32 {
+    pub fn capacity(&self) -> u32 {
         self.meta.capacity
     }
 

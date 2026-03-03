@@ -37,12 +37,19 @@ impl<'a, T: Copy> TypedSender<'a, T> {
     /// Send a value, blocking if the ring is full.
     pub fn send(&self, val: T) {
         let slots = slots_per::<T>();
+        debug_assert!(
+            slots <= self.ring.capacity() as usize,
+            "TypedSender: message requires {} slots but ring capacity is {}",
+            slots,
+            self.ring.capacity(),
+        );
         if slots == 1 {
             // Fast path: single u64
             let word = unsafe { *(&val as *const T as *const u64) };
             spsc::send(self.ring, word);
         } else {
             // Multi-slot: send each u64 word sequentially.
+            // Note: not atomic across slots — safe only with single producer/consumer.
             let ptr = &val as *const T as *const u64;
             for i in 0..slots {
                 let word = unsafe { ptr.add(i).read() };
@@ -52,8 +59,18 @@ impl<'a, T: Copy> TypedSender<'a, T> {
     }
 
     /// Try to send a value. Returns `true` on success.
+    ///
+    /// WARNING: For multi-slot types (size > 8 bytes), a partial send can occur
+    /// if the ring fills mid-way. This leaves orphaned slots in the ring.
+    /// Only safe with a single producer that retries the full value on failure.
     pub fn try_send(&self, val: T) -> bool {
         let slots = slots_per::<T>();
+        debug_assert!(
+            slots <= self.ring.capacity() as usize,
+            "TypedSender: message requires {} slots but ring capacity is {}",
+            slots,
+            self.ring.capacity(),
+        );
         if slots == 1 {
             let word = unsafe { *(&val as *const T as *const u64) };
             spsc::try_send(self.ring, word)

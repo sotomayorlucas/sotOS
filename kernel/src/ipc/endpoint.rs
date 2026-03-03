@@ -11,7 +11,7 @@
 use sotos_common::SysError;
 
 use crate::cap;
-use crate::pool::Pool;
+use crate::pool::{Pool, PoolHandle};
 use crate::sched;
 use crate::sync::ticket::TicketMutex;
 
@@ -21,9 +21,9 @@ const MAX_SEND_QUEUE: usize = 16;
 /// Number of message registers (64-bit words).
 pub const MSG_REGS: usize = 8;
 
-/// Endpoint identifier.
+/// Endpoint identifier (wraps a generation-checked PoolHandle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EndpointId(pub u32);
+pub struct EndpointId(pub PoolHandle);
 
 /// A fixed-size message that fits in registers.
 #[derive(Debug, Clone, Copy)]
@@ -112,7 +112,7 @@ fn process_cap_transfer(msg: &mut Message) {
         // Grant with ALL rights — the receiver gets a derived cap.
         match cap::grant(src_cap_id, cap::Rights::ALL.raw()) {
             Ok(new_cap) => {
-                msg.cap_transfer = Some(new_cap.index() as u32);
+                msg.cap_transfer = Some(new_cap.raw());
             }
             Err(_) => {
                 // Cap transfer failed — clear the field silently.
@@ -125,20 +125,20 @@ fn process_cap_transfer(msg: &mut Message) {
 /// Create a new endpoint.
 pub fn create() -> Option<EndpointId> {
     let mut eps = ENDPOINTS.lock();
-    let id = eps.alloc(Endpoint::new());
-    Some(EndpointId(id))
+    let handle = eps.alloc(Endpoint::new());
+    Some(EndpointId(handle))
 }
 
 /// Synchronous send: block until a receiver is ready, transfer message.
 ///
 /// Lock ordering: acquire ENDPOINTS, inspect state, drop ENDPOINTS,
 /// then call scheduler helpers (which acquire SCHEDULER independently).
-pub fn send(ep_id: u32, msg: Message) -> Result<(), SysError> {
+pub fn send(ep_handle: PoolHandle, msg: Message) -> Result<(), SysError> {
     let my_tid = sched::current_tid().ok_or(SysError::InvalidArg)?;
 
     let action = {
         let mut eps = ENDPOINTS.lock();
-        let ep = eps.get_mut(ep_id).ok_or(SysError::NotFound)?;
+        let ep = eps.get_mut(ep_handle).ok_or(SysError::NotFound)?;
 
         match ep.state {
             EndpointState::RecvWait => {
@@ -174,7 +174,7 @@ pub fn send(ep_id: u32, msg: Message) -> Result<(), SysError> {
             let mut msg = msg;
             process_cap_transfer(&mut msg);
             // Store our message and block.
-            sched::set_current_ipc(ep_id, sched::IpcRole::Sender, msg);
+            sched::set_current_ipc(ep_handle.raw(), sched::IpcRole::Sender, msg);
             sched::block_current();
             // Woken by a receiver that consumed our message.
             sched::clear_current_ipc();
@@ -184,10 +184,10 @@ pub fn send(ep_id: u32, msg: Message) -> Result<(), SysError> {
 }
 
 /// Synchronous receive: block until a sender is ready, receive message.
-pub fn recv(ep_id: u32) -> Result<Message, SysError> {
+pub fn recv(ep_handle: PoolHandle) -> Result<Message, SysError> {
     let action = {
         let mut eps = ENDPOINTS.lock();
-        let ep = eps.get_mut(ep_id).ok_or(SysError::NotFound)?;
+        let ep = eps.get_mut(ep_handle).ok_or(SysError::NotFound)?;
 
         match ep.state {
             EndpointState::SendWait => {
@@ -222,7 +222,7 @@ pub fn recv(ep_id: u32) -> Result<Message, SysError> {
         }
         RecvAction::Block => {
             // Block — a sender will write to our ipc_msg and wake us.
-            sched::set_current_ipc(ep_id, sched::IpcRole::Receiver, Message::empty());
+            sched::set_current_ipc(ep_handle.raw(), sched::IpcRole::Receiver, Message::empty());
             sched::block_current();
             // Woken by a sender that wrote into our buffer.
             let msg = sched::current_ipc_msg();
@@ -235,9 +235,9 @@ pub fn recv(ep_id: u32) -> Result<Message, SysError> {
 /// Synchronous call: send a message, then receive a reply on the same endpoint.
 /// Simplified as send() + recv() — non-atomic but correct for the 2-thread test.
 /// TODO: atomic caller role transition for multi-threaded scenarios.
-pub fn call(ep_id: u32, msg: Message) -> Result<Message, SysError> {
-    send(ep_id, msg)?;
-    recv(ep_id)
+pub fn call(ep_handle: PoolHandle, msg: Message) -> Result<Message, SysError> {
+    send(ep_handle, msg)?;
+    recv(ep_handle)
 }
 
 /// Internal action after inspecting endpoint state in send().

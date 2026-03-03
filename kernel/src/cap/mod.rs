@@ -3,6 +3,9 @@
 //! Every kernel object is accessed through capabilities — opaque handles
 //! with associated rights. Capabilities can be delegated (with reduced
 //! rights) and revoked (invalidating all derivatives via the CDT).
+//!
+//! CapId embeds a generation counter, so stale (revoked/recycled) caps
+//! are rejected automatically.
 
 pub mod table;
 
@@ -17,7 +20,7 @@ static CAP_TABLE: Mutex<CapabilityTable> = Mutex::new(CapabilityTable::new());
 pub fn init() {
     // The root capability table is ready — it starts empty.
     // Pool-backed: grows dynamically as capabilities are created.
-    kprintln!("  capability table ready (dynamic pool)");
+    kprintln!("  capability table ready (dynamic pool, generation-checked)");
 }
 
 /// Insert a new capability and return its ID.
@@ -36,6 +39,7 @@ pub fn revoke(id: CapId) {
 }
 
 /// Validate a capability: check existence, liveness, and required rights.
+/// Takes raw u32 from userspace — generation bits are embedded.
 pub fn validate(cap_id: u32, required: Rights) -> Result<CapObject, SysError> {
     CAP_TABLE.lock().validate(CapId::new(cap_id), required)
 }

@@ -6,15 +6,15 @@
 //!
 //! Lock ordering: NOTIFICATIONS dropped before scheduler calls.
 
-use spin::Mutex;
 use sotos_common::SysError;
 
-use crate::pool::Pool;
+use crate::pool::{Pool, PoolHandle};
 use crate::sched::{self, ThreadId};
+use crate::sync::ticket::TicketMutex;
 
-/// Notification identifier.
+/// Notification identifier (wraps a generation-checked PoolHandle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NotifyId(pub u32);
+pub struct NotifyId(pub PoolHandle);
 
 struct Notification {
     pending: bool,
@@ -30,13 +30,13 @@ impl Notification {
     }
 }
 
-static NOTIFICATIONS: Mutex<Pool<Notification>> = Mutex::new(Pool::new());
+static NOTIFICATIONS: TicketMutex<Pool<Notification>> = TicketMutex::new(Pool::new());
 
 /// Allocate a new notification.
 pub fn create() -> Option<NotifyId> {
     let mut ns = NOTIFICATIONS.lock();
-    let id = ns.alloc(Notification::new());
-    Some(NotifyId(id))
+    let handle = ns.alloc(Notification::new());
+    Some(NotifyId(handle))
 }
 
 /// Action decided under NOTIFICATIONS lock, executed after drop.
@@ -48,10 +48,10 @@ enum WaitAction {
 }
 
 /// Wait on a notification: if pending, clear and return; otherwise block.
-pub fn wait(id: u32) -> Result<(), SysError> {
+pub fn wait(handle: PoolHandle) -> Result<(), SysError> {
     let action = {
         let mut ns = NOTIFICATIONS.lock();
-        let n = ns.get_mut(id).ok_or(SysError::NotFound)?;
+        let n = ns.get_mut(handle).ok_or(SysError::NotFound)?;
 
         if n.pending {
             n.pending = false;
@@ -82,10 +82,10 @@ enum SignalAction {
 }
 
 /// Signal a notification: if a waiter exists, wake it; otherwise set pending.
-pub fn signal(id: u32) -> Result<(), SysError> {
+pub fn signal(handle: PoolHandle) -> Result<(), SysError> {
     let action = {
         let mut ns = NOTIFICATIONS.lock();
-        let n = ns.get_mut(id).ok_or(SysError::NotFound)?;
+        let n = ns.get_mut(handle).ok_or(SysError::NotFound)?;
 
         if let Some(tid) = n.waiting.take() {
             SignalAction::WakeWaiter(tid)
