@@ -1,9 +1,9 @@
 # sotOS Development Roadmap
 
-> Current state: All kernel primitives implemented and tested. 12 userspace threads
-> demonstrate sync/async IPC, capabilities, notifications, shared-memory, IRQ
-> virtualization, demand paging (VMM), and ELF loading from initramfs. First Rust
-> userspace program runs from disk.
+> Current state: SMP-capable microkernel. All five kernel primitives run across
+> multiple CPU cores. 12 userspace threads demonstrate sync/async IPC, capabilities,
+> notifications, shared-memory, IRQ virtualization, demand paging (VMM), and ELF
+> loading from initramfs. LAPIC timer provides per-CPU preemption. Tested on 1-4 cores.
 
 ---
 
@@ -74,7 +74,7 @@
 - [x] `sys_port_in(cap, port)` / `sys_port_out(cap, port, val)`: I/O port access
 - [x] Userspace keyboard driver (IRQ 1 → notification → port 0x60 read)
 - [x] Userspace serial driver (COM1 IRQ 4, receive interrupt, hex echo)
-- [ ] Detect APIC via CPUID / ACPI MADT (currently 8259 PIC only)
+- [x] LAPIC driver with per-CPU timer (Phase 8 delivered this)
 - [ ] Move serial output fully to userspace (keep `kprintln!` as kernel fallback)
 
 ### Milestone: Userspace drivers handle keyboard and serial via IRQ notifications.
@@ -146,27 +146,40 @@ This phase adds the lock-free userspace-only fast path.
 
 ---
 
-## Phase 8 — SMP (Multi-Core)
+## Phase 8 — SMP (Multi-Core) (DONE)
 
 **Goal**: The kernel runs on all available CPU cores.
 
 ### 8.1 AP Startup
-- [ ] Parse ACPI MADT to find all local APICs
-- [ ] Limine SMP request: get list of CPUs from bootloader
-- [ ] Boot Application Processors (APs) into the kernel
-- [ ] Per-CPU data structures (current thread, local APIC, per-CPU run queue)
+- [x] Limine MpRequest: get list of CPUs from bootloader
+- [x] Boot Application Processors (APs) into the kernel
+- [x] Per-CPU data via GS segment base (`PerCpu` struct, `IA32_GS_BASE` MSR)
+- [x] Per-CPU GDT+TSS (heap-allocated after slab init)
+- [x] Per-CPU SYSCALL MSRs, IDT reload, LAPIC init per AP
 
 ### 8.2 SMP Scheduler
-- [ ] Per-core run queues with work stealing
+- [x] Global run queue: any CPU can dequeue and run threads
+- [x] Per-CPU idle threads (never enqueued, only active when CPU has no work)
+- [x] Post-switch re-enqueue pattern (fixes race: old thread RSP saved before re-enqueue)
+- [x] `tick()` uses `try_lock()` to avoid deadlock when timer fires during SCHEDULER lock
+- [ ] Per-core run queues with work stealing (optimization, not needed yet)
 - [ ] Affinity hints: a thread can prefer a specific core (cache locality)
-- [ ] Global load balancer: periodically rebalance across cores
 
 ### 8.3 Synchronization
-- [ ] Audit all spinlocks for SMP safety (interrupt disable + spin)
-- [ ] Add ticket locks or MCS locks where contention is expected
+- [x] Serial lock (`spin::Mutex`) for SMP-safe `kprintln!`
+- [x] SYSCALL assembly uses GS-relative access (no `static mut` globals)
+- [x] BSP guard on PIC IRQ handlers (APs EOI LAPIC on spurious PIC IRQ)
+- [x] CPU index in panic output
 - [ ] IPI (Inter-Processor Interrupt) for cross-core notifications
+- [ ] Ticket/MCS locks where contention appears
 
-### Milestone: Kernel utilizes all cores. Threads migrate between cores.
+### 8.4 LAPIC Timer
+- [x] LAPIC MMIO driver (`lapic.rs`): init, calibrate, periodic timer, EOI
+- [x] Calibrated against PIT channel 2 (~10ms interval, ~100Hz)
+- [x] Replaces PIT for preemption (PIT IRQ masked)
+- [x] LAPIC timer vector 48, spurious vector 0xFF
+
+### Milestone: Kernel utilizes all cores. Threads schedule across CPUs. Tested 1-4 cores.
 
 ---
 
@@ -328,11 +341,11 @@ Phase  Scope                          Dependencies    Status
   1    Preemption + Context Switch    Phase 0         DONE
   2    Syscall + Ring 3               Phase 1         DONE
   3    IPC Send/Recv/Call + extras    Phase 2         DONE (no cap transfer, no benchmarks)
-  4    IRQ Virtualization             Phase 3         DONE (PIC only, no APIC)
+  4    IRQ Virtualization             Phase 3         DONE (LAPIC + PIC)
   5    VMM Server                     Phase 2         DONE
   6    ELF Loader + Initramfs         Phase 3,5       DONE (no full init service yet)
   7    Shared-Memory Channels         Phase 3         TODO (basic kernel channels done)
-  8    SMP (Multi-Core)               Phase 1         TODO
+  8    SMP (Multi-Core)               Phase 1         DONE (global queue, no work stealing)
   9    Scheduling Domains             Phase 8         TODO
  10    LUCAS (UNIX Compat Layer)      Phase 6,7,11    TODO
  11    Filesystem + Object Store      Phase 6         TODO
@@ -346,7 +359,7 @@ Phase  Scope                          Dependencies    Status
                          Phase 1 (DONE)
                         ╱          ╲
                 Phase 2              Phase 8
-                (DONE)               (SMP)
+                (DONE)               (DONE)
               ╱     ╲                   │
         Phase 3    Phase 5         Phase 9
         (DONE)     (DONE)     (Sched Domains)
@@ -372,13 +385,17 @@ Phase  Scope                          Dependencies    Status
 
 ## Immediate Next Steps
 
-Phases 0–6 are complete. The next unlocked phases are:
+Phases 0–8 are complete. The kernel is SMP-capable with all five primitives working
+across multiple cores. The next unlocked phases are:
 
-- **Phase 7 (Shared-Memory Channels)**: lock-free SPSC ring buffer in userspace for zero-syscall hot path. Basic kernel channels already work.
-- **Phase 8 (SMP)**: independent of Phases 7+, can be started in parallel. Requires APIC, per-CPU state, Limine SMP request, and lock audit.
+- **Phase 7 (Shared-Memory Channels)**: lock-free SPSC ring buffer in userspace for zero-syscall hot path. Basic kernel channels already work. Independent of other phases.
+- **Phase 9 (Scheduling Domains)**: now unlocked by Phase 8. Userspace custom schedulers with kernel-enforced time budgets.
+- **Phase 11 (Filesystem + Storage)**: virtio-blk driver + object store. Prerequisite for LUCAS (Phase 10).
 - **Phase 6 completion**: expand `services/init/` into a real init service that receives root capabilities and spawns VMM + drivers from config.
 
 ### Also open (smaller items from completed phases):
 - IPC capability transfer (Phase 3 leftover)
 - IPC latency benchmarks (Phase 3 leftover)
-- APIC detection (Phase 4 leftover — needed for Phase 8 anyway)
+- Per-core run queues + work stealing (Phase 8 optimization)
+- IPI for cross-core notifications (Phase 8 optimization)
+- Move serial output fully to userspace (Phase 4 leftover)
