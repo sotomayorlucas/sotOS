@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "libs/sotos-common",
+]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = 2

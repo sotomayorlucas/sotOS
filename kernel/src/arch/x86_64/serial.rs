@@ -1,0 +1,61 @@
+//! Minimal 16550 UART serial driver for early kernel output.
+//! COM1 at I/O port 0x3F8.
+
+use core::fmt;
+use super::io::{inb, outb};
+
+const COM1: u16 = 0x3F8;
+
+/// Initialize COM1 serial port at 38400 baud.
+pub fn init() {
+    unsafe {
+        outb(COM1 + 1, 0x00); // Disable all interrupts
+        outb(COM1 + 3, 0x80); // Enable DLAB (set baud rate divisor)
+        outb(COM1 + 0, 0x03); // Divisor low byte: 38400 baud
+        outb(COM1 + 1, 0x00); // Divisor high byte
+        outb(COM1 + 3, 0x03); // 8 bits, no parity, one stop bit
+        outb(COM1 + 2, 0xC7); // Enable FIFO, clear, 14-byte threshold
+        outb(COM1 + 4, 0x0B); // IRQs enabled, RTS/DSR set
+    }
+}
+
+/// Write a single byte to COM1, waiting for the transmit buffer.
+pub fn write_byte(byte: u8) {
+    unsafe {
+        // Wait for transmit holding register to be empty.
+        while inb(COM1 + 5) & 0x20 == 0 {}
+        outb(COM1, byte);
+    }
+}
+
+pub struct SerialWriter;
+
+impl fmt::Write for SerialWriter {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for byte in s.bytes() {
+            if byte == b'\n' {
+                write_byte(b'\r');
+            }
+            write_byte(byte);
+        }
+        Ok(())
+    }
+}
+
+/// Internal print function used by the kprint!/kprintln! macros.
+#[doc(hidden)]
+pub fn _print(args: fmt::Arguments) {
+    use fmt::Write;
+    SerialWriter.write_fmt(args).unwrap();
+}
+
+#[macro_export]
+macro_rules! kprint {
+    ($($arg:tt)*) => ($crate::arch::serial::_print(format_args!($($arg)*)));
+}
+
+#[macro_export]
+macro_rules! kprintln {
+    () => ($crate::kprint!("\n"));
+    ($($arg:tt)*) => ($crate::kprint!("{}\n", format_args!($($arg)*)));
+}

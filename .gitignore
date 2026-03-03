@@ -1,0 +1,6 @@
+/target
+*.iso
+*.img
+limine/
+**/*.o
+**/*.d

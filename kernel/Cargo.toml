@@ -1,0 +1,11 @@
+[package]
+name = "sotos-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+limine = "0.5"
+x86_64 = "0.15"
+spin = { version = "0.9", default-features = false, features = ["lazy", "mutex", "spin_mutex"] }
+sotos-common = { path = "../libs/sotos-common" }
+

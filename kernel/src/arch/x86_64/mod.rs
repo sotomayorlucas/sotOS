@@ -1,0 +1,15 @@
+pub mod gdt;
+pub mod idt;
+pub mod io;
+pub mod pic;
+pub mod pit;
+pub mod serial;
+pub mod syscall;
+
+/// Halt the CPU in a loop. Used after kernel initialization
+/// and as the final stop for panics.
+pub fn halt_loop() -> ! {
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
