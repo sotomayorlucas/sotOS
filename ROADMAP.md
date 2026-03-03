@@ -1,9 +1,11 @@
 # sotOS Development Roadmap
 
-> Current state: SMP-capable microkernel. All five kernel primitives run across
-> multiple CPU cores. 12 userspace threads demonstrate sync/async IPC, capabilities,
-> notifications, shared-memory, IRQ virtualization, demand paging (VMM), and ELF
-> loading from initramfs. LAPIC timer provides per-CPU preemption. Tested on 1-4 cores.
+> Current state: SMP-capable microkernel with lock-free userspace IPC. All five kernel
+> primitives run across multiple CPU cores. Lock-free SPSC shared-memory channels
+> provide zero-syscall hot-path messaging. 12+ userspace threads demonstrate sync/async
+> IPC, capabilities, notifications, shared-memory, IRQ virtualization, demand paging
+> (VMM), ELF loading from initramfs, and SPSC data streaming. LAPIC timer provides
+> per-CPU preemption. Tested on 1-4 cores.
 
 ---
 
@@ -107,7 +109,7 @@
 - [x] CPIO initrd builder (`scripts/mkinitrd.py`)
 - [x] Limine ModuleRequest delivers initrd as boot module
 - [x] `sotos-common::sys` module: raw syscall wrappers for userspace
-- [x] First Rust userspace program (`services/init/`): prints "ELF!\n"
+- [x] First Rust userspace program (`services/init/`): now runs SPSC channel demo
 - [x] Build pipeline: `build-user` → `initrd` → `image` → `run`
 - [ ] Init service that spawns further processes (currently just a test)
 - [ ] Root capability delegation from kernel to init
@@ -117,20 +119,26 @@
 
 ---
 
-## Phase 7 — Shared-Memory Channels (Fast IPC)
+## Phase 7 — Shared-Memory Channels (Fast IPC) (DONE)
 
 **Goal**: High-throughput zero-copy data transfer between services.
 
 Basic async channels (kernel ring buffers) already exist from Phase 3 extras.
 This phase adds the lock-free userspace-only fast path.
 
-### 7.1 Lock-Free SPSC Ring Buffer
-- [ ] Kernel allocates shared memory region between two processes
-- [ ] Lock-free single-producer single-consumer ring buffer in userspace
-  - Producer writes data + updates write pointer (atomic store)
-  - Consumer reads data + updates read pointer (atomic store)
+### 7.1 Lock-Free SPSC Ring Buffer (DONE)
+- [x] Lock-free SPSC ring buffer library in `sotos-common` (`spsc.rs`)
+  - Head/tail on separate cache lines (align(64)) to avoid false sharing on SMP
+  - 128 u64 slots in one 4 KiB shared page (192B header + 1024B data)
+  - Producer writes data + updates tail (atomic Release store)
+  - Consumer reads data + updates head (atomic Release store)
   - Zero syscalls on the hot path
-- [ ] Syscall only needed for block/wake when ring is full/empty
+- [x] Syscall only on block/wake: `notify_wait`/`notify_signal` on empty→non-empty / full→non-full transitions
+- [x] Typed syscall wrappers in `sotos-common::sys`: `frame_alloc`, `map`, `notify_create/wait/signal`, `thread_create`
+- [x] Multi-argument syscall helpers: `syscall2`, `syscall3`
+- [x] Init service rewritten as SPSC demo: consumer/producer stream 1000 messages, verified sum=499500
+- [x] No new kernel primitives — composes existing syscalls from userspace
+- [x] **Kernel bugfix**: `percpu.user_rsp_save` per-CPU corruption on blocking syscalls — saved/restored per-thread in `syscall_dispatch()`
 
 ### 7.2 Typed Channels (IDL)
 - [ ] Design an Interface Definition Language for message schemas
@@ -142,7 +150,7 @@ This phase adds the lock-free userspace-only fast path.
 - [ ] Compare: endpoint IPC vs shared-memory channel vs raw memcpy baseline
 - [ ] Target: channel throughput within 10% of raw memcpy
 
-### Milestone: Zero-copy data streaming between services at near-memcpy speed.
+### Milestone: Lock-free SPSC ring buffer working in userspace shared memory. 1000 messages streamed with zero-syscall hot path.
 
 ---
 
@@ -344,7 +352,7 @@ Phase  Scope                          Dependencies    Status
   4    IRQ Virtualization             Phase 3         DONE (LAPIC + PIC)
   5    VMM Server                     Phase 2         DONE
   6    ELF Loader + Initramfs         Phase 3,5       DONE (no full init service yet)
-  7    Shared-Memory Channels         Phase 3         TODO (basic kernel channels done)
+  7    Shared-Memory Channels         Phase 3         DONE (SPSC lock-free, IDL+bench TODO)
   8    SMP (Multi-Core)               Phase 1         DONE (global queue, no work stealing)
   9    Scheduling Domains             Phase 8         TODO
  10    LUCAS (UNIX Compat Layer)      Phase 6,7,11    TODO
@@ -365,7 +373,7 @@ Phase  Scope                          Dependencies    Status
         (DONE)     (DONE)     (Sched Domains)
         ╱    ╲        │
   Phase 4   Phase 7   │
-  (DONE)   (Channels)  │
+  (DONE)    (DONE)     │
         ╲    ╱        ╱
          Phase 6
          (DONE)
@@ -385,12 +393,12 @@ Phase  Scope                          Dependencies    Status
 
 ## Immediate Next Steps
 
-Phases 0–8 are complete. The kernel is SMP-capable with all five primitives working
-across multiple cores. The next unlocked phases are:
+Phases 0–8 are complete, plus Phase 7 (shared-memory SPSC channels). The kernel is
+SMP-capable with lock-free userspace IPC. The next unlocked phases are:
 
-- **Phase 7 (Shared-Memory Channels)**: lock-free SPSC ring buffer in userspace for zero-syscall hot path. Basic kernel channels already work. Independent of other phases.
 - **Phase 9 (Scheduling Domains)**: now unlocked by Phase 8. Userspace custom schedulers with kernel-enforced time budgets.
 - **Phase 11 (Filesystem + Storage)**: virtio-blk driver + object store. Prerequisite for LUCAS (Phase 10).
+- **Phase 7 completion**: IDL-based typed channels and throughput benchmarks.
 - **Phase 6 completion**: expand `services/init/` into a real init service that receives root capabilities and spawns VMM + drivers from config.
 
 ### Also open (smaller items from completed phases):
@@ -399,3 +407,4 @@ across multiple cores. The next unlocked phases are:
 - Per-core run queues + work stealing (Phase 8 optimization)
 - IPI for cross-core notifications (Phase 8 optimization)
 - Move serial output fully to userspace (Phase 4 leftover)
+- Fix slab allocator >4096 byte limit (exposed by SMP 4+ with many objects)
