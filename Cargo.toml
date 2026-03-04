@@ -5,6 +5,7 @@ members = [
     "libs/sotos-common",
     "libs/sotos-pci",
     "libs/sotos-virtio",
+    "libs/sotos-objstore",
 ]
 exclude = [
     "services/init",

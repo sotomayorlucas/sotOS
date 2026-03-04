@@ -1,22 +1,18 @@
 # sotOS (Secure Object Transactional Operating System) — Development Roadmap
 
-> Current state: SMP-capable microkernel with scheduling domains (budget-enforced
-> thread groups), per-core scheduling, lock-free userspace IPC, capability transfer,
-> IPC benchmarks, and a userspace virtio-blk block device driver. All five kernel
+> Current state: SMP-capable microkernel with scheduling domains, transactional object
+> store with WAL for crash consistency, and a POSIX-like VFS shim. All five kernel
 > primitives run across multiple CPU cores with per-core run queues and work stealing.
-> Scheduling domains provide kernel-enforced CPU time budgets for thread groups
-> (seL4-inspired model). Lock-free SPSC shared-memory channels provide zero-syscall
-> hot-path messaging with typed wrappers. Userspace PCI enumeration and virtio-blk
-> driver demonstrate device driver model: PCI config space access, DMA via contiguous
-> frame allocation, IRQ-driven I/O completion, and block read/write through capabilities.
-> 12+ userspace threads demonstrate sync/async IPC, capabilities, notifications,
-> shared-memory, IRQ virtualization, demand paging (VMM), ELF loading from initramfs,
-> SPSC data streaming, IPC benchmarks, and virtio block I/O. Init process receives root
-> capabilities via BootInfo page. LAPIC timer provides per-CPU preemption. IPI support
-> for cross-core notifications. Ticket spinlocks for FIFO-fair locking. Tested on 1-4
-> cores. Technical hardening complete: generation-checked Pool<T> (ABA protection), O(1)
-> thread lookup, lock ordering enforcement, per-CPU slab caches, complete syscall
-> wrappers for assembly→Rust migration.
+> Scheduling domains provide kernel-enforced CPU time budgets (seL4-inspired). Lock-free
+> SPSC shared-memory channels provide zero-syscall hot-path messaging. The object store
+> (`sotos-objstore`) provides named blob storage on top of virtio-blk with WAL-based
+> atomic metadata updates, block bitmap allocation, and a VFS with file handles
+> (open/read/write/seek/close/delete). Data persists across re-mounts. Userspace PCI
+> enumeration and virtio-blk driver demonstrate device driver model. 12+ userspace
+> threads demonstrate sync/async IPC, capabilities, notifications, shared-memory, IRQ
+> virtualization, demand paging (VMM), ELF loading, SPSC streaming, IPC benchmarks,
+> virtio block I/O, and filesystem operations. Technical hardening complete:
+> generation-checked Pool<T>, O(1) thread lookup, lock ordering, per-CPU slab caches.
 
 ---
 
@@ -375,17 +371,25 @@ capability-based primitives — entirely in Ring 3.
 - [x] PCI config space cap (0xCF8–0xCFF) in init BootInfo
 - [x] Integration demo: PCI enumerate → find virtio-blk → read/write/verify sectors
 
-### 11.2 Object Store
-- [ ] Transactional object store (userspace service)
-- [ ] Write-Ahead Log (WAL) for crash consistency
-- [ ] Copy-on-Write snapshots for object versioning
-- [ ] Schema-based typed objects with 128-bit OIDs
+### 11.2 Object Store (DONE)
+- [x] Transactional object store library (`libs/sotos-objstore`)
+- [x] On-disk layout: superblock, WAL (4-entry), block bitmap (2 sectors), directory (32 entries)
+- [x] Write-Ahead Log (WAL) for crash consistency (4-phase commit protocol)
+- [x] Block bitmap allocator: contiguous allocation, free, count
+- [x] CRUD operations: create, read_obj, write_obj, delete, find, stat, list
+- [x] WAL replay on mount (committed-but-not-applied transactions replayed)
+- [x] In-memory store placed at 0xD00000 (3 pages) to avoid stack overflow
+- [ ] Copy-on-Write snapshots for object versioning (deferred)
+- [ ] Schema-based typed objects with 128-bit OIDs (deferred)
 
-### 11.3 POSIX Compatibility
-- [ ] VFS shim: translates open/read/write/close to object store operations
-- [ ] Enough for basic utilities (shell, coreutils)
+### 11.3 POSIX VFS Shim (DONE)
+- [x] VFS shim in `sotos-objstore::vfs`: translates open/read/write/seek/close/delete
+- [x] 16 file handles with position tracking and access flags (O_RDONLY/O_WRONLY/O_RDWR)
+- [x] Read-modify-write for partial writes (temp buffer at 0xD03000)
+- [x] Integration demo: format → create files → read/write → list → delete → re-mount verify
+- [ ] Enough for basic utilities (shell, coreutils) — needs syscall integration (deferred)
 
-### Milestone: Data persists across reboots. Object store with transactional guarantees.
+### Milestone: Data persists across re-mounts. Object store with WAL transactional guarantees. VFS file operations work end-to-end.
 
 ---
 
@@ -456,7 +460,7 @@ Phase  Scope                          Dependencies    Status
  16    Technical Hardening            Phase 8         DONE (ABA protection, O(1) lookup, lock ordering, per-CPU slab)
   9    Scheduling Domains             Phase 8         DONE (budget enforcement, 5 syscalls, cap-based)
  10    LUCAS (UNIX Compat Layer)      Phase 6,7,11    TODO
- 11    Filesystem + Object Store      Phase 6         11.1 DONE (block driver)
+ 11    Filesystem + Object Store      Phase 6         DONE (block driver + objstore + VFS)
  12    Networking + Distribution      Phase 6,11      TODO
  13    Verification + Hardening       Phase 3+        TODO
 ```
@@ -493,15 +497,12 @@ Phase  Scope                          Dependencies    Status
 
 ## Immediate Next Steps
 
-Phases 0–9, Phase 16 (Technical Hardening), and Phase 11.1 (Block Device Driver) are
-complete. The kernel is SMP-capable with scheduling domains, generation-checked object
-pools, O(1) scheduler lookups, per-CPU slab caches, lock ordering enforcement, a complete
-syscall wrapper ABI, and a userspace virtio-blk block device driver with PCI enumeration.
-The next unlocked phases are:
+Phases 0–9, Phase 11 (complete), and Phase 16 (Technical Hardening) are done. The kernel
+is SMP-capable with scheduling domains, transactional object store, VFS, and a complete
+userspace driver model. The next unlocked phases are:
 
-- **Phase 11.2 (Object Store)**: transactional object store + WAL on top of virtio-blk.
-- **Phase 11.3 (POSIX VFS)**: VFS shim translating open/read/write/close to object store ops.
-- **Assembly blob → Rust migration**: all syscall wrappers now available in sotos-common; init service blobs can be rewritten in Rust.
-- **Full IDL-based typed channels**: code generator from IDL → Rust stubs (Phase 7 stretch).
-- **Expand init service**: spawn VMM + drivers from config, full process lifecycle management.
+- **Phase 10 (LUCAS)**: UNIX compatibility layer — syscall interceptor, VFS bridge, process coordinator.
+- **Phase 12 (Networking)**: virtio-net driver, IP/UDP/TCP stack, remote IPC.
+- **Assembly blob → Rust migration**: all syscall wrappers now available in sotos-common.
+- **Object store extensions**: CoW snapshots, schema-based types, 128-bit OIDs, directory hierarchy.
 - **Domain extensions**: CPU pinning, priority inheritance, domain destruction, exclusive cores.

@@ -6,6 +6,7 @@ use sotos_common::spsc;
 use sotos_common::{BootInfo, BOOT_INFO_ADDR};
 use sotos_pci::PciBus;
 use sotos_virtio::blk::VirtioBlk;
+use sotos_objstore::{ObjectStore, Vfs, DirEntry, DIR_ENTRY_COUNT};
 
 /// Shared memory page for the SPSC ring buffer.
 const RING_ADDR: u64 = 0xA00000;
@@ -92,7 +93,7 @@ pub extern "C" fn _start() -> ! {
     // --- Phase 3: Benchmarks ---
     run_benchmarks(ring);
 
-    // --- Phase 4: Virtio-BLK demo ---
+    // --- Phase 4: Virtio-BLK demo + Object Store ---
     run_virtio_blk_demo(boot_info);
 
     sys::thread_exit();
@@ -170,18 +171,14 @@ fn print_hex(val: u32) {
     }
 }
 
-fn run_virtio_blk_demo(boot_info: &BootInfo) {
-    // Cap 10 is the PCI config space port cap (0xCF8-0xCFF).
-    // Check if we have enough caps.
+fn init_virtio_blk(boot_info: &BootInfo) -> Option<VirtioBlk> {
     if boot_info.cap_count < 11 {
         print(b"BLK: no PCI cap, skipping\n");
-        return;
+        return None;
     }
     let pci_cap = boot_info.caps[10];
-
     let pci = PciBus::new(pci_cap);
 
-    // Enumerate PCI bus 0.
     let (devices, count) = pci.enumerate::<32>();
     print(b"PCI: ");
     print_u64(count as u64);
@@ -204,12 +201,11 @@ fn run_virtio_blk_demo(boot_info: &BootInfo) {
         print(b"\n");
     }
 
-    // Find virtio-blk device (vendor=0x1AF4, device=0x1001).
     let blk_dev = match pci.find_device(0x1AF4, 0x1001) {
         Some(d) => d,
         None => {
             print(b"BLK: virtio-blk not found\n");
-            return;
+            return None;
         }
     };
 
@@ -219,20 +215,27 @@ fn run_virtio_blk_demo(boot_info: &BootInfo) {
     print_u64(blk_dev.irq_line as u64);
     print(b"\n");
 
-    // Initialize the virtio-blk driver.
-    let mut blk = match VirtioBlk::init(&blk_dev, &pci) {
-        Ok(b) => b,
+    match VirtioBlk::init(&blk_dev, &pci) {
+        Ok(blk) => {
+            print(b"BLK: ");
+            print_u64(blk.capacity);
+            print(b" sectors\n");
+            Some(blk)
+        }
         Err(e) => {
             print(b"BLK: init failed: ");
             print(e.as_bytes());
             print(b"\n");
-            return;
+            None
         }
-    };
+    }
+}
 
-    print(b"BLK: ");
-    print_u64(blk.capacity);
-    print(b" sectors\n");
+fn run_virtio_blk_demo(boot_info: &BootInfo) {
+    let mut blk = match init_virtio_blk(boot_info) {
+        Some(b) => b,
+        None => return,
+    };
 
     // Read sector 0 and print first 16 bytes.
     match blk.read_sector(0) {
@@ -259,7 +262,6 @@ fn run_virtio_blk_demo(boot_info: &BootInfo) {
     // Write "WROTE\0" to sector 1.
     {
         let data = unsafe { core::slice::from_raw_parts_mut(blk.data_ptr_mut(), 512) };
-        // Zero the buffer first.
         for b in data.iter_mut() {
             *b = 0;
         }
@@ -296,8 +298,147 @@ fn run_virtio_blk_demo(boot_info: &BootInfo) {
             print(b"BLK VERIFY ERR: ");
             print(e.as_bytes());
             print(b"\n");
+            return;
         }
     }
+
+    // --- Object Store + VFS demo ---
+    run_objstore_demo(blk);
+}
+
+fn run_objstore_demo(blk: VirtioBlk) {
+    // 1. Format a new filesystem.
+    let store = match ObjectStore::format(blk) {
+        Ok(s) => s,
+        Err(e) => {
+            print(b"OBJSTORE: format failed: ");
+            print(e.as_bytes());
+            print(b"\n");
+            return;
+        }
+    };
+
+    // 2. Create VFS.
+    let mut vfs = Vfs::new(store);
+
+    // 3. Create and write hello.txt.
+    let fd = match vfs.create(b"hello.txt") {
+        Ok(f) => f,
+        Err(e) => {
+            print(b"VFS CREATE ERR: ");
+            print(e.as_bytes());
+            print(b"\n");
+            return;
+        }
+    };
+    if let Err(e) = vfs.write(fd, b"Hello from sotOS!") {
+        print(b"VFS WRITE ERR: ");
+        print(e.as_bytes());
+        print(b"\n");
+        return;
+    }
+    let _ = vfs.close(fd);
+
+    // 4. Read back hello.txt.
+    let fd = match vfs.open(b"hello.txt", 1) {
+        Ok(f) => f,
+        Err(e) => {
+            print(b"VFS OPEN ERR: ");
+            print(e.as_bytes());
+            print(b"\n");
+            return;
+        }
+    };
+    let mut buf = [0u8; 64];
+    match vfs.read(fd, &mut buf) {
+        Ok(n) => {
+            print(b"VFS READ: ");
+            print(&buf[..n]);
+            print(b"\n");
+        }
+        Err(e) => {
+            print(b"VFS READ ERR: ");
+            print(e.as_bytes());
+            print(b"\n");
+        }
+    }
+    let _ = vfs.close(fd);
+
+    // 5. Create data.bin with binary data.
+    let fd = match vfs.create(b"data.bin") {
+        Ok(f) => f,
+        Err(e) => {
+            print(b"VFS CREATE ERR: ");
+            print(e.as_bytes());
+            print(b"\n");
+            return;
+        }
+    };
+    let _ = vfs.write(fd, &[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE]);
+    let _ = vfs.close(fd);
+
+    // 6. List files.
+    let mut entries = [DirEntry::zeroed(); DIR_ENTRY_COUNT];
+    let count = vfs.store().list(&mut entries);
+    print(b"VFS LIST: ");
+    print_u64(count as u64);
+    print(b" files\n");
+    for i in 0..count {
+        print(b"  ");
+        print(entries[i].name_as_str());
+        print(b" oid=");
+        print_u64(entries[i].oid);
+        print(b" size=");
+        print_u64(entries[i].size);
+        print(b"\n");
+    }
+
+    // 7. Delete data.bin.
+    if let Err(e) = vfs.delete(b"data.bin") {
+        print(b"VFS DELETE ERR: ");
+        print(e.as_bytes());
+        print(b"\n");
+    }
+    let remain = vfs.store().list(&mut entries);
+    print(b"VFS: ");
+    print_u64(remain as u64);
+    print(b" files remain\n");
+
+    // 8. Re-mount from disk and verify persistence.
+    let blk = vfs.store_mut().into_blk();
+    let store = match ObjectStore::mount(blk) {
+        Ok(s) => s,
+        Err(e) => {
+            print(b"OBJSTORE: mount failed: ");
+            print(e.as_bytes());
+            print(b"\n");
+            return;
+        }
+    };
+    let mut vfs = Vfs::new(store);
+    let fd = match vfs.open(b"hello.txt", 1) {
+        Ok(f) => f,
+        Err(e) => {
+            print(b"VFS REMOUNT OPEN ERR: ");
+            print(e.as_bytes());
+            print(b"\n");
+            return;
+        }
+    };
+    let mut buf2 = [0u8; 64];
+    match vfs.read(fd, &mut buf2) {
+        Ok(n) => {
+            print(b"VFS REMOUNT READ: ");
+            print(&buf2[..n]);
+            print(b"\n");
+        }
+        Err(e) => {
+            print(b"VFS REMOUNT READ ERR: ");
+            print(e.as_bytes());
+            print(b"\n");
+        }
+    }
+    let _ = vfs.close(fd);
 }
 
 fn panic_halt() -> ! {
