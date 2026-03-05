@@ -1805,6 +1805,9 @@ pub extern "C" fn lucas_handler() -> ! {
     let mut dir_len: usize = 0;
     let mut dir_pos: usize = 0;
 
+    // Current working directory OID
+    let mut cwd_oid: u64 = sotos_objstore::ROOT_OID;
+
     // brk heap tracking
     let mut current_brk: u64 = BRK_BASE;
 
@@ -2006,21 +2009,29 @@ pub extern "C" fn lucas_handler() -> ! {
                     }
                 };
 
-                // "." → directory listing
+                // "." → directory listing of cwd; other paths may also be dirs
                 if path_len == 1 && path[0] == b'.' {
                     dir_len = 0;
                     dir_pos = 0;
                     if let Some(vfs) = vfs_opt.as_ref() {
                         let mut entries = [DirEntry::zeroed(); DIR_ENTRY_COUNT];
-                        let count = vfs.store().list(&mut entries);
+                        let count = vfs.store().list_dir(cwd_oid, &mut entries);
                         for i in 0..count {
                             let ename = entries[i].name_as_str();
                             let elen = ename.len();
                             if dir_len + elen + 20 > dir_buf.len() {
                                 break;
                             }
-                            dir_buf[dir_len..dir_len + elen].copy_from_slice(ename);
-                            dir_len += elen;
+                            // Show d/ prefix for directories
+                            if entries[i].is_dir() {
+                                dir_buf[dir_len..dir_len + elen].copy_from_slice(ename);
+                                dir_len += elen;
+                                dir_buf[dir_len] = b'/';
+                                dir_len += 1;
+                            } else {
+                                dir_buf[dir_len..dir_len + elen].copy_from_slice(ename);
+                                dir_len += elen;
+                            }
                             dir_buf[dir_len] = b' ';
                             dir_buf[dir_len + 1] = b' ';
                             dir_len += 2;
@@ -2103,8 +2114,122 @@ pub extern "C" fn lucas_handler() -> ! {
                     continue;
                 }
 
+                // /snap virtual path for snapshot operations
+                if starts_with(name, b"/snap/") {
+                    let snap_cmd = &path[6..path_len];
+
+                    if starts_with(snap_cmd, b"create/") && snap_cmd.len() > 7 {
+                        let snap_name = &snap_cmd[7..];
+                        match vfs_opt.as_mut() {
+                            Some(vfs) => {
+                                match vfs.store_mut().snap_create(snap_name) {
+                                    Ok(_) => {
+                                        dir_len = 0;
+                                        dir_pos = 0;
+                                        let msg_text = b"snapshot created\n";
+                                        dir_buf[..msg_text.len()].copy_from_slice(msg_text);
+                                        dir_len = msg_text.len();
+                                        fds[new_fd] = FdEntry { kind: FdKind::DirList, vfs_fd: 0, net_conn_id: 0 };
+                                        reply_val(ep_cap, new_fd as i64);
+                                    }
+                                    Err(_) => reply_val(ep_cap, -28), // -ENOSPC
+                                }
+                            }
+                            None => reply_val(ep_cap, -2),
+                        }
+                        continue;
+                    } else if snap_cmd == b"list" {
+                        dir_len = 0;
+                        dir_pos = 0;
+                        match vfs_opt.as_ref() {
+                            Some(vfs) => {
+                                let mut snaps = [sotos_objstore::SnapMeta::zeroed(); sotos_objstore::MAX_SNAPSHOTS];
+                                let count = vfs.store().snap_list(&mut snaps);
+                                if count == 0 {
+                                    let msg_text = b"no snapshots\n";
+                                    dir_buf[..msg_text.len()].copy_from_slice(msg_text);
+                                    dir_len = msg_text.len();
+                                } else {
+                                    for i in 0..count {
+                                        let sname = snaps[i].name_as_str();
+                                        if dir_len + sname.len() + 10 > dir_buf.len() { break; }
+                                        dir_buf[dir_len..dir_len + sname.len()].copy_from_slice(sname);
+                                        dir_len += sname.len();
+                                        dir_buf[dir_len] = b'\n';
+                                        dir_len += 1;
+                                    }
+                                }
+                            }
+                            None => {
+                                let msg_text = b"no VFS\n";
+                                dir_buf[..msg_text.len()].copy_from_slice(msg_text);
+                                dir_len = msg_text.len();
+                            }
+                        }
+                        fds[new_fd] = FdEntry { kind: FdKind::DirList, vfs_fd: 0, net_conn_id: 0 };
+                        reply_val(ep_cap, new_fd as i64);
+                        continue;
+                    } else if starts_with(snap_cmd, b"restore/") && snap_cmd.len() > 8 {
+                        let snap_name = &snap_cmd[8..];
+                        match vfs_opt.as_mut() {
+                            Some(vfs) => {
+                                match vfs.store_mut().snap_find(snap_name) {
+                                    Some(slot) => {
+                                        match vfs.store_mut().snap_restore(slot) {
+                                            Ok(()) => {
+                                                dir_len = 0;
+                                                dir_pos = 0;
+                                                let msg_text = b"snapshot restored\n";
+                                                dir_buf[..msg_text.len()].copy_from_slice(msg_text);
+                                                dir_len = msg_text.len();
+                                                fds[new_fd] = FdEntry { kind: FdKind::DirList, vfs_fd: 0, net_conn_id: 0 };
+                                                reply_val(ep_cap, new_fd as i64);
+                                            }
+                                            Err(_) => reply_val(ep_cap, -5), // -EIO
+                                        }
+                                    }
+                                    None => reply_val(ep_cap, -2), // -ENOENT
+                                }
+                            }
+                            None => reply_val(ep_cap, -2),
+                        }
+                        continue;
+                    } else if starts_with(snap_cmd, b"delete/") && snap_cmd.len() > 7 {
+                        let snap_name = &snap_cmd[7..];
+                        match vfs_opt.as_mut() {
+                            Some(vfs) => {
+                                match vfs.store_mut().snap_find(snap_name) {
+                                    Some(slot) => {
+                                        match vfs.store_mut().snap_delete(slot) {
+                                            Ok(()) => {
+                                                dir_len = 0;
+                                                dir_pos = 0;
+                                                let msg_text = b"snapshot deleted\n";
+                                                dir_buf[..msg_text.len()].copy_from_slice(msg_text);
+                                                dir_len = msg_text.len();
+                                                fds[new_fd] = FdEntry { kind: FdKind::DirList, vfs_fd: 0, net_conn_id: 0 };
+                                                reply_val(ep_cap, new_fd as i64);
+                                            }
+                                            Err(_) => reply_val(ep_cap, -5),
+                                        }
+                                    }
+                                    None => reply_val(ep_cap, -2),
+                                }
+                            }
+                            None => reply_val(ep_cap, -2),
+                        }
+                        continue;
+                    } else {
+                        reply_val(ep_cap, -2);
+                        continue;
+                    }
+                }
+
                 match vfs_opt.as_mut() {
                     Some(vfs) => {
+                        // Sync cwd before path resolution
+                        vfs.cwd = cwd_oid;
+
                         let linux_access = flags & 0x3;
                         let has_creat = flags & 0x40 != 0;
                         let vfs_flags = match linux_access {
@@ -2179,25 +2304,27 @@ pub extern "C" fn lucas_handler() -> ! {
                 let path_len = copy_guest_path(path_ptr, &mut path);
                 let name = &path[..path_len];
 
-                // "." → directory
+                // "." → current directory
                 if path_len == 1 && path[0] == b'.' {
-                    write_linux_stat(stat_ptr, 1, 0, true);
+                    write_linux_stat(stat_ptr, cwd_oid, 0, true);
                     reply_val(ep_cap, 0);
                     continue;
                 }
 
                 match vfs_opt.as_ref() {
                     Some(vfs) => {
-                        match vfs.store().find(name) {
-                            Some(oid) => {
-                                let size = match vfs.store().stat(oid) {
-                                    Some(entry) => entry.size,
-                                    None => 0,
-                                };
-                                write_linux_stat(stat_ptr, oid, size, false);
-                                reply_val(ep_cap, 0);
+                        match vfs.store().resolve_path(name, cwd_oid) {
+                            Ok(oid) => {
+                                match vfs.store().stat(oid) {
+                                    Some(entry) => {
+                                        let is_dir = entry.is_dir();
+                                        write_linux_stat(stat_ptr, oid, entry.size, is_dir);
+                                        reply_val(ep_cap, 0);
+                                    }
+                                    None => reply_val(ep_cap, -2),
+                                }
                             }
-                            None => reply_val(ep_cap, -2),
+                            Err(_) => reply_val(ep_cap, -2),
                         }
                     }
                     None => reply_val(ep_cap, -2),
@@ -2570,6 +2697,126 @@ pub extern "C" fn lucas_handler() -> ! {
                 reply_val(ep_cap, 0);
             }
 
+            // SYS_getcwd(buf, size)
+            79 => {
+                let buf_ptr = msg.regs[0];
+                let buf_size = msg.regs[1] as usize;
+
+                match vfs_opt.as_ref() {
+                    Some(vfs) => {
+                        let mut cwd_buf = [0u8; 128];
+                        let len = {
+                            // Temporarily create a Vfs-like view for getcwd
+                            // We need to walk the store's dir entries
+                            let store = vfs.store();
+                            let mut oids = [0u64; 16];
+                            let mut depth = 0;
+                            let mut cur = cwd_oid;
+                            while cur != sotos_objstore::ROOT_OID && depth < 16 {
+                                oids[depth] = cur;
+                                depth += 1;
+                                if let Some(entry) = store.stat(cur) {
+                                    let parent = entry.parent_oid;
+                                    cur = if parent == 0 { sotos_objstore::ROOT_OID } else { parent };
+                                } else {
+                                    break;
+                                }
+                            }
+                            let mut pos = 0;
+                            if depth == 0 {
+                                cwd_buf[0] = b'/';
+                                pos = 1;
+                            } else {
+                                let mut i = depth;
+                                while i > 0 {
+                                    i -= 1;
+                                    if pos < cwd_buf.len() { cwd_buf[pos] = b'/'; pos += 1; }
+                                    if let Some(entry) = store.stat(oids[i]) {
+                                        let name = entry.name_as_str();
+                                        let copy_len = name.len().min(cwd_buf.len() - pos);
+                                        cwd_buf[pos..pos + copy_len].copy_from_slice(&name[..copy_len]);
+                                        pos += copy_len;
+                                    }
+                                }
+                            }
+                            pos
+                        };
+                        let copy_len = len.min(buf_size);
+                        let dst = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, copy_len) };
+                        dst.copy_from_slice(&cwd_buf[..copy_len]);
+                        if copy_len < buf_size {
+                            unsafe { *((buf_ptr + copy_len as u64) as *mut u8) = 0; }
+                        }
+                        reply_val(ep_cap, buf_ptr as i64);
+                    }
+                    None => reply_val(ep_cap, -2),
+                }
+            }
+
+            // SYS_chdir(path)
+            80 => {
+                let path_ptr = msg.regs[0];
+                let mut path = [0u8; 48];
+                let path_len = copy_guest_path(path_ptr, &mut path);
+                let name = &path[..path_len];
+
+                match vfs_opt.as_ref() {
+                    Some(vfs) => {
+                        match vfs.store().resolve_path(name, cwd_oid) {
+                            Ok(oid) => {
+                                match vfs.store().stat(oid) {
+                                    Some(entry) if entry.is_dir() => {
+                                        cwd_oid = oid;
+                                        reply_val(ep_cap, 0);
+                                    }
+                                    _ => reply_val(ep_cap, -20), // -ENOTDIR
+                                }
+                            }
+                            Err(_) => reply_val(ep_cap, -2), // -ENOENT
+                        }
+                    }
+                    None => reply_val(ep_cap, -2),
+                }
+            }
+
+            // SYS_mkdir(path, mode)
+            83 => {
+                let path_ptr = msg.regs[0];
+                let mut path = [0u8; 48];
+                let path_len = copy_guest_path(path_ptr, &mut path);
+                let name = &path[..path_len];
+
+                match vfs_opt.as_mut() {
+                    Some(vfs) => {
+                        vfs.cwd = cwd_oid;
+                        match vfs.mkdir(name) {
+                            Ok(_) => reply_val(ep_cap, 0),
+                            Err(_) => reply_val(ep_cap, -2),
+                        }
+                    }
+                    None => reply_val(ep_cap, -2),
+                }
+            }
+
+            // SYS_rmdir(path)
+            84 => {
+                let path_ptr = msg.regs[0];
+                let mut path = [0u8; 48];
+                let path_len = copy_guest_path(path_ptr, &mut path);
+                let name = &path[..path_len];
+
+                match vfs_opt.as_mut() {
+                    Some(vfs) => {
+                        vfs.cwd = cwd_oid;
+                        match vfs.rmdir(name) {
+                            Ok(()) => reply_val(ep_cap, 0),
+                            Err(_) => reply_val(ep_cap, -2),
+                        }
+                    }
+                    None => reply_val(ep_cap, -2),
+                }
+            }
+
             // SYS_unlink(path)
             87 => {
                 let path_ptr = msg.regs[0];
@@ -2579,6 +2826,7 @@ pub extern "C" fn lucas_handler() -> ! {
 
                 match vfs_opt.as_mut() {
                     Some(vfs) => {
+                        vfs.cwd = cwd_oid;
                         match vfs.delete(name) {
                             Ok(()) => reply_val(ep_cap, 0),
                             Err(_) => reply_val(ep_cap, -2),

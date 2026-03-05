@@ -1,7 +1,7 @@
 //! POSIX-like VFS shim on top of the ObjectStore.
 
 use sotos_common::sys;
-use crate::store::{ObjectStore, TEMP_BUF_VADDR, MAX_OBJ_SIZE};
+use crate::store::ObjectStore;
 
 const MAX_HANDLES: usize = 16;
 
@@ -30,6 +30,7 @@ impl FileHandle {
 pub struct Vfs {
     store: &'static mut ObjectStore,
     handles: [FileHandle; MAX_HANDLES],
+    pub cwd: u64,
 }
 
 fn dbg(s: &[u8]) {
@@ -56,30 +57,29 @@ fn dbg_u64(mut n: u64) {
     }
 }
 
-/// Get the temp buffer as a mutable slice (1 page at TEMP_BUF_VADDR).
-fn temp_buf() -> &'static mut [u8] {
-    unsafe { core::slice::from_raw_parts_mut(TEMP_BUF_VADDR as *mut u8, MAX_OBJ_SIZE) }
-}
-
 impl Vfs {
     pub fn new(store: &'static mut ObjectStore) -> Self {
+        use crate::layout::ROOT_OID;
         Self {
             store,
             handles: [FileHandle::unused(); MAX_HANDLES],
+            cwd: ROOT_OID,
         }
     }
 
-    /// Open an existing file by name. Returns fd.
+    /// Open an existing file by name (path resolved relative to cwd). Returns fd.
     pub fn open(&mut self, name: &[u8], flags: u32) -> Result<u32, &'static str> {
-        let oid = self.store.find(name).ok_or("file not found")?;
+        let oid = self.resolve(name)?;
         let fd = self.alloc_handle()?;
         self.handles[fd as usize] = FileHandle { oid, pos: 0, flags };
         Ok(fd)
     }
 
-    /// Create a new file. Returns fd (opened for read/write).
+    /// Create a new file (path resolved relative to cwd). Returns fd (opened for read/write).
     pub fn create(&mut self, name: &[u8]) -> Result<u32, &'static str> {
-        let oid = self.store.create(name, &[])?;
+        // Split into parent path and filename
+        let (parent_oid, filename) = self.resolve_parent(name)?;
+        let oid = self.store.create_in(filename, &[], parent_oid)?;
         let fd = self.alloc_handle()?;
         self.handles[fd as usize] = FileHandle { oid, pos: 0, flags: O_RDWR };
 
@@ -102,20 +102,9 @@ impl Vfs {
         let oid = h.oid;
         let pos = h.pos as usize;
 
-        // Read full object into temp buffer.
-        let tmp = temp_buf();
-        let obj_size = self.store.read_obj(oid, tmp)?;
-
-        if pos >= obj_size {
-            return Ok(0);
-        }
-
-        let available = obj_size - pos;
-        let to_read = buf.len().min(available);
-        buf[..to_read].copy_from_slice(&tmp[pos..pos + to_read]);
-
-        self.handles[fd as usize].pos += to_read as u64;
-        Ok(to_read)
+        let n = self.store.read_obj_range(oid, pos, buf)?;
+        self.handles[fd as usize].pos += n as u64;
+        Ok(n)
     }
 
     /// Write to an open file at the current position.
@@ -128,29 +117,7 @@ impl Vfs {
         let oid = h.oid;
         let pos = h.pos as usize;
 
-        // Read existing object into temp buffer.
-        let tmp = temp_buf();
-        let obj_size = self.store.read_obj(oid, tmp).unwrap_or(0);
-
-        // Calculate new size.
-        let new_end = pos + data.len();
-        if new_end > MAX_OBJ_SIZE {
-            return Err("write exceeds max size");
-        }
-        let new_size = new_end.max(obj_size);
-
-        // Zero-fill gap if writing past end.
-        if pos > obj_size {
-            for b in &mut tmp[obj_size..pos] {
-                *b = 0;
-            }
-        }
-
-        // Apply write.
-        tmp[pos..pos + data.len()].copy_from_slice(data);
-
-        // Write back full object.
-        self.store.write_obj(oid, &tmp[..new_size])?;
+        self.store.write_obj_range(oid, pos, data)?;
 
         self.handles[fd as usize].pos += data.len() as u64;
 
@@ -180,9 +147,9 @@ impl Vfs {
         Ok(())
     }
 
-    /// Delete a file by name (closes no handles — caller should close first).
+    /// Delete a file by name/path (closes no handles — caller should close first).
     pub fn delete(&mut self, name: &[u8]) -> Result<(), &'static str> {
-        let oid = self.store.find(name).ok_or("file not found")?;
+        let oid = self.resolve(name)?;
         self.store.delete(oid)?;
 
         dbg(b"VFS: deleted ");
@@ -211,6 +178,79 @@ impl Vfs {
         Ok(entry.size)
     }
 
+    /// Change working directory.
+    pub fn chdir(&mut self, path: &[u8]) -> Result<(), &'static str> {
+        let oid = self.resolve(path)?;
+        let entry = self.store.stat(oid).ok_or("not found")?;
+        if !entry.is_dir() {
+            return Err("not a directory");
+        }
+        self.cwd = oid;
+        Ok(())
+    }
+
+    /// Get the current working directory path.
+    pub fn getcwd(&self, buf: &mut [u8]) -> usize {
+        use crate::layout::ROOT_OID;
+        if self.cwd == ROOT_OID {
+            if !buf.is_empty() {
+                buf[0] = b'/';
+            }
+            return 1;
+        }
+
+        // Walk up to root collecting names
+        let mut oids = [0u64; 16];
+        let mut depth = 0;
+        let mut cur = self.cwd;
+        while cur != ROOT_OID && depth < 16 {
+            oids[depth] = cur;
+            depth += 1;
+            if let Some(slot) = self.store.find_slot_pub(cur) {
+                let parent = self.store.dir[slot].parent_oid;
+                cur = if parent == 0 { ROOT_OID } else { parent };
+            } else {
+                break;
+            }
+        }
+
+        // Build path from root down
+        let mut pos = 0;
+        if depth == 0 {
+            if pos < buf.len() { buf[pos] = b'/'; pos += 1; }
+            return pos;
+        }
+        let mut i = depth;
+        while i > 0 {
+            i -= 1;
+            if pos < buf.len() { buf[pos] = b'/'; pos += 1; }
+            if let Some(slot) = self.store.find_slot_pub(oids[i]) {
+                let name = self.store.dir[slot].name_as_str();
+                let copy_len = name.len().min(buf.len() - pos);
+                buf[pos..pos + copy_len].copy_from_slice(&name[..copy_len]);
+                pos += copy_len;
+            }
+        }
+        pos
+    }
+
+    /// Create a directory at the given path.
+    pub fn mkdir(&mut self, path: &[u8]) -> Result<u64, &'static str> {
+        let (parent_oid, name) = self.resolve_parent(path)?;
+        self.store.mkdir(name, parent_oid)
+    }
+
+    /// Remove a directory at the given path.
+    pub fn rmdir(&mut self, path: &[u8]) -> Result<(), &'static str> {
+        let oid = self.resolve(path)?;
+        self.store.rmdir(oid)
+    }
+
+    /// Find a file/dir by path, resolving relative to cwd. Returns OID.
+    pub fn find_path(&self, path: &[u8]) -> Option<u64> {
+        self.store.resolve_path(path, self.cwd).ok()
+    }
+
     /// Get access to the underlying object store.
     pub fn store(&self) -> &ObjectStore {
         self.store
@@ -224,6 +264,43 @@ impl Vfs {
     // ---------------------------------------------------------------
     // Private
     // ---------------------------------------------------------------
+
+    /// Resolve a path to an OID relative to cwd.
+    fn resolve(&self, path: &[u8]) -> Result<u64, &'static str> {
+        self.store.resolve_path(path, self.cwd)
+    }
+
+    /// Resolve the parent directory and return (parent_oid, filename).
+    fn resolve_parent<'a>(&self, path: &'a [u8]) -> Result<(u64, &'a [u8]), &'static str> {
+        // Find last '/' to split parent/filename
+        let mut last_slash = None;
+        for (i, &b) in path.iter().enumerate() {
+            if b == b'/' {
+                last_slash = Some(i);
+            }
+        }
+
+        match last_slash {
+            Some(pos) => {
+                let parent_path = &path[..pos];
+                let filename = &path[pos + 1..];
+                if filename.is_empty() {
+                    return Err("empty filename");
+                }
+                let parent_oid = if parent_path.is_empty() {
+                    use crate::layout::ROOT_OID;
+                    ROOT_OID
+                } else {
+                    self.store.resolve_path(parent_path, self.cwd)?
+                };
+                Ok((parent_oid, filename))
+            }
+            None => {
+                // No slash — file in cwd
+                Ok((self.cwd, path))
+            }
+        }
+    }
 
     fn alloc_handle(&self) -> Result<u32, &'static str> {
         for (i, h) in self.handles.iter().enumerate() {

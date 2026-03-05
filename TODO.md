@@ -15,9 +15,9 @@
 - [x] DNS resolution from shell (resolve/ping/wget accept hostnames via custom syscall 200 → net IPC)
 
 ## Filesystem
-- [ ] Directory hierarchy (object store is currently flat)
-- [ ] CoW snapshots for atomic transactions
-- [ ] Large file support (currently limited by data region size)
+- [x] Large file support (streaming I/O, 512 KB max, sector-granular read/write)
+- [x] Directory hierarchy (parent_oid, path resolution, mkdir/rmdir/cd/pwd)
+- [x] CoW snapshots (refcounted blocks, snap create/restore/delete/list)
 
 ## Kernel / Architecture
 - [x] Real SMP boot — `-smp 4` default on all targets, TSC timeout on AP boot

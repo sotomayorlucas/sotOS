@@ -374,6 +374,68 @@ fn linux_kill(pid: u64, sig: u64) -> i64 {
     ret
 }
 
+fn linux_getcwd(buf: *mut u8, size: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 79u64 => ret,
+            in("rdi") buf as u64,
+            in("rsi") size,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+fn linux_chdir(path: *const u8) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 80u64 => ret,
+            in("rdi") path as u64,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+fn linux_mkdir(path: *const u8, mode: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 83u64 => ret,
+            in("rdi") path as u64,
+            in("rsi") mode,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+fn linux_rmdir(path: *const u8) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 84u64 => ret,
+            in("rdi") path as u64,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
 // ---------------------------------------------------------------------------
 // Output helpers
 // ---------------------------------------------------------------------------
@@ -521,7 +583,7 @@ fn shell_loop() {
 
         // --- Command dispatch ---
         if eq(line, b"help") {
-            print(b"commands: help, echo, uname, uptime, caps, ls, cat, write, rm,\n         stat, hexdump, fork, getpid, exec, ps, kill,\n         resolve, ping, traceroute, wget, exit\n");
+            print(b"commands: help, echo, uname, uptime, caps, ls, cat, write, rm,\n         stat, hexdump, mkdir, rmdir, cd, pwd, snap, fork,\n         getpid, exec, ps, kill, resolve, ping, traceroute,\n         wget, exit\n");
         } else if eq(line, b"uname") {
             print(b"sotOS 0.1.0 x86_64 LUCAS\n");
         } else if eq(line, b"uptime") {
@@ -545,6 +607,13 @@ fn shell_loop() {
             print(b"\n");
         } else if eq(line, b"ls") {
             cmd_ls();
+        } else if starts_with(line, b"ls ") {
+            let path = trim(&line[3..]);
+            if path.is_empty() {
+                cmd_ls();
+            } else {
+                cmd_ls_path(path);
+            }
         } else if starts_with(line, b"cat ") {
             let name = trim(&line[4..]);
             if name.is_empty() {
@@ -587,6 +656,32 @@ fn shell_loop() {
             } else {
                 cmd_hexdump(name);
             }
+        } else if starts_with(line, b"mkdir ") {
+            let name = trim(&line[6..]);
+            if name.is_empty() {
+                print(b"usage: mkdir <dir>\n");
+            } else {
+                cmd_mkdir(name);
+            }
+        } else if starts_with(line, b"rmdir ") {
+            let name = trim(&line[6..]);
+            if name.is_empty() {
+                print(b"usage: rmdir <dir>\n");
+            } else {
+                cmd_rmdir(name);
+            }
+        } else if starts_with(line, b"cd ") {
+            let name = trim(&line[3..]);
+            if name.is_empty() {
+                print(b"usage: cd <dir>\n");
+            } else {
+                cmd_cd(name);
+            }
+        } else if eq(line, b"cd") {
+            // cd with no args goes to root
+            cmd_cd(b"/");
+        } else if eq(line, b"pwd") {
+            cmd_pwd();
         } else if eq(line, b"fork") {
             cmd_fork();
         } else if eq(line, b"getpid") {
@@ -628,6 +723,9 @@ fn shell_loop() {
             } else {
                 cmd_wget(url);
             }
+        } else if starts_with(line, b"snap ") {
+            let args = trim(&line[5..]);
+            cmd_snap(args);
         } else if eq(line, b"exit") {
             print(b"bye!\n");
             return;
@@ -819,6 +917,155 @@ fn cmd_rm(name: &[u8]) {
         print(b"removed\n");
     } else {
         print(b"rm: file not found\n");
+    }
+}
+
+fn cmd_ls_path(path: &[u8]) {
+    // Save cwd, cd to path, ls, cd back
+    let mut old_cwd = [0u8; 128];
+    let cwd_ret = linux_getcwd(old_cwd.as_mut_ptr(), old_cwd.len() as u64);
+
+    let mut path_buf = [0u8; 64];
+    let p = null_terminate(path, &mut path_buf);
+    if linux_chdir(p) < 0 {
+        print(b"ls: cannot access ");
+        print(path);
+        print(b"\n");
+        return;
+    }
+    cmd_ls();
+    // Restore cwd
+    if cwd_ret > 0 {
+        linux_chdir(old_cwd.as_ptr());
+    }
+}
+
+fn cmd_mkdir(name: &[u8]) {
+    let mut path_buf = [0u8; 64];
+    let path = null_terminate(name, &mut path_buf);
+    let ret = linux_mkdir(path, 0o755);
+    if ret == 0 {
+        print(b"directory created\n");
+    } else {
+        print(b"mkdir: failed\n");
+    }
+}
+
+fn cmd_rmdir(name: &[u8]) {
+    let mut path_buf = [0u8; 64];
+    let path = null_terminate(name, &mut path_buf);
+    let ret = linux_rmdir(path);
+    if ret == 0 {
+        print(b"directory removed\n");
+    } else {
+        print(b"rmdir: failed (not empty or not found)\n");
+    }
+}
+
+fn cmd_cd(name: &[u8]) {
+    let mut path_buf = [0u8; 64];
+    let path = null_terminate(name, &mut path_buf);
+    let ret = linux_chdir(path);
+    if ret < 0 {
+        print(b"cd: not a directory or not found\n");
+    }
+}
+
+fn cmd_pwd() {
+    let mut buf = [0u8; 128];
+    let ret = linux_getcwd(buf.as_mut_ptr(), buf.len() as u64);
+    if ret > 0 {
+        // Find NUL or use full buf
+        let mut len = 0;
+        while len < buf.len() && buf[len] != 0 {
+            len += 1;
+        }
+        linux_write(1, buf.as_ptr(), len);
+        print(b"\n");
+    } else {
+        print(b"/\n");
+    }
+}
+
+fn cmd_snap(args: &[u8]) {
+    if starts_with(args, b"create ") {
+        let name = trim(&args[7..]);
+        if name.is_empty() {
+            print(b"usage: snap create <name>\n");
+            return;
+        }
+        // Open /snap/create/<name> to trigger snapshot creation
+        let mut path_buf = [0u8; 64];
+        let prefix = b"/snap/create/";
+        path_buf[..prefix.len()].copy_from_slice(prefix);
+        let copy_len = name.len().min(path_buf.len() - prefix.len() - 1);
+        path_buf[prefix.len()..prefix.len() + copy_len].copy_from_slice(&name[..copy_len]);
+        path_buf[prefix.len() + copy_len] = 0;
+        let fd = linux_open(path_buf.as_ptr(), 0);
+        if fd >= 0 {
+            let mut buf = [0u8; 64];
+            let n = linux_read(fd as u64, buf.as_mut_ptr(), buf.len());
+            if n > 0 { linux_write(1, buf.as_ptr(), n as usize); }
+            linux_close(fd as u64);
+        } else {
+            print(b"snap create: failed\n");
+        }
+    } else if eq(args, b"list") {
+        let mut path_buf = [0u8; 16];
+        let path = null_terminate(b"/snap/list", &mut path_buf);
+        let fd = linux_open(path, 0);
+        if fd >= 0 {
+            let mut buf = [0u8; 256];
+            let n = linux_read(fd as u64, buf.as_mut_ptr(), buf.len());
+            if n > 0 { linux_write(1, buf.as_ptr(), n as usize); }
+            linux_close(fd as u64);
+        } else {
+            print(b"snap list: failed\n");
+        }
+    } else if starts_with(args, b"restore ") {
+        let name = trim(&args[8..]);
+        if name.is_empty() {
+            print(b"usage: snap restore <name>\n");
+            return;
+        }
+        let mut path_buf = [0u8; 64];
+        let prefix = b"/snap/restore/";
+        path_buf[..prefix.len()].copy_from_slice(prefix);
+        let copy_len = name.len().min(path_buf.len() - prefix.len() - 1);
+        path_buf[prefix.len()..prefix.len() + copy_len].copy_from_slice(&name[..copy_len]);
+        path_buf[prefix.len() + copy_len] = 0;
+        let fd = linux_open(path_buf.as_ptr(), 0);
+        if fd >= 0 {
+            let mut buf = [0u8; 64];
+            let n = linux_read(fd as u64, buf.as_mut_ptr(), buf.len());
+            if n > 0 { linux_write(1, buf.as_ptr(), n as usize); }
+            linux_close(fd as u64);
+        } else {
+            print(b"snap restore: failed\n");
+        }
+    } else if starts_with(args, b"delete ") {
+        let name = trim(&args[7..]);
+        if name.is_empty() {
+            print(b"usage: snap delete <name>\n");
+            return;
+        }
+        let mut path_buf = [0u8; 64];
+        let prefix = b"/snap/delete/";
+        path_buf[..prefix.len()].copy_from_slice(prefix);
+        let copy_len = name.len().min(path_buf.len() - prefix.len() - 1);
+        path_buf[prefix.len()..prefix.len() + copy_len].copy_from_slice(&name[..copy_len]);
+        path_buf[prefix.len() + copy_len] = 0;
+        let fd = linux_open(path_buf.as_ptr(), 0);
+        if fd >= 0 {
+            let mut buf = [0u8; 64];
+            let n = linux_read(fd as u64, buf.as_mut_ptr(), buf.len());
+            if n > 0 { linux_write(1, buf.as_ptr(), n as usize); }
+            linux_close(fd as u64);
+        } else {
+            print(b"snap delete: failed\n");
+        }
+    } else {
+        print(b"usage: snap create|list|restore|delete [<name>]\n");
     }
 }
 

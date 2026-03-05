@@ -7,7 +7,13 @@ pub const SUPERBLOCK_MAGIC: u64 = 0x534F544F_53465321;
 pub const WAL_MAGIC: u32 = 0x57414C48;
 
 /// Filesystem version.
-pub const FS_VERSION: u32 = 1;
+pub const FS_VERSION: u32 = 3;
+
+/// Directory entry flag: entry is a directory.
+pub const FLAG_DIR: u32 = 1;
+
+/// Root directory OID (always 1).
+pub const ROOT_OID: u64 = 1;
 
 // Sector layout:
 pub const SECTOR_SUPERBLOCK: u32 = 0;
@@ -18,7 +24,17 @@ pub const SECTOR_BITMAP: u32 = 6;     // 6-7 (2 sectors)
 pub const BITMAP_SECTORS: u32 = 2;
 pub const SECTOR_DIR: u32 = 8;        // 8-15 (8 sectors)
 pub const DIR_SECTORS: u32 = 8;
-pub const SECTOR_DATA: u32 = 16;      // 16+ (data region)
+pub const SECTOR_REFCOUNT: u32 = 16;  // 16-23 (refcount table: 4096 × u8)
+pub const REFCOUNT_SECTORS: u32 = 8;
+pub const REFCOUNT_ENTRIES: usize = REFCOUNT_SECTORS as usize * SECTOR_SIZE; // 4096
+
+pub const SECTOR_SNAP_META: u32 = 24; // 24-27 (4 × SnapMeta, 512 bytes each)
+pub const MAX_SNAPSHOTS: usize = 4;
+
+pub const SECTOR_SNAP_DIR: u32 = 28;  // 28-59 (4 × 8 dir sectors)
+pub const SECTOR_SNAP_BMP: u32 = 60;  // 60-67 (4 × 2 bitmap sectors)
+
+pub const SECTOR_DATA: u32 = 68;      // 68+ (data region)
 
 /// Entries per sector (128 bytes each, 4 per 512-byte sector).
 pub const DIR_ENTRIES_PER_SECTOR: usize = 4;
@@ -106,7 +122,8 @@ pub struct DirEntry {
     pub flags: u32,
     pub created_tick: u32,
     pub modified_tick: u32,
-    pub _pad: [u8; 44],  // 128 - 84
+    pub parent_oid: u64,      // parent directory OID (0 = root's parent sentinel)
+    pub _pad: [u8; 32],       // 128 - 96 (4 bytes alignment pad before parent_oid)
 }
 
 impl DirEntry {
@@ -120,8 +137,13 @@ impl DirEntry {
             flags: 0,
             created_tick: 0,
             modified_tick: 0,
-            _pad: [0; 44],
+            parent_oid: 0,
+            _pad: [0; 32],
         }
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.flags & FLAG_DIR != 0
     }
 
     pub fn is_free(&self) -> bool {
@@ -134,7 +156,40 @@ impl DirEntry {
     }
 }
 
+/// Snapshot metadata (512 bytes, one per sector).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SnapMeta {
+    pub active: u32,
+    pub snap_id: u32,
+    pub name: [u8; 32],
+    pub created_tick: u32,
+    pub obj_count: u32,
+    pub next_oid: u64,
+    pub _pad: [u8; 456],   // 512 - 56
+}
+
+impl SnapMeta {
+    pub const fn zeroed() -> Self {
+        Self {
+            active: 0,
+            snap_id: 0,
+            name: [0; 32],
+            created_tick: 0,
+            obj_count: 0,
+            next_oid: 0,
+            _pad: [0; 456],
+        }
+    }
+
+    pub fn name_as_str(&self) -> &[u8] {
+        let len = self.name.iter().position(|&b| b == 0).unwrap_or(32);
+        &self.name[..len]
+    }
+}
+
 // Compile-time size assertions.
 const _: () = assert!(core::mem::size_of::<Superblock>() == 512);
 const _: () = assert!(core::mem::size_of::<WalHeader>() == 512);
 const _: () = assert!(core::mem::size_of::<DirEntry>() == 128);
+const _: () = assert!(core::mem::size_of::<SnapMeta>() == 512);
