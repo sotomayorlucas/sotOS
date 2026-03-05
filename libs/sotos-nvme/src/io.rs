@@ -118,11 +118,18 @@ impl NvmeController {
 
     /// Poll I/O completion queue for the next CQE.
     fn poll_io_completion(&mut self, wait: WaitFn) -> Result<(), &'static str> {
+        if self.use_interrupts {
+            return self.interrupt_io_completion(wait);
+        }
+
         for _ in 0..10_000_000 {
             let cq = self.io_cq.as_mut().ok_or("NVMe: I/O CQ not initialized")?;
             if let Some(cqe) = cq.poll() {
                 cq.advance();
                 self.ring_io_cq_doorbell();
+                if let Some(cb) = self.completion_callback {
+                    cb(cqe.cid());
+                }
                 if cqe.status() != 0 {
                     return Err("NVMe: I/O operation failed");
                 }
@@ -131,5 +138,79 @@ impl NvmeController {
             wait();
         }
         Err("NVMe: I/O timeout")
+    }
+
+    /// Wait for an interrupt-driven I/O completion.
+    ///
+    /// Uses `notify_wait()` to block until the controller fires an interrupt,
+    /// then polls the CQ for the completed entry. Falls back to polling if
+    /// no notification cap is configured.
+    fn interrupt_io_completion(&mut self, wait: WaitFn) -> Result<(), &'static str> {
+        let notify = match self.notify_cap {
+            Some(cap) => cap,
+            None => return self.poll_io_completion_fallback(wait),
+        };
+
+        // Wait for interrupt notification (blocks the thread, yields CPU).
+        for _ in 0..1000 {
+            sotos_common::sys::notify_wait(notify);
+
+            let cq = self.io_cq.as_mut().ok_or("NVMe: I/O CQ not initialized")?;
+            if let Some(cqe) = cq.poll() {
+                cq.advance();
+                self.ring_io_cq_doorbell();
+                if let Some(cb) = self.completion_callback {
+                    cb(cqe.cid());
+                }
+                if cqe.status() != 0 {
+                    return Err("NVMe: I/O operation failed");
+                }
+                return Ok(());
+            }
+        }
+        Err("NVMe: I/O interrupt timeout")
+    }
+
+    /// Polling fallback (used when interrupt mode is requested but no cap set).
+    fn poll_io_completion_fallback(&mut self, wait: WaitFn) -> Result<(), &'static str> {
+        for _ in 0..10_000_000 {
+            let cq = self.io_cq.as_mut().ok_or("NVMe: I/O CQ not initialized")?;
+            if let Some(cqe) = cq.poll() {
+                cq.advance();
+                self.ring_io_cq_doorbell();
+                if let Some(cb) = self.completion_callback {
+                    cb(cqe.cid());
+                }
+                if cqe.status() != 0 {
+                    return Err("NVMe: I/O operation failed");
+                }
+                return Ok(());
+            }
+            wait();
+        }
+        Err("NVMe: I/O timeout")
+    }
+
+    /// Enable interrupt-driven completion mode.
+    ///
+    /// - `notify_cap`: Notification capability for IRQ wait.
+    /// - `callback`: Optional callback invoked with the command ID on completion.
+    pub fn enable_interrupt_mode(&mut self, notify_cap: u64, callback: Option<fn(u16)>) {
+        self.notify_cap = Some(notify_cap);
+        self.completion_callback = callback;
+        self.use_interrupts = true;
+    }
+
+    /// Disable interrupt-driven completion, revert to polling.
+    pub fn disable_interrupt_mode(&mut self) {
+        self.use_interrupts = false;
+    }
+
+    /// Wait for the next interrupt notification (blocking).
+    /// Returns immediately if no notification cap is set.
+    pub fn wait_for_interrupt(&self) {
+        if let Some(cap) = self.notify_cap {
+            sotos_common::sys::notify_wait(cap);
+        }
     }
 }

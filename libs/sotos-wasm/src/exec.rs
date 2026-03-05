@@ -25,6 +25,35 @@ pub enum Trap {
     Unreachable,
     InvalidOpcode(u8),
     MemoryGrowFailed,
+    HostFunctionError,
+    StartFunctionFailed,
+    InstructionLimitExceeded,
+    MemoryGrowDenied,
+}
+
+/// Maximum number of host functions that can be registered.
+const MAX_HOST_FNS: usize = 16;
+
+/// Host function type: takes a mutable reference to the runtime and arguments,
+/// returns an optional value or a trap.
+pub type HostFn = fn(&mut Runtime, &[Value]) -> Result<Option<Value>, Trap>;
+
+/// A registered host function entry.
+#[derive(Clone, Copy)]
+struct HostFnEntry {
+    name: [u8; 32],
+    name_len: usize,
+    func: Option<HostFn>,
+}
+
+impl HostFnEntry {
+    const fn empty() -> Self {
+        Self {
+            name: [0; 32],
+            name_len: 0,
+            func: None,
+        }
+    }
 }
 
 /// A call frame on the call stack.
@@ -69,7 +98,7 @@ const MAX_LOCALS_PER_FRAME: usize = 64;
 pub struct Runtime {
     /// Operand stack.
     stack: [Value; MAX_STACK],
-    sp: usize,
+    pub sp: usize,
 
     /// Call stack.
     frames: [CallFrame; MAX_CALL_DEPTH],
@@ -85,6 +114,10 @@ pub struct Runtime {
     /// Global variables.
     globals: [Value; 32],
     global_count: usize,
+
+    /// Registered host functions.
+    host_fns: [HostFnEntry; MAX_HOST_FNS],
+    host_fn_count: usize,
 }
 
 impl Runtime {
@@ -108,6 +141,8 @@ impl Runtime {
             memory_size: module.memory_pages as usize * WASM_PAGE_SIZE,
             globals: [Value::I32(0); 32],
             global_count: module.global_count,
+            host_fns: [HostFnEntry::empty(); MAX_HOST_FNS],
+            host_fn_count: 0,
         };
 
         // Initialize globals from module.
@@ -120,6 +155,62 @@ impl Runtime {
         }
 
         rt
+    }
+
+    /// Create a runtime and initialize it from a module: set up globals,
+    /// memory, and call the start function if one is defined.
+    pub fn instantiate(module: &Module) -> Result<Self, Trap> {
+        let mut rt = Self::new(module);
+
+        // If the module has a start function, call it automatically.
+        if let Some(start_idx) = module.start_function() {
+            rt.call(module, start_idx, &[])
+                .map_err(|_| Trap::StartFunctionFailed)?;
+        }
+
+        Ok(rt)
+    }
+
+    /// Register a host function by name. Up to 16 host functions can be registered.
+    /// Host functions can be invoked by imported function calls.
+    pub fn register_host_fn(&mut self, name: &str, func: HostFn) {
+        if self.host_fn_count >= MAX_HOST_FNS {
+            return;
+        }
+        let mut entry = HostFnEntry::empty();
+        let copy_len = name.len().min(31);
+        entry.name[..copy_len].copy_from_slice(&name.as_bytes()[..copy_len]);
+        entry.name_len = copy_len;
+        entry.func = Some(func);
+        self.host_fns[self.host_fn_count] = entry;
+        self.host_fn_count += 1;
+    }
+
+    /// Look up a host function by name.
+    pub fn find_host_fn(&self, name: &[u8]) -> Option<HostFn> {
+        for i in 0..self.host_fn_count {
+            let entry = &self.host_fns[i];
+            if entry.name_len == name.len() && &entry.name[..entry.name_len] == name {
+                return entry.func;
+            }
+        }
+        None
+    }
+
+    /// Get the current memory size in bytes.
+    pub fn memory_size(&self) -> usize {
+        self.memory_size
+    }
+
+    /// Get a reference to the linear memory.
+    pub fn memory(&self) -> &[u8] {
+        &self.memory[..self.memory_size]
+    }
+
+    /// Get a mutable reference to the linear memory.
+    pub fn memory_mut(&mut self) -> &mut [u8] {
+        let sz = self.memory_size;
+        &mut self.memory[..sz]
     }
 
     /// Call an exported function by index with the given arguments.

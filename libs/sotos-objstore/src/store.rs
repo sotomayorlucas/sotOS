@@ -112,8 +112,10 @@ impl ObjectStore {
         store.dir[0].flags = FLAG_DIR;
         store.dir[0].parent_oid = 0; // sentinel: root's parent
         store.dir[0].permissions = DEFAULT_DIR_PERMS;
-        store.dir[0].created_tick = sys::rdtsc() as u32;
-        store.dir[0].modified_tick = store.dir[0].created_tick;
+        let now = crate::layout::get_epoch_seconds();
+        store.dir[0].created_time = now;
+        store.dir[0].modified_time = now;
+        store.dir[0].accessed_time = now;
 
         // Clear bitmap.
         store.bitmap = [0u8; BITMAP_BYTES];
@@ -164,11 +166,13 @@ impl ObjectStore {
         if store.sb.magic != SUPERBLOCK_MAGIC {
             return Err("bad superblock magic");
         }
-        if store.sb.version != FS_VERSION && store.sb.version != 1 && store.sb.version != 2 {
+        if store.sb.version != FS_VERSION && store.sb.version != 1
+            && store.sb.version != 2 && store.sb.version != 3 {
             return Err("unsupported version");
         }
         let needs_dir_migration = store.sb.version == 1;
         let needs_snap_migration = store.sb.version <= 2;
+        let needs_v4_migration = store.sb.version <= 3;
 
         // WAL replay.
         let replayed = wal::replay(&mut store.blk, &mut store.wal, &mut store.wal_buf)?;
@@ -214,8 +218,10 @@ impl ObjectStore {
             store.dir[root_slot].flags = FLAG_DIR;
             store.dir[root_slot].parent_oid = 0;
             store.dir[root_slot].permissions = DEFAULT_DIR_PERMS;
-            store.dir[root_slot].created_tick = sys::rdtsc() as u32;
-            store.dir[root_slot].modified_tick = store.dir[root_slot].created_tick;
+            let now = crate::layout::get_epoch_seconds();
+            store.dir[root_slot].created_time = now;
+            store.dir[root_slot].modified_time = now;
+            store.dir[root_slot].accessed_time = now;
 
             // Fix next_oid if needed (root uses oid=1)
             if store.sb.next_oid <= ROOT_OID {
@@ -256,6 +262,35 @@ impl ObjectStore {
 
             // Read snapshot metadata
             store.read_snap_meta()?;
+        }
+
+        // Migrate v3 → v4: larger directory table (32→128 entries) + u64 timestamps
+        if needs_v4_migration && !needs_snap_migration {
+            dbg(b"OBJSTORE: migrating -> v4 (128 entries + timestamps)\n");
+            // Zero out new directory slots (entries 32..128 are already zeroed from init)
+            // Update data_start and version
+            store.sb.data_start = SECTOR_DATA;
+            store.sb.dir_sectors = DIR_SECTORS;
+            store.sb.version = FS_VERSION;
+
+            // Convert old tick-based timestamps to epoch seconds
+            // (Old u32 ticks become 0 since they are in a different field now;
+            //  the struct was re-read with the new layout so old tick values
+            //  ended up in created_time's low bytes. We just set them to "now".)
+            let now = crate::layout::get_epoch_seconds();
+            for entry in store.dir.iter_mut() {
+                if !entry.is_free() && entry.created_time < 1_000_000_000 {
+                    // Old tick value — replace with approximate current time
+                    entry.created_time = now;
+                    entry.modified_time = now;
+                    entry.accessed_time = now;
+                }
+            }
+
+            store.flush_superblock()?;
+            store.flush_dir()?;
+            store.flush_refcount()?;
+            store.flush_snap_meta()?;
         }
 
         Ok(store)
@@ -310,8 +345,10 @@ impl ObjectStore {
         self.dir[slot].sector_count = sector_count;
         self.dir[slot].parent_oid = parent_oid;
         self.dir[slot].permissions = DEFAULT_FILE_PERMS;
-        self.dir[slot].created_tick = sys::rdtsc() as u32;
-        self.dir[slot].modified_tick = self.dir[slot].created_tick;
+        let now = crate::layout::get_epoch_seconds();
+        self.dir[slot].created_time = now;
+        self.dir[slot].modified_time = now;
+        self.dir[slot].accessed_time = now;
 
         // Update superblock.
         self.sb.next_oid += 1;
@@ -371,7 +408,7 @@ impl ObjectStore {
         self.dir[slot].size = data.len() as u64;
         self.dir[slot].sector_start = new_start;
         self.dir[slot].sector_count = new_count;
-        self.dir[slot].modified_tick = sys::rdtsc() as u32;
+        self.dir[slot].modified_time = crate::layout::get_epoch_seconds();
 
         // WAL commit.
         self.wal_commit_metadata(slot)?;
@@ -505,7 +542,7 @@ impl ObjectStore {
         }
 
         self.dir[slot].size = new_size as u64;
-        self.dir[slot].modified_tick = sys::rdtsc() as u32;
+        self.dir[slot].modified_time = crate::layout::get_epoch_seconds();
 
         // WAL commit metadata
         self.wal_commit_metadata(slot)?;
@@ -615,8 +652,10 @@ impl ObjectStore {
         self.dir[slot].flags = FLAG_DIR;
         self.dir[slot].parent_oid = parent_oid;
         self.dir[slot].permissions = DEFAULT_DIR_PERMS;
-        self.dir[slot].created_tick = sys::rdtsc() as u32;
-        self.dir[slot].modified_tick = self.dir[slot].created_tick;
+        let now = crate::layout::get_epoch_seconds();
+        self.dir[slot].created_time = now;
+        self.dir[slot].modified_time = now;
+        self.dir[slot].accessed_time = now;
 
         self.sb.next_oid += 1;
         self.sb.obj_count += 1;
@@ -689,7 +728,7 @@ impl ObjectStore {
         self.snap_meta[slot].snap_id = (slot + 1) as u32;
         let copy_len = name.len().min(31);
         self.snap_meta[slot].name[..copy_len].copy_from_slice(&name[..copy_len]);
-        self.snap_meta[slot].created_tick = sys::rdtsc() as u32;
+        self.snap_meta[slot].created_tick = crate::layout::get_epoch_seconds() as u32;
         self.snap_meta[slot].obj_count = self.sb.obj_count;
         self.snap_meta[slot].next_oid = self.sb.next_oid;
 
@@ -1014,8 +1053,8 @@ impl ObjectStore {
         Ok(())
     }
 
-    /// Flush all directory sectors to disk (non-WAL, for format).
-    fn flush_dir(&mut self) -> Result<(), &'static str> {
+    /// Flush all directory sectors to disk (non-WAL, for format/chmod/chown).
+    pub fn flush_dir(&mut self) -> Result<(), &'static str> {
         for s in 0..DIR_SECTORS as usize {
             let buf = self.serialize_dir_sector(s);
             let dst = unsafe {

@@ -22,6 +22,13 @@ pub struct NvmeController {
     pub ns_size: u64,
     /// LBA size in bytes (usually 512).
     pub lba_size: u32,
+    /// Optional callback invoked on I/O completion (CID passed).
+    pub completion_callback: Option<fn(u16)>,
+    /// Optional notification cap for interrupt-driven completion.
+    /// When set, `wait_for_interrupt()` uses notify_wait instead of polling.
+    pub notify_cap: Option<u64>,
+    /// Whether to use interrupt-driven completion (true) or polling (false).
+    pub use_interrupts: bool,
 }
 
 /// DMA memory layout provided by the caller.
@@ -142,6 +149,9 @@ impl NvmeController {
             io_cq: None,
             ns_size: 0,
             lba_size: 512,
+            completion_callback: None,
+            notify_cap: None,
+            use_interrupts: false,
         };
 
         // 5. Identify Controller.

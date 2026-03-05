@@ -21,6 +21,7 @@ pub mod endpoint;
 pub mod mailbox;
 pub mod notify;
 pub mod route;
+pub mod typed_payload;
 
 #[allow(unused_imports)]
 pub use channel::ChannelId;

@@ -161,10 +161,12 @@ pub mod op {
 /// WASM section IDs.
 pub mod section {
     pub const TYPE: u8 = 1;
+    pub const IMPORT: u8 = 2;
     pub const FUNCTION: u8 = 3;
     pub const MEMORY: u8 = 5;
     pub const GLOBAL: u8 = 6;
     pub const EXPORT: u8 = 7;
+    pub const START: u8 = 8;
     pub const CODE: u8 = 10;
 }
 

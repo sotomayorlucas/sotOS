@@ -135,6 +135,10 @@ pub enum Syscall {
     BootInfoWrite = 133,
     /// Change page permissions (mprotect-like, W^X enforced).
     Protect = 134,
+    /// Change file permissions (chmod).
+    Chmod = 150,
+    /// Change file ownership (chown).
+    Chown = 151,
     /// Get thread info by pool index.
     ThreadInfo = 140,
     /// Set resource limits on current thread.
@@ -915,6 +919,24 @@ pub mod sys {
     #[inline(always)]
     pub fn protect(vaddr: u64, flags: u64) -> Result<(), i64> {
         let ret = syscall2(super::Syscall::Protect as u64, vaddr, flags);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
+    /// Change file permissions (chmod).
+    /// `path_ptr`/`path_len`: path string in userspace memory.
+    /// `mode`: Unix permission bits (e.g. 0o755).
+    #[inline(always)]
+    pub fn chmod(path_ptr: u64, path_len: u64, mode: u64) -> Result<(), i64> {
+        let ret = syscall3(super::Syscall::Chmod as u64, path_ptr, path_len, mode);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
+    /// Change file ownership (chown).
+    /// `path_ptr`/`path_len`: path string in userspace memory.
+    /// `uid`: new owner user ID. `gid`: new owner group ID.
+    #[inline(always)]
+    pub fn chown(path_ptr: u64, path_len: u64, uid: u64, gid: u64) -> Result<(), i64> {
+        let ret = syscall4(super::Syscall::Chown as u64, path_ptr, path_len, uid, gid);
         if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
     }
 

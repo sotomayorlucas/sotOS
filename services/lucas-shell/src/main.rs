@@ -599,12 +599,237 @@ fn env_unset(key: &[u8]) {
     }
 }
 
-/// Expand $VAR references in a command line.
+// ---------------------------------------------------------------------------
+// Job control
+// ---------------------------------------------------------------------------
+
+const MAX_JOBS: usize = 16;
+const MAX_JOB_CMD: usize = 128;
+
+const JOB_NONE: u8 = 0;
+const JOB_RUNNING: u8 = 1;
+const JOB_STOPPED: u8 = 2;
+const JOB_DONE: u8 = 3;
+
+struct Job {
+    active: bool,
+    pid: u64,
+    status: u8,
+    cmd: [u8; MAX_JOB_CMD],
+    cmd_len: usize,
+}
+
+impl Job {
+    const fn empty() -> Self {
+        Self { active: false, pid: 0, status: JOB_NONE, cmd: [0; MAX_JOB_CMD], cmd_len: 0 }
+    }
+}
+
+static mut JOBS: [Job; MAX_JOBS] = {
+    const INIT: Job = Job::empty();
+    [INIT; MAX_JOBS]
+};
+
+fn jobs_slice() -> &'static [Job] {
+    unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(JOBS) as *const Job, MAX_JOBS) }
+}
+
+fn jobs_slice_mut() -> &'static mut [Job] {
+    unsafe { core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(JOBS) as *mut Job, MAX_JOBS) }
+}
+
+fn job_add(pid: u64, status: u8, cmd: &[u8]) -> usize {
+    for (i, j) in jobs_slice_mut().iter_mut().enumerate() {
+        if !j.active {
+            j.active = true;
+            j.pid = pid;
+            j.status = status;
+            let cl = cmd.len().min(MAX_JOB_CMD);
+            j.cmd[..cl].copy_from_slice(&cmd[..cl]);
+            j.cmd_len = cl;
+            return i + 1; // 1-based job IDs
+        }
+    }
+    0 // no free slot
+}
+
+fn job_find_by_id(id: usize) -> Option<&'static mut Job> {
+    if id == 0 || id > MAX_JOBS { return None; }
+    let j = &mut jobs_slice_mut()[id - 1];
+    if j.active { Some(j) } else { None }
+}
+
+/// Track the PID of the foreground child (0 = none).
+static mut FG_PID: u64 = 0;
+
+fn set_fg_pid(pid: u64) {
+    unsafe { FG_PID = pid; }
+}
+
+fn get_fg_pid() -> u64 {
+    unsafe { FG_PID }
+}
+
+// ---------------------------------------------------------------------------
+// Command history
+// ---------------------------------------------------------------------------
+
+const HIST_SIZE: usize = 64;
+const HIST_LINE_LEN: usize = 256;
+
+struct HistEntry {
+    data: [u8; HIST_LINE_LEN],
+    len: usize,
+}
+
+impl HistEntry {
+    const fn empty() -> Self {
+        Self { data: [0; HIST_LINE_LEN], len: 0 }
+    }
+}
+
+static mut HISTORY: [HistEntry; HIST_SIZE] = {
+    const INIT: HistEntry = HistEntry::empty();
+    [INIT; HIST_SIZE]
+};
+static mut HIST_COUNT: usize = 0;
+static mut HIST_WRITE: usize = 0; // next write index (circular)
+
+fn history_slice() -> &'static [HistEntry] {
+    unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(HISTORY) as *const HistEntry, HIST_SIZE) }
+}
+
+fn history_add(line: &[u8]) {
+    if line.is_empty() { return; }
+    unsafe {
+        let idx = HIST_WRITE;
+        let entry = &mut (*core::ptr::addr_of_mut!(HISTORY))[idx];
+        let l = line.len().min(HIST_LINE_LEN);
+        entry.data[..l].copy_from_slice(&line[..l]);
+        entry.len = l;
+        HIST_WRITE = (HIST_WRITE + 1) % HIST_SIZE;
+        if HIST_COUNT < HIST_SIZE { HIST_COUNT += 1; }
+    }
+}
+
+fn history_count() -> usize {
+    unsafe { HIST_COUNT }
+}
+
+fn history_get(index: usize) -> Option<&'static [u8]> {
+    let count = history_count();
+    if index >= count { return None; }
+    unsafe {
+        // oldest entry is at (HIST_WRITE - count + index) mod HIST_SIZE
+        let actual = (HIST_WRITE + HIST_SIZE - count + index) % HIST_SIZE;
+        let entry = &(*core::ptr::addr_of!(HISTORY))[actual];
+        Some(&entry.data[..entry.len])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shell functions
+// ---------------------------------------------------------------------------
+
+const MAX_FUNCTIONS: usize = 16;
+const MAX_FUNC_NAME: usize = 32;
+const MAX_FUNC_BODY: usize = 1024;
+
+struct ShellFunction {
+    active: bool,
+    name: [u8; MAX_FUNC_NAME],
+    name_len: usize,
+    body: [u8; MAX_FUNC_BODY],
+    body_len: usize,
+}
+
+impl ShellFunction {
+    const fn empty() -> Self {
+        Self {
+            active: false,
+            name: [0; MAX_FUNC_NAME],
+            name_len: 0,
+            body: [0; MAX_FUNC_BODY],
+            body_len: 0,
+        }
+    }
+}
+
+static mut FUNCTIONS: [ShellFunction; MAX_FUNCTIONS] = {
+    const INIT: ShellFunction = ShellFunction::empty();
+    [INIT; MAX_FUNCTIONS]
+};
+
+fn funcs_slice() -> &'static [ShellFunction] {
+    unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(FUNCTIONS) as *const ShellFunction, MAX_FUNCTIONS) }
+}
+
+fn funcs_slice_mut() -> &'static mut [ShellFunction] {
+    unsafe { core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(FUNCTIONS) as *mut ShellFunction, MAX_FUNCTIONS) }
+}
+
+fn func_define(name: &[u8], body: &[u8]) {
+    // Update existing
+    for f in funcs_slice_mut().iter_mut() {
+        if f.active && f.name_len == name.len() && f.name[..f.name_len] == *name {
+            let bl = body.len().min(MAX_FUNC_BODY);
+            f.body[..bl].copy_from_slice(&body[..bl]);
+            f.body_len = bl;
+            return;
+        }
+    }
+    // Insert new
+    for f in funcs_slice_mut().iter_mut() {
+        if !f.active {
+            let nl = name.len().min(MAX_FUNC_NAME);
+            f.name[..nl].copy_from_slice(&name[..nl]);
+            f.name_len = nl;
+            let bl = body.len().min(MAX_FUNC_BODY);
+            f.body[..bl].copy_from_slice(&body[..bl]);
+            f.body_len = bl;
+            f.active = true;
+            return;
+        }
+    }
+    print(b"error: too many functions defined\n");
+}
+
+fn func_find(name: &[u8]) -> Option<usize> {
+    for (i, f) in funcs_slice().iter().enumerate() {
+        if f.active && f.name_len == name.len() && f.name[..f.name_len] == *name {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Positional args for the currently executing function ($1, $2, ...).
+const MAX_FUNC_ARGS: usize = 8;
+static mut FUNC_ARGS: [[u8; 128]; MAX_FUNC_ARGS] = [[0; 128]; MAX_FUNC_ARGS];
+static mut FUNC_ARG_LENS: [usize; MAX_FUNC_ARGS] = [0; MAX_FUNC_ARGS];
+static mut FUNC_ARG_COUNT: usize = 0;
+
+/// Expand $VAR references (and $1-$8 positional args) in a command line.
 fn expand_vars(input: &[u8], output: &mut [u8]) -> usize {
     let mut out_pos = 0;
     let mut i = 0;
     while i < input.len() && out_pos < output.len() - 1 {
         if input[i] == b'$' && i + 1 < input.len() && input[i + 1] != b' ' {
+            // Check for positional argument $1-$8
+            let next = input[i + 1];
+            if next >= b'1' && next <= b'8' {
+                let arg_idx = (next - b'1') as usize;
+                unsafe {
+                    if arg_idx < FUNC_ARG_COUNT {
+                        let arg_len = FUNC_ARG_LENS[arg_idx];
+                        let copy_len = arg_len.min(output.len() - 1 - out_pos);
+                        output[out_pos..out_pos + copy_len].copy_from_slice(&FUNC_ARGS[arg_idx][..copy_len]);
+                        out_pos += copy_len;
+                    }
+                }
+                i += 2;
+                continue;
+            }
             // Extract variable name.
             let start = i + 1;
             let mut end = start;
@@ -673,16 +898,28 @@ fn shell_loop() {
     env_set(b"VERSION", b"0.1.0");
 
     loop {
+        // Reap finished background jobs
+        reap_done_jobs();
+
         // Prompt
         print(b"$ ");
 
-        // Read line
+        // Read line with history navigation and tab completion
         let mut pos: usize = 0;
+        let mut hist_nav: isize = -1; // -1 = not navigating, 0..count-1 = history index
+        let mut saved_line = [0u8; 256]; // save current line when navigating history
+        let mut saved_len: usize = 0;
+        let mut esc_state: u8 = 0; // 0=normal, 1=got ESC, 2=got ESC+[
+
         loop {
             let mut ch = [0u8; 1];
             let n = linux_read(0, ch.as_mut_ptr(), 1);
             if n == -4 {
-                // -EINTR (Ctrl+C)
+                // -EINTR (Ctrl+C) — send to fg job if any
+                let fg = get_fg_pid();
+                if fg != 0 {
+                    linux_kill(fg, 2); // SIGINT
+                }
                 print(b"^C\n");
                 pos = 0;
                 break;
@@ -692,18 +929,108 @@ fn shell_loop() {
             }
             let c = ch[0];
 
+            // Handle escape sequences for arrow keys
+            if esc_state == 1 {
+                if c == b'[' {
+                    esc_state = 2;
+                    continue;
+                } else {
+                    esc_state = 0;
+                    // fall through to normal processing
+                }
+            }
+            if esc_state == 2 {
+                esc_state = 0;
+                match c {
+                    b'A' => {
+                        // Up arrow — previous history
+                        let count = history_count();
+                        if count == 0 { continue; }
+                        if hist_nav < 0 {
+                            // Save current line
+                            saved_line[..pos].copy_from_slice(&line_buf[..pos]);
+                            saved_len = pos;
+                            hist_nav = (count as isize) - 1;
+                        } else if hist_nav > 0 {
+                            hist_nav -= 1;
+                        } else {
+                            continue; // already at oldest
+                        }
+                        // Erase current line on terminal
+                        erase_line(pos);
+                        // Copy history entry
+                        if let Some(entry) = history_get(hist_nav as usize) {
+                            let l = entry.len().min(line_buf.len() - 1);
+                            line_buf[..l].copy_from_slice(&entry[..l]);
+                            pos = l;
+                            linux_write(1, line_buf[..pos].as_ptr(), pos);
+                        }
+                        continue;
+                    }
+                    b'B' => {
+                        // Down arrow — next history
+                        if hist_nav < 0 { continue; }
+                        let count = history_count();
+                        erase_line(pos);
+                        if (hist_nav as usize) < count - 1 {
+                            hist_nav += 1;
+                            if let Some(entry) = history_get(hist_nav as usize) {
+                                let l = entry.len().min(line_buf.len() - 1);
+                                line_buf[..l].copy_from_slice(&entry[..l]);
+                                pos = l;
+                                linux_write(1, line_buf[..pos].as_ptr(), pos);
+                            }
+                        } else {
+                            // Restore saved line
+                            hist_nav = -1;
+                            line_buf[..saved_len].copy_from_slice(&saved_line[..saved_len]);
+                            pos = saved_len;
+                            linux_write(1, line_buf[..pos].as_ptr(), pos);
+                        }
+                        continue;
+                    }
+                    _ => { continue; } // ignore other escape sequences
+                }
+            }
+
             match c {
+                0x1B => {
+                    // ESC — start of escape sequence
+                    esc_state = 1;
+                }
                 // Enter
                 b'\r' | b'\n' => {
                     print(b"\n");
+                    let _ = hist_nav;
                     break;
                 }
                 // Backspace (0x08) or DEL (0x7F)
                 0x08 | 0x7F => {
                     if pos > 0 {
                         pos -= 1;
-                        // Erase character on terminal: BS + space + BS
                         print(b"\x08 \x08");
+                    }
+                }
+                // Tab — completion
+                b'\t' => {
+                    do_tab_completion(&mut line_buf, &mut pos);
+                }
+                // Ctrl+Z
+                0x1A => {
+                    let fg = get_fg_pid();
+                    if fg != 0 {
+                        linux_kill(fg, 20); // SIGTSTP
+                        print(b"^Z\n");
+                        // Add to jobs as stopped
+                        let jid = job_add(fg, JOB_STOPPED, b"(stopped)");
+                        if jid > 0 {
+                            print(b"[");
+                            print_u64(jid as u64);
+                            print(b"]  Stopped\n");
+                        }
+                        set_fg_pid(0);
+                        pos = 0;
+                        break;
                     }
                 }
                 // Printable character
@@ -711,17 +1038,29 @@ fn shell_loop() {
                     if pos < line_buf.len() - 1 {
                         line_buf[pos] = c;
                         pos += 1;
-                        // Echo
                         linux_write(1, &c as *const u8, 1);
                     }
                 }
-                // Ignore other control chars
                 _ => {}
             }
         }
 
-        let raw_line = trim(&line_buf[..pos]);
-        if raw_line.is_empty() {
+        // Copy raw line into its own buffer to avoid borrow conflicts
+        let mut raw_copy = [0u8; 256];
+        let raw_trimmed = trim(&line_buf[..pos]);
+        if raw_trimmed.is_empty() {
+            continue;
+        }
+        let raw_len = raw_trimmed.len();
+        raw_copy[..raw_len].copy_from_slice(raw_trimmed);
+        let raw_line = &raw_copy[..raw_len];
+
+        // Add to history
+        history_add(raw_line);
+
+        // Check for function definition: "function NAME() {"
+        if starts_with(raw_line, b"function ") {
+            read_function_def(raw_line, &mut line_buf);
             continue;
         }
 
@@ -731,6 +1070,16 @@ fn shell_loop() {
         let line = trim(&expanded[..exp_len]);
         if line.is_empty() {
             continue;
+        }
+
+        // Check for here-document (<<DELIM).
+        if let Some(heredoc_pos) = find_substr(line, b"<<") {
+            let cmd_part = trim(&line[..heredoc_pos]);
+            let delim = trim(&line[heredoc_pos + 2..]);
+            if !delim.is_empty() && !cmd_part.is_empty() {
+                execute_heredoc(cmd_part, delim, &mut line_buf);
+                continue;
+            }
         }
 
         // Check for pipe operator.
@@ -751,11 +1100,13 @@ fn shell_loop() {
         };
 
         if background {
-            // Run in a forked child.
             let child_fn = child_shell_main as *const () as u64;
             let pid = linux_clone(child_fn);
             if pid > 0 {
-                print(b"[bg] pid=");
+                let jid = job_add(pid as u64, JOB_RUNNING, line);
+                print(b"[");
+                print_u64(jid as u64);
+                print(b"] ");
                 print_u64(pid as u64);
                 print(b"\n");
             }
@@ -774,8 +1125,722 @@ fn shell_loop() {
             continue;
         }
 
-        dispatch_command(line);
+        // Parse and handle redirects, then dispatch
+        dispatch_with_redirects(line);
     }
+}
+
+/// Erase the current line on terminal (move cursor back, overwrite, move back).
+fn erase_line(len: usize) {
+    for _ in 0..len {
+        print(b"\x08 \x08");
+    }
+}
+
+/// Reap background jobs that have finished.
+fn reap_done_jobs() {
+    for j in jobs_slice_mut().iter_mut() {
+        if j.active && j.status == JOB_RUNNING {
+            // Non-blocking waitpid check: we just mark done if pid finished.
+            // In this OS the waitpid is blocking, so we skip actual wait here.
+            // Jobs will be cleaned up when user runs `jobs`.
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tab completion
+// ---------------------------------------------------------------------------
+
+fn do_tab_completion(line_buf: &mut [u8; 256], pos: &mut usize) {
+    if *pos == 0 { return; }
+    // Extract the current word (last token) — copy to avoid borrow conflict
+    let mut word_start = *pos;
+    while word_start > 0 && line_buf[word_start - 1] != b' ' {
+        word_start -= 1;
+    }
+    if word_start >= *pos { return; }
+    let mut word_buf = [0u8; 128];
+    let word_len = (*pos - word_start).min(127);
+    word_buf[..word_len].copy_from_slice(&line_buf[word_start..*pos]);
+    let word = &word_buf[..word_len];
+
+    // Check if word contains '/' — do file completion
+    let has_slash = find_byte(word, b'/').is_some();
+
+    if has_slash {
+        tab_complete_file(word, line_buf, pos, word_start);
+    } else {
+        tab_complete_builtin(word, line_buf, pos, word_start);
+    }
+}
+
+fn tab_complete_builtin(prefix: &[u8], line_buf: &mut [u8; 256], pos: &mut usize, word_start: usize) {
+    static BUILTINS: &[&[u8]] = &[
+        b"help", b"echo", b"uname", b"uptime", b"caps", b"ls", b"cat", b"write",
+        b"rm", b"stat", b"hexdump", b"head", b"tail", b"grep", b"mkdir", b"rmdir",
+        b"cd", b"pwd", b"snap", b"fork", b"getpid", b"exec", b"ps", b"top", b"kill",
+        b"resolve", b"ping", b"traceroute", b"wget", b"export", b"env", b"unset",
+        b"exit", b"jobs", b"fg", b"bg", b"history", b"wc", b"sort", b"uniq", b"diff",
+        b"function",
+    ];
+
+    let mut matches: [usize; 40] = [0; 40];
+    let mut match_count: usize = 0;
+
+    for (i, &builtin) in BUILTINS.iter().enumerate() {
+        if starts_with(builtin, prefix) && match_count < 40 {
+            matches[match_count] = i;
+            match_count += 1;
+        }
+    }
+
+    if match_count == 0 {
+        return;
+    }
+    if match_count == 1 {
+        // Single match — complete it
+        let builtin = BUILTINS[matches[0]];
+        let suffix = &builtin[prefix.len()..];
+        if *pos + suffix.len() + 1 < line_buf.len() {
+            line_buf[*pos..*pos + suffix.len()].copy_from_slice(suffix);
+            *pos += suffix.len();
+            line_buf[*pos] = b' ';
+            *pos += 1;
+            linux_write(1, suffix.as_ptr(), suffix.len());
+            print(b" ");
+        }
+    } else {
+        // Multiple matches — show all
+        print(b"\n");
+        for i in 0..match_count {
+            print(BUILTINS[matches[i]]);
+            print(b"  ");
+        }
+        print(b"\n$ ");
+        linux_write(1, line_buf[..word_start].as_ptr(), word_start);
+        // Find common prefix among matches
+        let first = BUILTINS[matches[0]];
+        let mut common_len = first.len();
+        for i in 1..match_count {
+            let other = BUILTINS[matches[i]];
+            let mut cl = 0;
+            while cl < common_len && cl < other.len() && first[cl] == other[cl] {
+                cl += 1;
+            }
+            common_len = cl;
+        }
+        if common_len > prefix.len() {
+            let extra = &first[prefix.len()..common_len];
+            line_buf[*pos..*pos + extra.len()].copy_from_slice(extra);
+            *pos += extra.len();
+        }
+        linux_write(1, line_buf[word_start..*pos].as_ptr(), *pos - word_start);
+    }
+}
+
+fn tab_complete_file(prefix: &[u8], line_buf: &mut [u8; 256], pos: &mut usize, _word_start: usize) {
+    // Split prefix into directory part and name part
+    let mut last_slash = 0;
+    for i in 0..prefix.len() {
+        if prefix[i] == b'/' { last_slash = i + 1; }
+    }
+    let dir_part = if last_slash > 0 { &prefix[..last_slash] } else { b"." as &[u8] };
+    let name_prefix = &prefix[last_slash..];
+
+    // Open directory and list entries
+    let mut dir_buf = [0u8; 128];
+    let dir_path = null_terminate(dir_part, &mut dir_buf);
+
+    // Save/restore cwd for listing the target dir
+    let mut old_cwd = [0u8; 128];
+    let cwd_ret = linux_getcwd(old_cwd.as_mut_ptr(), old_cwd.len() as u64);
+
+    if last_slash > 0 {
+        if linux_chdir(dir_path) < 0 { return; }
+    }
+
+    let mut dot_buf = [0u8; 4];
+    let dot_path = null_terminate(b".", &mut dot_buf);
+    let fd = linux_open(dot_path, 0);
+    if fd < 0 {
+        if cwd_ret > 0 && last_slash > 0 { linux_chdir(old_cwd.as_ptr()); }
+        return;
+    }
+
+    let mut listing = [0u8; 2048];
+    let mut total: usize = 0;
+    loop {
+        let n = linux_read(fd as u64, listing[total..].as_mut_ptr(), listing.len() - total);
+        if n <= 0 { break; }
+        total += n as usize;
+        if total >= listing.len() { break; }
+    }
+    linux_close(fd as u64);
+
+    if cwd_ret > 0 && last_slash > 0 { linux_chdir(old_cwd.as_ptr()); }
+
+    // Parse directory listing lines and find matches
+    let mut match_names: [[u8; 64]; 16] = [[0; 64]; 16];
+    let mut match_lens: [usize; 16] = [0; 16];
+    let mut match_count: usize = 0;
+
+    let mut line_start: usize = 0;
+    let mut i: usize = 0;
+    while i <= total && match_count < 16 {
+        if i == total || listing[i] == b'\n' {
+            let entry_line = &listing[line_start..i];
+            // Entry line format might be "name" or "name  SIZE  TYPE" etc
+            // Extract just the first word/name
+            let entry_name = if let Some(sp) = find_space(entry_line) {
+                &entry_line[..sp]
+            } else {
+                entry_line
+            };
+            if !entry_name.is_empty() && starts_with(entry_name, name_prefix) {
+                let l = entry_name.len().min(64);
+                match_names[match_count][..l].copy_from_slice(&entry_name[..l]);
+                match_lens[match_count] = l;
+                match_count += 1;
+            }
+            line_start = i + 1;
+        }
+        i += 1;
+    }
+
+    if match_count == 0 { return; }
+    if match_count == 1 {
+        let suffix = &match_names[0][name_prefix.len()..match_lens[0]];
+        if *pos + suffix.len() + 1 < line_buf.len() {
+            line_buf[*pos..*pos + suffix.len()].copy_from_slice(suffix);
+            *pos += suffix.len();
+            line_buf[*pos] = b' ';
+            *pos += 1;
+            linux_write(1, suffix.as_ptr(), suffix.len());
+            print(b" ");
+        }
+    } else {
+        print(b"\n");
+        for j in 0..match_count {
+            linux_write(1, match_names[j][..match_lens[j]].as_ptr(), match_lens[j]);
+            print(b"  ");
+        }
+        print(b"\n$ ");
+        linux_write(1, line_buf[..*pos].as_ptr(), *pos);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Redirect parsing and execution
+// ---------------------------------------------------------------------------
+
+struct Redirects {
+    stdin_file: [u8; 64],
+    stdin_file_len: usize,
+    stdout_file: [u8; 64],
+    stdout_file_len: usize,
+    stdout_append: bool,
+}
+
+impl Redirects {
+    const fn empty() -> Self {
+        Self {
+            stdin_file: [0; 64],
+            stdin_file_len: 0,
+            stdout_file: [0; 64],
+            stdout_file_len: 0,
+            stdout_append: false,
+        }
+    }
+}
+
+/// Parse redirects from command line and return the cleaned command + redirect info.
+fn parse_redirects<'a>(line: &'a [u8], redir: &mut Redirects, clean: &mut [u8; 256]) -> usize {
+    let mut clean_len: usize = 0;
+    let mut i: usize = 0;
+
+    while i < line.len() {
+        if line[i] == b'>' {
+            // Output redirect
+            if i + 1 < line.len() && line[i + 1] == b'>' {
+                // >> append
+                redir.stdout_append = true;
+                i += 2;
+            } else {
+                // > truncate
+                redir.stdout_append = false;
+                i += 1;
+            }
+            // Skip spaces
+            while i < line.len() && line[i] == b' ' { i += 1; }
+            // Read filename
+            let start = i;
+            while i < line.len() && line[i] != b' ' && line[i] != b'<' && line[i] != b'>' { i += 1; }
+            let fname = &line[start..i];
+            let fl = fname.len().min(63);
+            redir.stdout_file[..fl].copy_from_slice(&fname[..fl]);
+            redir.stdout_file_len = fl;
+        } else if line[i] == b'<' {
+            // Input redirect
+            i += 1;
+            while i < line.len() && line[i] == b' ' { i += 1; }
+            let start = i;
+            while i < line.len() && line[i] != b' ' && line[i] != b'<' && line[i] != b'>' { i += 1; }
+            let fname = &line[start..i];
+            let fl = fname.len().min(63);
+            redir.stdin_file[..fl].copy_from_slice(&fname[..fl]);
+            redir.stdin_file_len = fl;
+        } else {
+            if clean_len < 255 {
+                clean[clean_len] = line[i];
+                clean_len += 1;
+            }
+            i += 1;
+        }
+    }
+    clean_len
+}
+
+/// Check if a line contains redirect operators (outside of quoted strings).
+fn has_redirects(line: &[u8]) -> bool {
+    for &b in line.iter() {
+        if b == b'>' || b == b'<' { return true; }
+    }
+    false
+}
+
+/// Dispatch a command with redirect support.
+fn dispatch_with_redirects(line: &[u8]) {
+    if !has_redirects(line) {
+        dispatch_or_call_func(line);
+        return;
+    }
+
+    let mut redir = Redirects::empty();
+    let mut clean = [0u8; 256];
+    let clean_len = parse_redirects(line, &mut redir, &mut clean);
+    let cmd = trim(&clean[..clean_len]);
+    if cmd.is_empty() { return; }
+
+    // Set up input redirect
+    let mut in_fd: i64 = -1;
+    if redir.stdin_file_len > 0 {
+        let mut path_buf = [0u8; 65];
+        let path = null_terminate(&redir.stdin_file[..redir.stdin_file_len], &mut path_buf);
+        in_fd = linux_open(path, 0); // O_RDONLY
+        if in_fd < 0 {
+            print(b"redirect: cannot open input file: ");
+            print(&redir.stdin_file[..redir.stdin_file_len]);
+            print(b"\n");
+            return;
+        }
+    }
+
+    // Set up output redirect
+    let mut out_fd: i64 = -1;
+    if redir.stdout_file_len > 0 {
+        let mut path_buf = [0u8; 65];
+        let path = null_terminate(&redir.stdout_file[..redir.stdout_file_len], &mut path_buf);
+        let flags: u64 = if redir.stdout_append {
+            0x441 // O_WRONLY | O_CREAT | O_APPEND
+        } else {
+            0x41 // O_WRONLY | O_CREAT (truncate)
+        };
+        out_fd = linux_open(path, flags);
+        if out_fd < 0 {
+            print(b"redirect: cannot open output file: ");
+            print(&redir.stdout_file[..redir.stdout_file_len]);
+            print(b"\n");
+            if in_fd >= 0 { linux_close(in_fd as u64); }
+            return;
+        }
+    }
+
+    // For output redirect, capture command output and write to file
+    if out_fd >= 0 {
+        let mut capture_buf = [0u8; 4096];
+        let cap_len = capture_command_extended(cmd, &mut capture_buf, in_fd);
+        if cap_len > 0 {
+            linux_write(out_fd as u64, capture_buf[..cap_len].as_ptr(), cap_len);
+        }
+        linux_close(out_fd as u64);
+    } else if in_fd >= 0 {
+        // Input redirect only — read from file and feed to command as stdin
+        // For commands that read stdin (like wc, sort, uniq with no file arg)
+        let mut input_data = [0u8; 4096];
+        let mut input_len: usize = 0;
+        loop {
+            let n = linux_read(in_fd as u64, input_data[input_len..].as_mut_ptr(),
+                              input_data.len() - input_len);
+            if n <= 0 { break; }
+            input_len += n as usize;
+            if input_len >= input_data.len() { break; }
+        }
+        linux_close(in_fd as u64);
+        dispatch_command_with_stdin(cmd, &input_data[..input_len]);
+    } else {
+        dispatch_or_call_func(cmd);
+    }
+
+    if in_fd >= 0 { linux_close(in_fd as u64); }
+}
+
+/// Extended capture: supports more commands than capture_command
+fn capture_command_extended(cmd: &[u8], buf: &mut [u8], in_fd: i64) -> usize {
+    // Try the existing capture_command first
+    let len = capture_command(cmd, buf);
+    if len > 0 { return len; }
+
+    // Handle echo
+    if starts_with(cmd, b"echo ") {
+        let rest = &cmd[5..];
+        let l = rest.len().min(buf.len());
+        buf[..l].copy_from_slice(&rest[..l]);
+        if l < buf.len() { buf[l] = b'\n'; return l + 1; }
+        return l;
+    }
+    if eq(cmd, b"echo") {
+        if buf.len() > 0 { buf[0] = b'\n'; return 1; }
+        return 0;
+    }
+    if eq(cmd, b"pwd") {
+        let ret = linux_getcwd(buf.as_mut_ptr(), buf.len() as u64);
+        if ret > 0 {
+            let mut len = 0;
+            while len < buf.len() && buf[len] != 0 { len += 1; }
+            if len < buf.len() { buf[len] = b'\n'; len += 1; }
+            return len;
+        }
+        return 0;
+    }
+    if eq(cmd, b"uname") {
+        let s = b"sotOS 0.1.0 x86_64 LUCAS\n";
+        let l = s.len().min(buf.len());
+        buf[..l].copy_from_slice(&s[..l]);
+        return l;
+    }
+
+    // For commands with stdin, read stdin data and process
+    if in_fd >= 0 {
+        let mut input_data = [0u8; 4096];
+        let mut input_len: usize = 0;
+        loop {
+            let n = linux_read(in_fd as u64, input_data[input_len..].as_mut_ptr(),
+                              input_data.len() - input_len);
+            if n <= 0 { break; }
+            input_len += n as usize;
+            if input_len >= input_data.len() { break; }
+        }
+        return capture_command_with_stdin(cmd, &input_data[..input_len], buf);
+    }
+
+    // Fallback: just dispatch normally and return 0
+    dispatch_or_call_func(cmd);
+    0
+}
+
+/// Capture output from commands that can read from stdin data
+fn capture_command_with_stdin(cmd: &[u8], stdin_data: &[u8], buf: &mut [u8]) -> usize {
+    if eq(cmd, b"wc") {
+        return wc_data(stdin_data, buf);
+    }
+    if eq(cmd, b"sort") {
+        return sort_data(stdin_data, buf);
+    }
+    if eq(cmd, b"uniq") {
+        return uniq_data(stdin_data, buf);
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Here-document support
+// ---------------------------------------------------------------------------
+
+fn execute_heredoc(cmd: &[u8], delim: &[u8], line_buf: &mut [u8; 256]) {
+    let mut heredoc_data = [0u8; 4096];
+    let mut heredoc_len: usize = 0;
+
+    // Read lines until we see the delimiter
+    loop {
+        print(b"> ");
+        let mut pos: usize = 0;
+        loop {
+            let mut ch = [0u8; 1];
+            let n = linux_read(0, ch.as_mut_ptr(), 1);
+            if n <= 0 { continue; }
+            let c = ch[0];
+            match c {
+                b'\r' | b'\n' => {
+                    print(b"\n");
+                    break;
+                }
+                0x08 | 0x7F => {
+                    if pos > 0 {
+                        pos -= 1;
+                        print(b"\x08 \x08");
+                    }
+                }
+                0x20..=0x7E => {
+                    if pos < line_buf.len() - 1 {
+                        line_buf[pos] = c;
+                        pos += 1;
+                        linux_write(1, &c as *const u8, 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let input_line = trim(&line_buf[..pos]);
+        // Check if this is the delimiter
+        if eq(input_line, delim) {
+            break;
+        }
+        // Append to heredoc data
+        let l = input_line.len();
+        if heredoc_len + l + 1 < heredoc_data.len() {
+            heredoc_data[heredoc_len..heredoc_len + l].copy_from_slice(input_line);
+            heredoc_len += l;
+            heredoc_data[heredoc_len] = b'\n';
+            heredoc_len += 1;
+        }
+    }
+
+    // Feed heredoc data as stdin to the command
+    dispatch_command_with_stdin(cmd, &heredoc_data[..heredoc_len]);
+}
+
+/// Dispatch a command that has stdin data available
+fn dispatch_command_with_stdin(cmd: &[u8], stdin_data: &[u8]) {
+    // Handle commands that accept stdin
+    if eq(cmd, b"cat") {
+        // cat with no file reads stdin
+        linux_write(1, stdin_data.as_ptr(), stdin_data.len());
+        return;
+    }
+    if eq(cmd, b"wc") {
+        let mut buf = [0u8; 128];
+        let len = wc_data(stdin_data, &mut buf);
+        linux_write(1, buf[..len].as_ptr(), len);
+        return;
+    }
+    if eq(cmd, b"sort") {
+        let mut buf = [0u8; 4096];
+        let len = sort_data(stdin_data, &mut buf);
+        linux_write(1, buf[..len].as_ptr(), len);
+        return;
+    }
+    if eq(cmd, b"uniq") {
+        let mut buf = [0u8; 4096];
+        let len = uniq_data(stdin_data, &mut buf);
+        linux_write(1, buf[..len].as_ptr(), len);
+        return;
+    }
+    if starts_with(cmd, b"grep ") {
+        let pattern = trim(&cmd[5..]);
+        // Filter stdin_data lines by pattern
+        let mut line_start: usize = 0;
+        let mut i: usize = 0;
+        while i <= stdin_data.len() {
+            if i == stdin_data.len() || stdin_data[i] == b'\n' {
+                let line = &stdin_data[line_start..i];
+                if contains(line, pattern) {
+                    linux_write(1, line.as_ptr(), line.len());
+                    print(b"\n");
+                }
+                line_start = i + 1;
+            }
+            i += 1;
+        }
+        return;
+    }
+    // For other commands, just dispatch normally (ignore stdin data)
+    dispatch_or_call_func(cmd);
+}
+
+// ---------------------------------------------------------------------------
+// Function definition and invocation
+// ---------------------------------------------------------------------------
+
+fn read_function_def(first_line: &[u8], line_buf: &mut [u8; 256]) {
+    // Parse "function NAME() {" or "function NAME {"
+    let after_func = trim(&first_line[9..]);
+
+    // Extract function name
+    let mut name_end: usize = 0;
+    while name_end < after_func.len()
+        && after_func[name_end] != b'('
+        && after_func[name_end] != b' '
+        && after_func[name_end] != b'{'
+    {
+        name_end += 1;
+    }
+    let func_name = &after_func[..name_end];
+    if func_name.is_empty() {
+        print(b"syntax error: function name expected\n");
+        return;
+    }
+
+    // Check if first line contains '{' — if not, it's an error
+    let has_brace = find_byte(after_func, b'{').is_some();
+    if !has_brace {
+        print(b"syntax error: expected '{'\n");
+        return;
+    }
+
+    // Read body lines until we see "}"
+    let mut body = [0u8; MAX_FUNC_BODY];
+    let mut body_len: usize = 0;
+
+    loop {
+        print(b"> ");
+        let mut pos: usize = 0;
+        loop {
+            let mut ch = [0u8; 1];
+            let n = linux_read(0, ch.as_mut_ptr(), 1);
+            if n <= 0 { continue; }
+            let c = ch[0];
+            match c {
+                b'\r' | b'\n' => {
+                    print(b"\n");
+                    break;
+                }
+                0x08 | 0x7F => {
+                    if pos > 0 {
+                        pos -= 1;
+                        print(b"\x08 \x08");
+                    }
+                }
+                0x20..=0x7E => {
+                    if pos < line_buf.len() - 1 {
+                        line_buf[pos] = c;
+                        pos += 1;
+                        linux_write(1, &c as *const u8, 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let input_line = trim(&line_buf[..pos]);
+        if eq(input_line, b"}") {
+            break;
+        }
+        // Append line to body with newline separator
+        if body_len + input_line.len() + 1 < MAX_FUNC_BODY {
+            body[body_len..body_len + input_line.len()].copy_from_slice(input_line);
+            body_len += input_line.len();
+            body[body_len] = b'\n';
+            body_len += 1;
+        }
+    }
+
+    func_define(func_name, &body[..body_len]);
+}
+
+/// Try to call a shell function. Returns true if found and called.
+fn call_function(name: &[u8], args: &[u8]) -> bool {
+    let idx = match func_find(name) {
+        Some(i) => i,
+        None => return false,
+    };
+
+    // Save old positional args
+    let mut old_args: [[u8; 128]; MAX_FUNC_ARGS] = [[0; 128]; MAX_FUNC_ARGS];
+    let mut old_arg_lens: [usize; MAX_FUNC_ARGS] = [0; MAX_FUNC_ARGS];
+    let old_count: usize;
+    unsafe {
+        old_count = FUNC_ARG_COUNT;
+        for i in 0..MAX_FUNC_ARGS {
+            old_arg_lens[i] = FUNC_ARG_LENS[i];
+            old_args[i][..old_arg_lens[i]].copy_from_slice(&FUNC_ARGS[i][..old_arg_lens[i]]);
+        }
+    }
+
+    // Parse new positional args from args string
+    unsafe {
+        FUNC_ARG_COUNT = 0;
+        let mut pos: usize = 0;
+        while pos < args.len() && FUNC_ARG_COUNT < MAX_FUNC_ARGS {
+            while pos < args.len() && args[pos] == b' ' { pos += 1; }
+            let start = pos;
+            while pos < args.len() && args[pos] != b' ' { pos += 1; }
+            if start < pos {
+                let l = (pos - start).min(128);
+                FUNC_ARGS[FUNC_ARG_COUNT][..l].copy_from_slice(&args[start..start + l]);
+                FUNC_ARG_LENS[FUNC_ARG_COUNT] = l;
+                FUNC_ARG_COUNT += 1;
+            }
+        }
+    }
+
+    // Copy the body before execution (func_define might modify FUNCTIONS)
+    let mut body_copy = [0u8; MAX_FUNC_BODY];
+    let body_len;
+    {
+        let f = &funcs_slice()[idx];
+        body_len = f.body_len;
+        body_copy[..body_len].copy_from_slice(&f.body[..body_len]);
+    }
+
+    // Execute each line in the body
+    let mut line_start: usize = 0;
+    let mut i: usize = 0;
+    while i <= body_len {
+        if i == body_len || body_copy[i] == b'\n' {
+            let func_line = trim(&body_copy[line_start..i]);
+            if !func_line.is_empty() {
+                if eq(func_line, b"return") {
+                    break; // early return
+                }
+                if starts_with(func_line, b"return ") {
+                    break; // return with value (just exit)
+                }
+                // Expand variables (including $1, $2, etc.)
+                let mut exp_buf = [0u8; 256];
+                let exp_len = expand_vars(func_line, &mut exp_buf);
+                let expanded = trim(&exp_buf[..exp_len]);
+                if !expanded.is_empty() {
+                    dispatch_or_call_func(expanded);
+                }
+            }
+            line_start = i + 1;
+        }
+        i += 1;
+    }
+
+    // Restore old positional args
+    unsafe {
+        FUNC_ARG_COUNT = old_count;
+        for i in 0..MAX_FUNC_ARGS {
+            FUNC_ARG_LENS[i] = old_arg_lens[i];
+            FUNC_ARGS[i][..old_arg_lens[i]].copy_from_slice(&old_args[i][..old_arg_lens[i]]);
+        }
+    }
+
+    true
+}
+
+/// Dispatch a command, trying functions first, then builtins.
+fn dispatch_or_call_func(line: &[u8]) {
+    // Extract command name (first word)
+    let cmd_name = if let Some(sp) = find_space(line) {
+        &line[..sp]
+    } else {
+        line
+    };
+    let args = if let Some(sp) = find_space(line) {
+        trim(&line[sp + 1..])
+    } else {
+        b"" as &[u8]
+    };
+
+    // Try function call first
+    if call_function(cmd_name, args) {
+        return;
+    }
+
+    // Fall through to builtin dispatch
+    dispatch_command(line);
 }
 
 fn dispatch_command(line: &[u8]) {
@@ -784,9 +1849,11 @@ fn dispatch_command(line: &[u8]) {
             print(b"commands: help, echo, uname, uptime, caps, ls, cat, write, rm,\n");
             print(b"  stat, hexdump, head, tail, grep, mkdir, rmdir, cd, pwd, snap,\n");
             print(b"  fork, getpid, exec, ps, top, kill, resolve, ping, traceroute,\n");
-            print(b"  wget, export, env, unset, exit\n");
-            print(b"operators: cmd1 | cmd2 (pipe), cmd & (background)\n");
+            print(b"  wget, export, env, unset, exit, jobs, fg, bg, history,\n");
+            print(b"  wc, sort, uniq, diff\n");
+            print(b"operators: cmd > file, cmd >> file, cmd < file, cmd1 | cmd2, cmd &\n");
             print(b"scripting: if COND; then CMD; fi, for VAR in A B C; do CMD; done\n");
+            print(b"  function NAME() { body; }, <<EOF heredocs\n");
         } else if eq(line, b"uname") {
             print(b"sotOS 0.1.0 x86_64 LUCAS\n");
         } else if eq(line, b"uptime") {
@@ -956,6 +2023,39 @@ fn dispatch_command(line: &[u8]) {
             cmd_grep(args);
         } else if eq(line, b"top") {
             cmd_top();
+        } else if eq(line, b"jobs") {
+            cmd_jobs();
+        } else if starts_with(line, b"fg ") {
+            let n = parse_u64_simple(trim(&line[3..])) as usize;
+            cmd_fg(n);
+        } else if eq(line, b"fg") {
+            cmd_fg(0);
+        } else if starts_with(line, b"bg ") {
+            let n = parse_u64_simple(trim(&line[3..])) as usize;
+            cmd_bg(n);
+        } else if eq(line, b"bg") {
+            cmd_bg(0);
+        } else if eq(line, b"history") {
+            cmd_history();
+        } else if starts_with(line, b"wc ") {
+            let name = trim(&line[3..]);
+            cmd_wc(name);
+        } else if eq(line, b"wc") {
+            // wc with no args — read from stdin (only meaningful with pipe/redirect)
+            print(b"      0       0       0\n");
+        } else if starts_with(line, b"sort ") {
+            let name = trim(&line[5..]);
+            cmd_sort(name);
+        } else if eq(line, b"sort") {
+            print(b"usage: sort <file>\n");
+        } else if starts_with(line, b"uniq ") {
+            let name = trim(&line[5..]);
+            cmd_uniq(name);
+        } else if eq(line, b"uniq") {
+            print(b"usage: uniq <file>\n");
+        } else if starts_with(line, b"diff ") {
+            let args = trim(&line[5..]);
+            cmd_diff(args);
         } else if eq(line, b"exit") {
             print(b"bye!\n");
             linux_exit(0);
@@ -967,7 +2067,483 @@ fn dispatch_command(line: &[u8]) {
 }
 
 // ---------------------------------------------------------------------------
-// New commands: env, head, tail, grep, top, pipe support, scripting
+// Job control commands
+// ---------------------------------------------------------------------------
+
+fn cmd_jobs() {
+    for (i, j) in jobs_slice().iter().enumerate() {
+        if j.active {
+            print(b"[");
+            print_u64((i + 1) as u64);
+            print(b"]  ");
+            match j.status {
+                JOB_RUNNING => print(b"Running    "),
+                JOB_STOPPED => print(b"Stopped    "),
+                JOB_DONE    => print(b"Done       "),
+                _           => print(b"Unknown    "),
+            }
+            print(&j.cmd[..j.cmd_len]);
+            print(b"\n");
+        }
+    }
+    // Clean up done jobs after listing
+    for j in jobs_slice_mut().iter_mut() {
+        if j.active && j.status == JOB_DONE {
+            j.active = false;
+        }
+    }
+}
+
+fn cmd_fg(id: usize) {
+    // If id==0, find most recent running/stopped job
+    let job_id = if id == 0 {
+        let mut last: usize = 0;
+        for (i, j) in jobs_slice().iter().enumerate() {
+            if j.active && (j.status == JOB_RUNNING || j.status == JOB_STOPPED) {
+                last = i + 1;
+            }
+        }
+        last
+    } else {
+        id
+    };
+
+    if let Some(j) = job_find_by_id(job_id) {
+        let pid = j.pid;
+        print(&j.cmd[..j.cmd_len]);
+        print(b"\n");
+        if j.status == JOB_STOPPED {
+            // Resume the process
+            linux_kill(pid, 18); // SIGCONT
+            j.status = JOB_RUNNING;
+        }
+        // Wait for it
+        set_fg_pid(pid);
+        linux_waitpid(pid);
+        set_fg_pid(0);
+        j.status = JOB_DONE;
+        j.active = false;
+    } else {
+        print(b"fg: no such job\n");
+    }
+}
+
+fn cmd_bg(id: usize) {
+    let job_id = if id == 0 {
+        let mut last: usize = 0;
+        for (i, j) in jobs_slice().iter().enumerate() {
+            if j.active && j.status == JOB_STOPPED {
+                last = i + 1;
+            }
+        }
+        last
+    } else {
+        id
+    };
+
+    if let Some(j) = job_find_by_id(job_id) {
+        if j.status == JOB_STOPPED {
+            linux_kill(j.pid, 18); // SIGCONT
+            j.status = JOB_RUNNING;
+            print(b"[");
+            print_u64(job_id as u64);
+            print(b"]  ");
+            print(&j.cmd[..j.cmd_len]);
+            print(b" &\n");
+        } else {
+            print(b"bg: job not stopped\n");
+        }
+    } else {
+        print(b"bg: no such job\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// History command
+// ---------------------------------------------------------------------------
+
+fn cmd_history() {
+    let count = history_count();
+    for i in 0..count {
+        if let Some(entry) = history_get(i) {
+            // Print index (1-based)
+            let idx = i + 1;
+            if idx < 10 { print(b"   "); }
+            else if idx < 100 { print(b"  "); }
+            else { print(b" "); }
+            print_u64(idx as u64);
+            print(b"  ");
+            print(entry);
+            print(b"\n");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// wc, sort, uniq, diff commands
+// ---------------------------------------------------------------------------
+
+fn cmd_wc(name: &[u8]) {
+    if name.is_empty() {
+        print(b"usage: wc <file>\n");
+        return;
+    }
+    let mut path_buf = [0u8; 64];
+    let path = null_terminate(name, &mut path_buf);
+    let fd = linux_open(path, 0);
+    if fd < 0 { print(b"wc: file not found\n"); return; }
+
+    let mut data = [0u8; 4096];
+    let mut total: usize = 0;
+    loop {
+        let n = linux_read(fd as u64, data[total..].as_mut_ptr(), data.len() - total);
+        if n <= 0 { break; }
+        total += n as usize;
+        if total >= data.len() { break; }
+    }
+    linux_close(fd as u64);
+
+    let mut out_buf = [0u8; 128];
+    let len = wc_data(&data[..total], &mut out_buf);
+    linux_write(1, out_buf[..len].as_ptr(), len);
+    print(b" ");
+    print(name);
+    print(b"\n");
+}
+
+/// Count lines, words, chars in data. Returns formatted string in buf.
+fn wc_data(data: &[u8], buf: &mut [u8]) -> usize {
+    let mut lines: u64 = 0;
+    let mut words: u64 = 0;
+    let chars = data.len() as u64;
+    let mut in_word = false;
+
+    for &b in data.iter() {
+        if b == b'\n' { lines += 1; }
+        if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+            in_word = false;
+        } else {
+            if !in_word { words += 1; }
+            in_word = true;
+        }
+    }
+
+    // Format: "  LINES  WORDS  CHARS"
+    let mut pos: usize = 0;
+    pos += format_u64_right(lines, 7, &mut buf[pos..]);
+    buf[pos] = b' ';
+    pos += 1;
+    pos += format_u64_right(words, 7, &mut buf[pos..]);
+    buf[pos] = b' ';
+    pos += 1;
+    pos += format_u64_right(chars, 7, &mut buf[pos..]);
+    pos
+}
+
+/// Format a u64 right-aligned in a field of given width.
+fn format_u64_right(n: u64, width: usize, buf: &mut [u8]) -> usize {
+    let mut tmp = [0u8; 20];
+    let mut len: usize = 0;
+    let mut val = n;
+    if val == 0 {
+        tmp[0] = b'0';
+        len = 1;
+    } else {
+        while val > 0 {
+            tmp[len] = b'0' + (val % 10) as u8;
+            val /= 10;
+            len += 1;
+        }
+    }
+    let padding = if width > len { width - len } else { 0 };
+    let total = padding + len;
+    if total > buf.len() { return 0; }
+    for i in 0..padding { buf[i] = b' '; }
+    for i in 0..len { buf[padding + i] = tmp[len - 1 - i]; }
+    total
+}
+
+fn cmd_sort(name: &[u8]) {
+    if name.is_empty() {
+        print(b"usage: sort <file>\n");
+        return;
+    }
+    let mut path_buf = [0u8; 64];
+    let path = null_terminate(name, &mut path_buf);
+    let fd = linux_open(path, 0);
+    if fd < 0 { print(b"sort: file not found\n"); return; }
+
+    let mut data = [0u8; 4096];
+    let mut total: usize = 0;
+    loop {
+        let n = linux_read(fd as u64, data[total..].as_mut_ptr(), data.len() - total);
+        if n <= 0 { break; }
+        total += n as usize;
+        if total >= data.len() { break; }
+    }
+    linux_close(fd as u64);
+
+    let mut out_buf = [0u8; 4096];
+    let len = sort_data(&data[..total], &mut out_buf);
+    linux_write(1, out_buf[..len].as_ptr(), len);
+}
+
+/// Sort lines in data alphabetically (bubble sort). Returns sorted text in buf.
+fn sort_data(data: &[u8], buf: &mut [u8]) -> usize {
+    const MAX_LINES: usize = 256;
+    let mut line_starts: [usize; MAX_LINES] = [0; MAX_LINES];
+    let mut line_ends: [usize; MAX_LINES] = [0; MAX_LINES];
+    let mut line_count: usize = 0;
+
+    // Parse lines
+    let mut start: usize = 0;
+    let mut i: usize = 0;
+    while i <= data.len() && line_count < MAX_LINES {
+        if i == data.len() || data[i] == b'\n' {
+            if start < i {
+                line_starts[line_count] = start;
+                line_ends[line_count] = i;
+                line_count += 1;
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+
+    // Create index array for sorting
+    let mut indices: [usize; MAX_LINES] = [0; MAX_LINES];
+    for j in 0..line_count { indices[j] = j; }
+
+    // Bubble sort by line content
+    let mut swapped = true;
+    while swapped {
+        swapped = false;
+        for j in 0..line_count.saturating_sub(1) {
+            let a = &data[line_starts[indices[j]]..line_ends[indices[j]]];
+            let b_line = &data[line_starts[indices[j + 1]]..line_ends[indices[j + 1]]];
+            if compare_bytes(a, b_line) > 0 {
+                let tmp = indices[j];
+                indices[j] = indices[j + 1];
+                indices[j + 1] = tmp;
+                swapped = true;
+            }
+        }
+    }
+
+    // Write sorted output
+    let mut out_pos: usize = 0;
+    for j in 0..line_count {
+        let line = &data[line_starts[indices[j]]..line_ends[indices[j]]];
+        let l = line.len().min(buf.len() - out_pos - 1);
+        buf[out_pos..out_pos + l].copy_from_slice(&line[..l]);
+        out_pos += l;
+        if out_pos < buf.len() { buf[out_pos] = b'\n'; out_pos += 1; }
+    }
+    out_pos
+}
+
+/// Compare two byte slices lexicographically. Returns <0, 0, >0.
+fn compare_bytes(a: &[u8], b: &[u8]) -> i32 {
+    let min_len = a.len().min(b.len());
+    for i in 0..min_len {
+        if a[i] != b[i] {
+            return (a[i] as i32) - (b[i] as i32);
+        }
+    }
+    (a.len() as i32) - (b.len() as i32)
+}
+
+fn cmd_uniq(name: &[u8]) {
+    if name.is_empty() {
+        print(b"usage: uniq <file>\n");
+        return;
+    }
+    let mut path_buf = [0u8; 64];
+    let path = null_terminate(name, &mut path_buf);
+    let fd = linux_open(path, 0);
+    if fd < 0 { print(b"uniq: file not found\n"); return; }
+
+    let mut data = [0u8; 4096];
+    let mut total: usize = 0;
+    loop {
+        let n = linux_read(fd as u64, data[total..].as_mut_ptr(), data.len() - total);
+        if n <= 0 { break; }
+        total += n as usize;
+        if total >= data.len() { break; }
+    }
+    linux_close(fd as u64);
+
+    let mut out_buf = [0u8; 4096];
+    let len = uniq_data(&data[..total], &mut out_buf);
+    linux_write(1, out_buf[..len].as_ptr(), len);
+}
+
+/// Filter adjacent duplicate lines. Returns result in buf.
+fn uniq_data(data: &[u8], buf: &mut [u8]) -> usize {
+    let mut out_pos: usize = 0;
+    let mut prev_start: usize = 0;
+    let mut prev_end: usize = 0;
+    let mut has_prev = false;
+
+    let mut line_start: usize = 0;
+    let mut i: usize = 0;
+    while i <= data.len() {
+        if i == data.len() || data[i] == b'\n' {
+            let line = &data[line_start..i];
+            if has_prev {
+                let prev = &data[prev_start..prev_end];
+                if !eq(line, prev) {
+                    // Different from previous — output it
+                    let l = line.len().min(buf.len() - out_pos - 1);
+                    buf[out_pos..out_pos + l].copy_from_slice(&line[..l]);
+                    out_pos += l;
+                    if out_pos < buf.len() { buf[out_pos] = b'\n'; out_pos += 1; }
+                }
+            } else if !line.is_empty() {
+                // First line — always output
+                let l = line.len().min(buf.len() - out_pos - 1);
+                buf[out_pos..out_pos + l].copy_from_slice(&line[..l]);
+                out_pos += l;
+                if out_pos < buf.len() { buf[out_pos] = b'\n'; out_pos += 1; }
+            }
+            prev_start = line_start;
+            prev_end = i;
+            has_prev = true;
+            line_start = i + 1;
+        }
+        i += 1;
+    }
+    out_pos
+}
+
+fn cmd_diff(args: &[u8]) {
+    if let Some(sp) = find_space(args) {
+        let file1 = trim(&args[..sp]);
+        let file2 = trim(&args[sp + 1..]);
+        if file1.is_empty() || file2.is_empty() {
+            print(b"usage: diff <file1> <file2>\n");
+            return;
+        }
+
+        // Read file1
+        let mut path_buf1 = [0u8; 64];
+        let path1 = null_terminate(file1, &mut path_buf1);
+        let fd1 = linux_open(path1, 0);
+        if fd1 < 0 { print(b"diff: cannot open "); print(file1); print(b"\n"); return; }
+        let mut data1 = [0u8; 4096];
+        let mut len1: usize = 0;
+        loop {
+            let n = linux_read(fd1 as u64, data1[len1..].as_mut_ptr(), data1.len() - len1);
+            if n <= 0 { break; }
+            len1 += n as usize;
+            if len1 >= data1.len() { break; }
+        }
+        linux_close(fd1 as u64);
+
+        // Read file2
+        let mut path_buf2 = [0u8; 64];
+        let path2 = null_terminate(file2, &mut path_buf2);
+        let fd2 = linux_open(path2, 0);
+        if fd2 < 0 { print(b"diff: cannot open "); print(file2); print(b"\n"); return; }
+        let mut data2 = [0u8; 4096];
+        let mut len2: usize = 0;
+        loop {
+            let n = linux_read(fd2 as u64, data2[len2..].as_mut_ptr(), data2.len() - len2);
+            if n <= 0 { break; }
+            len2 += n as usize;
+            if len2 >= data2.len() { break; }
+        }
+        linux_close(fd2 as u64);
+
+        // Line-by-line comparison
+        diff_data(&data1[..len1], &data2[..len2]);
+    } else {
+        print(b"usage: diff <file1> <file2>\n");
+    }
+}
+
+fn diff_data(data1: &[u8], data2: &[u8]) {
+    const MAX_LINES: usize = 256;
+
+    // Extract lines from file1
+    let mut lines1_start: [usize; MAX_LINES] = [0; MAX_LINES];
+    let mut lines1_end: [usize; MAX_LINES] = [0; MAX_LINES];
+    let mut count1: usize = 0;
+    {
+        let mut start: usize = 0;
+        let mut i: usize = 0;
+        while i <= data1.len() && count1 < MAX_LINES {
+            if i == data1.len() || data1[i] == b'\n' {
+                lines1_start[count1] = start;
+                lines1_end[count1] = i;
+                count1 += 1;
+                start = i + 1;
+            }
+            i += 1;
+        }
+    }
+
+    // Extract lines from file2
+    let mut lines2_start: [usize; MAX_LINES] = [0; MAX_LINES];
+    let mut lines2_end: [usize; MAX_LINES] = [0; MAX_LINES];
+    let mut count2: usize = 0;
+    {
+        let mut start: usize = 0;
+        let mut i: usize = 0;
+        while i <= data2.len() && count2 < MAX_LINES {
+            if i == data2.len() || data2[i] == b'\n' {
+                lines2_start[count2] = start;
+                lines2_end[count2] = i;
+                count2 += 1;
+                start = i + 1;
+            }
+            i += 1;
+        }
+    }
+
+    // Simple line-by-line diff
+    let max_lines = if count1 > count2 { count1 } else { count2 };
+    let mut had_diff = false;
+    for i in 0..max_lines {
+        if i < count1 && i < count2 {
+            let line1 = &data1[lines1_start[i]..lines1_end[i]];
+            let line2 = &data2[lines2_start[i]..lines2_end[i]];
+            if !eq(line1, line2) {
+                had_diff = true;
+                print_u64((i + 1) as u64);
+                print(b"c");
+                print_u64((i + 1) as u64);
+                print(b"\n< ");
+                print(line1);
+                print(b"\n---\n> ");
+                print(line2);
+                print(b"\n");
+            }
+        } else if i < count1 {
+            had_diff = true;
+            print_u64((i + 1) as u64);
+            print(b"d");
+            print_u64(count2 as u64);
+            print(b"\n< ");
+            print(&data1[lines1_start[i]..lines1_end[i]]);
+            print(b"\n");
+        } else if i < count2 {
+            had_diff = true;
+            print_u64(count1 as u64);
+            print(b"a");
+            print_u64((i + 1) as u64);
+            print(b"\n> ");
+            print(&data2[lines2_start[i]..lines2_end[i]]);
+            print(b"\n");
+        }
+    }
+    if !had_diff {
+        print(b"files are identical\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Existing commands: env, head, tail, grep, top, pipe support, scripting
 // ---------------------------------------------------------------------------
 
 fn cmd_env() {
@@ -1239,10 +2815,41 @@ fn execute_pipe(left: &[u8], right: &[u8]) {
                 }
             }
         }
+    } else if eq(right, b"wc") {
+        let mut capture = [0u8; 4096];
+        let cap_len = capture_command(left, &mut capture);
+        if cap_len > 0 {
+            let mut out_buf = [0u8; 128];
+            let len = wc_data(&capture[..cap_len], &mut out_buf);
+            linux_write(1, out_buf[..len].as_ptr(), len);
+            print(b"\n");
+        }
+    } else if eq(right, b"sort") {
+        let mut capture = [0u8; 4096];
+        let cap_len = capture_command(left, &mut capture);
+        if cap_len > 0 {
+            let mut out_buf = [0u8; 4096];
+            let len = sort_data(&capture[..cap_len], &mut out_buf);
+            linux_write(1, out_buf[..len].as_ptr(), len);
+        }
+    } else if eq(right, b"uniq") {
+        let mut capture = [0u8; 4096];
+        let cap_len = capture_command(left, &mut capture);
+        if cap_len > 0 {
+            let mut out_buf = [0u8; 4096];
+            let len = uniq_data(&capture[..cap_len], &mut out_buf);
+            linux_write(1, out_buf[..len].as_ptr(), len);
+        }
     } else {
-        // Fallback: just run both commands sequentially.
-        dispatch_command(left);
-        dispatch_command(right);
+        // General fallback: capture left, feed as stdin to right
+        let mut capture = [0u8; 4096];
+        let cap_len = capture_command(left, &mut capture);
+        if cap_len > 0 {
+            dispatch_command_with_stdin(right, &capture[..cap_len]);
+        } else {
+            dispatch_command(left);
+            dispatch_command(right);
+        }
     }
     // Cleanup temp file.
     linux_unlink(tmp_path);
@@ -1296,6 +2903,32 @@ fn capture_command(cmd: &[u8], buf: &mut [u8]) -> usize {
                 total += 1;
             }
         }
+        return total;
+    }
+    if starts_with(cmd, b"echo ") {
+        let rest = &cmd[5..];
+        let l = rest.len().min(buf.len() - 1);
+        buf[..l].copy_from_slice(&rest[..l]);
+        buf[l] = b'\n';
+        return l + 1;
+    }
+    if eq(cmd, b"echo") {
+        if buf.len() > 0 { buf[0] = b'\n'; return 1; }
+        return 0;
+    }
+    if eq(cmd, b"ps") {
+        let mut path_buf = [0u8; 8];
+        let path = null_terminate(b"/proc", &mut path_buf);
+        let fd = linux_open(path, 0);
+        if fd < 0 { return 0; }
+        let mut total: usize = 0;
+        loop {
+            let n = linux_read(fd as u64, buf[total..].as_mut_ptr(), (buf.len() - total) as usize);
+            if n <= 0 { break; }
+            total += n as usize;
+            if total >= buf.len() { break; }
+        }
+        linux_close(fd as u64);
         return total;
     }
     0

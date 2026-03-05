@@ -190,6 +190,34 @@ run-xhci: image create-test-disk
         -m 256M \
         -smp 4
 
+# Run with ALL devices (virtio-blk, virtio-net, NVMe, xHCI USB kbd+mouse, AC97 audio, AHCI SATA, display)
+run-full: image create-test-disk create-nvme-disk
+    "{{QEMU}}" \
+        -drive format=raw,file={{IMAGE}} \
+        -drive if=none,format=raw,file=target/disk.img,id=disk0 \
+        -device virtio-blk-pci,drive=disk0,disable-modern=on \
+        -drive file=target/nvme-disk.img,format=raw,if=none,id=nvme0 \
+        -device nvme,serial=sotOS-NVMe,drive=nvme0 \
+        -netdev user,id=net0,hostfwd=udp::5555-:5555,hostfwd=tcp::7777-:7 \
+        -device virtio-net-pci,netdev=net0,disable-modern=on \
+        -device qemu-xhci,id=xhci \
+        -device usb-kbd,bus=xhci.0 \
+        -device usb-mouse,bus=xhci.0 \
+        -device AC97 \
+        -device ahci,id=ahci0 \
+        -serial stdio \
+        -no-reboot \
+        -m 512M \
+        -smp 4
+
+# Flash sotOS image to a disk/USB drive (usage: just flash DISK=/dev/sdX)
+flash DISK: image
+    @echo "WARNING: This will OVERWRITE all data on {{DISK}}"
+    @echo "Press Ctrl+C to cancel, or Enter to continue..."
+    @read -r _
+    dd if={{IMAGE}} of={{DISK}} bs=4M status=progress conv=fsync
+    @echo "Flash complete. You can now boot from {{DISK}}."
+
 # Clean build artifacts
 clean:
     cargo clean

@@ -11,6 +11,13 @@ members = [
     "libs/sotos-nvme",
     "libs/sotos-xhci",
     "libs/sotos-wasm",
+    "libs/sotos-audio",
+    "libs/sotos-ahci",
+    "libs/sotos-usb-storage",
+    "libs/sotos-mouse",
+    "libs/sotos-gui",
+    "libs/sotos-lua",
+    "libs/sotos-pkg",
 ]
 exclude = [
     "services/init",

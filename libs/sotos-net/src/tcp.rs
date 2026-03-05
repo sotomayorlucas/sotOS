@@ -1,12 +1,22 @@
 //! TCP state machine — 3-way handshake, data transfer, FIN teardown.
 //!
-//! Minimal implementation: fixed window (4096), no congestion control,
-//! simple retransmit. Supports both active (connect) and passive (listen) open.
+//! Features: Reno-style congestion control (slow start + congestion avoidance),
+//! TCP window scaling (RFC 7323), retransmit with exponential backoff.
+//! Supports both active (connect) and passive (listen) open.
 
 use crate::checksum;
 
 pub const TCP_HDR_LEN: usize = 20;
-const TCP_WINDOW: u16 = 4096;
+/// Base TCP header length with window scale option (20 + 4 = 24, padded to 24).
+pub const TCP_HDR_LEN_WITH_OPTS: usize = 24;
+/// Default receive window size (unscaled, advertised in SYN).
+const TCP_WINDOW_BASE: u16 = 4096;
+/// Maximum Segment Size for congestion control calculations.
+pub const MSS: u32 = 536;
+/// Default initial slow start threshold.
+const INITIAL_SSTHRESH: u32 = 65535;
+/// Default window scale factor we request.
+const DEFAULT_RCV_WND_SCALE: u8 = 7;
 
 // TCP flags.
 const FIN: u8 = 0x01;
@@ -14,6 +24,11 @@ const SYN: u8 = 0x02;
 const RST: u8 = 0x04;
 const PSH: u8 = 0x08;
 const ACK: u8 = 0x10;
+
+// TCP option kinds.
+const TCP_OPT_END: u8 = 0;
+const TCP_OPT_NOP: u8 = 1;
+const TCP_OPT_WINDOW_SCALE: u8 = 3;
 
 /// TCP connection state.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -54,6 +69,24 @@ pub struct TcpConn {
     retransmit_len: usize,
     retransmit_count: u8,
     retransmit_tick: u32,
+
+    // --- Congestion control (Reno) ---
+    /// Congestion window in bytes.
+    pub cwnd: u32,
+    /// Slow start threshold in bytes.
+    pub ssthresh: u32,
+    /// Estimated round-trip time in ticks.
+    pub rtt_estimate: u32,
+
+    // --- Window scaling (RFC 7323) ---
+    /// Our receive window scale factor (0-14), sent in SYN.
+    pub rcv_wnd_scale: u8,
+    /// Peer's window scale factor, learned from SYN/SYN-ACK.
+    pub snd_wnd_scale: u8,
+    /// Actual receive window size (after applying our scale factor).
+    pub rcv_window: u32,
+    /// Whether window scaling was negotiated for this connection.
+    pub wnd_scale_enabled: bool,
 }
 
 impl TcpConn {
@@ -73,7 +106,47 @@ impl TcpConn {
             retransmit_len: 0,
             retransmit_count: 0,
             retransmit_tick: 0,
+            cwnd: MSS,
+            ssthresh: INITIAL_SSTHRESH,
+            rtt_estimate: RETRANSMIT_TICKS,
+            rcv_wnd_scale: DEFAULT_RCV_WND_SCALE,
+            snd_wnd_scale: 0,
+            rcv_window: (TCP_WINDOW_BASE as u32) << DEFAULT_RCV_WND_SCALE,
+            wnd_scale_enabled: false,
         }
+    }
+
+    /// Get the advertised window value for outgoing segments.
+    /// If window scaling is negotiated, the advertised value is
+    /// rcv_window >> rcv_wnd_scale (the raw 16-bit field).
+    fn advertised_window(&self) -> u16 {
+        if self.wnd_scale_enabled {
+            let shifted = self.rcv_window >> (self.rcv_wnd_scale as u32);
+            if shifted > 0xFFFF { 0xFFFF } else { shifted as u16 }
+        } else {
+            // During handshake or if not negotiated, use base window.
+            TCP_WINDOW_BASE
+        }
+    }
+
+    /// Called when an ACK advances snd_una (new data acknowledged).
+    /// Updates congestion window per Reno algorithm.
+    fn on_ack_received(&mut self, bytes_acked: u32) {
+        if self.cwnd < self.ssthresh {
+            // Slow start: cwnd += min(bytes_acked, MSS) per ACK.
+            self.cwnd = self.cwnd.saturating_add(bytes_acked.min(MSS));
+        } else {
+            // Congestion avoidance: cwnd += MSS * MSS / cwnd per ACK.
+            let inc = (MSS as u64 * MSS as u64) / self.cwnd as u64;
+            self.cwnd = self.cwnd.saturating_add(inc.max(1) as u32);
+        }
+    }
+
+    /// Called on packet loss (retransmit timeout).
+    /// Reduces ssthresh and resets cwnd per Reno.
+    fn on_loss(&mut self) {
+        self.ssthresh = (self.cwnd / 2).max(2 * MSS);
+        self.cwnd = MSS;
     }
 }
 
@@ -147,11 +220,20 @@ impl TcpTable {
         c.snd_una = iss;
         c.rcv_nxt = 0;
         c.recv_len = 0;
-        let seg_len = build_segment(
+        // Initialize congestion control.
+        c.cwnd = MSS;
+        c.ssthresh = INITIAL_SSTHRESH;
+        c.rcv_wnd_scale = DEFAULT_RCV_WND_SCALE;
+        c.snd_wnd_scale = 0;
+        c.wnd_scale_enabled = false;
+        c.rcv_window = (TCP_WINDOW_BASE as u32) << DEFAULT_RCV_WND_SCALE;
+        // Send SYN with window scale option.
+        let seg_len = build_segment_with_options(
             reply_buf, our_ip, remote_ip,
             local_port, remote_port,
             iss, 0,
-            SYN, TCP_WINDOW, &[],
+            SYN, TCP_WINDOW_BASE, &[],
+            Some(c.rcv_wnd_scale),
         );
         Self::save_for_retransmit(&mut self.conns[ci], &reply_buf[..seg_len], 0);
         Some((ci, seg_len))
@@ -191,6 +273,9 @@ impl TcpTable {
         let data_start = (hdr.data_offset as usize) * 4;
         let payload = if data_start < segment.len() { &segment[data_start..] } else { &[] };
 
+        // Parse TCP options from the segment.
+        let opts = parse_tcp_options(segment, &hdr);
+
         let ci = self.find_conn(src_ip, hdr.src_port, hdr.dst_port)?;
 
         match self.conns[ci].state {
@@ -206,11 +291,29 @@ impl TcpTable {
                     c.snd_una = iss;
                     c.state = TcpState::SynRcvd;
                     c.recv_len = 0;
-                    return Some(build_segment(
+                    // Initialize congestion control for passive open.
+                    c.cwnd = MSS;
+                    c.ssthresh = INITIAL_SSTHRESH;
+                    // Check if peer sent window scale option.
+                    if let Some(peer_scale) = opts.window_scale {
+                        c.snd_wnd_scale = peer_scale;
+                        c.wnd_scale_enabled = true;
+                    } else {
+                        c.snd_wnd_scale = 0;
+                        c.wnd_scale_enabled = false;
+                    }
+                    // Reply with SYN+ACK including our window scale option.
+                    let wnd_opt = if c.wnd_scale_enabled {
+                        Some(c.rcv_wnd_scale)
+                    } else {
+                        None
+                    };
+                    return Some(build_segment_with_options(
                         reply_buf, our_ip, src_ip,
                         c.local_port, c.remote_port,
                         iss, c.rcv_nxt,
-                        SYN | ACK, TCP_WINDOW, &[],
+                        SYN | ACK, TCP_WINDOW_BASE, &[],
+                        wnd_opt,
                     ));
                 }
                 None
@@ -224,12 +327,20 @@ impl TcpTable {
                     c.state = TcpState::Established;
                     c.retransmit_len = 0;
                     c.retransmit_count = 0;
+                    // Check window scale option in SYN+ACK.
+                    if let Some(peer_scale) = opts.window_scale {
+                        c.snd_wnd_scale = peer_scale;
+                        c.wnd_scale_enabled = true;
+                    }
+                    // Congestion control: connection established, cwnd starts at MSS.
+                    c.cwnd = MSS;
+                    let win = c.advertised_window();
                     // Send ACK to complete 3-way handshake.
                     return Some(build_segment(
                         reply_buf, our_ip, src_ip,
                         c.local_port, c.remote_port,
                         c.snd_nxt, c.rcv_nxt,
-                        ACK, TCP_WINDOW, &[],
+                        ACK, win, &[],
                     ));
                 }
                 None
@@ -247,7 +358,13 @@ impl TcpTable {
 
                 // Process ACK — clear retransmit if all data acknowledged.
                 if hdr.flags & ACK != 0 {
+                    let old_una = c.snd_una;
                     c.snd_una = hdr.ack;
+                    // Bytes newly acknowledged.
+                    let bytes_acked = hdr.ack.wrapping_sub(old_una);
+                    if bytes_acked > 0 && bytes_acked < 0x80000000 {
+                        c.on_ack_received(bytes_acked);
+                    }
                     if c.snd_una == c.snd_nxt {
                         c.retransmit_len = 0;
                         c.retransmit_count = 0;
@@ -263,12 +380,13 @@ impl TcpTable {
                     c.recv_len += copy_len;
                     c.rcv_nxt = c.rcv_nxt.wrapping_add(copy_len as u32);
 
+                    let win = c.advertised_window();
                     // Send ACK.
                     return Some(build_segment(
                         reply_buf, our_ip, src_ip,
                         c.local_port, c.remote_port,
                         c.snd_nxt, c.rcv_nxt,
-                        ACK, TCP_WINDOW, &[],
+                        ACK, win, &[],
                     ));
                 }
 
@@ -276,12 +394,13 @@ impl TcpTable {
                 if hdr.flags & FIN != 0 {
                     c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
                     c.state = TcpState::CloseWait;
+                    let win = c.advertised_window();
                     // ACK the FIN, then send our own FIN.
                     let ack_len = build_segment(
                         reply_buf, our_ip, src_ip,
                         c.local_port, c.remote_port,
                         c.snd_nxt, c.rcv_nxt,
-                        ACK | FIN, TCP_WINDOW, &[],
+                        ACK | FIN, win, &[],
                     );
                     c.snd_nxt = c.snd_nxt.wrapping_add(1);
                     c.state = TcpState::LastAck;
@@ -298,11 +417,12 @@ impl TcpTable {
                         c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
                         c.state = TcpState::Closed;
                         c.active = false;
+                        let win = c.advertised_window();
                         return Some(build_segment(
                             reply_buf, our_ip, src_ip,
                             c.local_port, c.remote_port,
                             c.snd_nxt, c.rcv_nxt,
-                            ACK, TCP_WINDOW, &[],
+                            ACK, win, &[],
                         ));
                     }
                     c.state = TcpState::FinWait2;
@@ -315,11 +435,12 @@ impl TcpTable {
                     c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
                     c.state = TcpState::Closed;
                     c.active = false;
+                    let win = c.advertised_window();
                     return Some(build_segment(
                         reply_buf, our_ip, src_ip,
                         c.local_port, c.remote_port,
                         c.snd_nxt, c.rcv_nxt,
-                        ACK, TCP_WINDOW, &[],
+                        ACK, win, &[],
                     ));
                 }
                 None
@@ -345,6 +466,7 @@ impl TcpTable {
     }
 
     /// Send data on an established connection. Returns the TCP segment to transmit.
+    /// Respects the congestion window: only sends up to cwnd bytes of in-flight data.
     pub fn send(
         &mut self,
         conn_id: usize,
@@ -356,13 +478,21 @@ impl TcpTable {
         if c.state != TcpState::Established || !c.active {
             return None;
         }
+        // Check congestion window: bytes in flight must not exceed cwnd.
+        let in_flight = c.snd_nxt.wrapping_sub(c.snd_una);
+        if in_flight >= c.cwnd {
+            return None; // Congestion window full — wait for ACKs.
+        }
+        let allowed = (c.cwnd - in_flight) as usize;
+        let send_data = if data.len() > allowed { &data[..allowed] } else { data };
+        let win = c.advertised_window();
         let len = build_segment(
             reply_buf, our_ip, c.remote_ip,
             c.local_port, c.remote_port,
             c.snd_nxt, c.rcv_nxt,
-            ACK | PSH, TCP_WINDOW, data,
+            ACK | PSH, win, send_data,
         );
-        c.snd_nxt = c.snd_nxt.wrapping_add(data.len() as u32);
+        c.snd_nxt = c.snd_nxt.wrapping_add(send_data.len() as u32);
         Self::save_for_retransmit(c, &reply_buf[..len], 0);
         Some(len)
     }
@@ -383,6 +513,9 @@ impl TcpTable {
     /// Check all connections for retransmit timeouts. Returns the first segment
     /// that needs retransmission as (conn_id, segment_bytes, length), or None.
     /// `current_tick` is a monotonic counter provided by the caller.
+    ///
+    /// On timeout, triggers congestion control loss response (Reno):
+    /// ssthresh = cwnd/2, cwnd = MSS.
     pub fn check_retransmit(&mut self, current_tick: u32, out: &mut [u8]) -> Option<(usize, usize)> {
         for (i, c) in self.conns.iter_mut().enumerate() {
             if !c.active || c.retransmit_len == 0 {
@@ -395,8 +528,9 @@ impl TcpTable {
                 continue;
             }
             let elapsed = current_tick.wrapping_sub(c.retransmit_tick);
-            // Exponential backoff: base interval * 2^retransmit_count.
-            let interval = RETRANSMIT_TICKS << (c.retransmit_count as u32).min(4);
+            // Use rtt_estimate as base interval for retransmit (with backoff).
+            let base = if c.rtt_estimate > 0 { c.rtt_estimate } else { RETRANSMIT_TICKS };
+            let interval = base << (c.retransmit_count as u32).min(4);
             if elapsed >= interval {
                 if c.retransmit_count >= MAX_RETRANSMITS {
                     // Give up — reset connection.
@@ -405,6 +539,8 @@ impl TcpTable {
                     c.retransmit_len = 0;
                     continue;
                 }
+                // Congestion control: loss detected.
+                c.on_loss();
                 c.retransmit_count += 1;
                 c.retransmit_tick = current_tick;
                 let len = c.retransmit_len.min(out.len());
@@ -435,11 +571,12 @@ impl TcpTable {
         if !c.active {
             return None;
         }
+        let win = c.advertised_window();
         let len = build_segment(
             reply_buf, our_ip, c.remote_ip,
             c.local_port, c.remote_port,
             c.snd_nxt, c.rcv_nxt,
-            FIN | ACK, TCP_WINDOW, &[],
+            FIN | ACK, win, &[],
         );
         c.snd_nxt = c.snd_nxt.wrapping_add(1);
         c.state = TcpState::FinWait1;
@@ -463,6 +600,7 @@ pub fn parse_header(data: &[u8]) -> Option<TcpHeader> {
 }
 
 /// Build a TCP segment (header + payload) into `buf`. Returns total length.
+/// This is the standard segment builder with no TCP options.
 pub fn build_segment(
     buf: &mut [u8],
     src_ip: u32,
@@ -498,4 +636,106 @@ pub fn build_segment(
     buf[16..18].copy_from_slice(&cksum.to_be_bytes());
 
     total
+}
+
+/// Build a TCP segment with optional TCP options (e.g., window scale in SYN).
+/// If `wnd_scale` is Some(shift), includes the window scale option (kind=3, len=3, shift).
+/// Options are padded to a 4-byte boundary with NOP.
+pub fn build_segment_with_options(
+    buf: &mut [u8],
+    src_ip: u32,
+    dst_ip: u32,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+    wnd_scale: Option<u8>,
+) -> usize {
+    // Calculate options length.
+    let opts_len = if wnd_scale.is_some() {
+        4 // NOP(1) + kind(1) + len(1) + shift(1) = 4 bytes (already aligned)
+    } else {
+        0
+    };
+    let hdr_len = TCP_HDR_LEN + opts_len;
+    let total = hdr_len + payload.len();
+    if buf.len() < total {
+        return 0;
+    }
+
+    let data_offset = (hdr_len / 4) as u8; // In 32-bit words.
+
+    buf[0..2].copy_from_slice(&src_port.to_be_bytes());
+    buf[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    buf[4..8].copy_from_slice(&seq.to_be_bytes());
+    buf[8..12].copy_from_slice(&ack.to_be_bytes());
+    buf[12] = data_offset << 4;
+    buf[13] = flags;
+    buf[14..16].copy_from_slice(&window.to_be_bytes());
+    buf[16] = 0; // checksum (filled below)
+    buf[17] = 0;
+    buf[18] = 0; // urgent pointer
+    buf[19] = 0;
+
+    // Write options after the base 20-byte header.
+    if let Some(shift) = wnd_scale {
+        buf[20] = TCP_OPT_NOP;              // NOP padding for alignment
+        buf[21] = TCP_OPT_WINDOW_SCALE;     // kind = 3
+        buf[22] = 3;                         // length = 3
+        buf[23] = shift.min(14);             // shift count (0-14)
+    }
+
+    if !payload.is_empty() {
+        buf[hdr_len..total].copy_from_slice(payload);
+    }
+
+    let cksum = checksum::pseudo_header_checksum(src_ip, dst_ip, 6, &buf[..total]);
+    buf[16..18].copy_from_slice(&cksum.to_be_bytes());
+
+    total
+}
+
+/// Parsed TCP options from a segment.
+struct TcpOptions {
+    /// Window scale shift count, if present (kind=3).
+    window_scale: Option<u8>,
+}
+
+/// Parse TCP options from a segment. Looks for window scale (kind=3).
+fn parse_tcp_options(segment: &[u8], hdr: &TcpHeader) -> TcpOptions {
+    let mut opts = TcpOptions {
+        window_scale: None,
+    };
+    let opts_end = (hdr.data_offset as usize) * 4;
+    if opts_end <= TCP_HDR_LEN || opts_end > segment.len() {
+        return opts;
+    }
+    let mut pos = TCP_HDR_LEN;
+    while pos < opts_end {
+        let kind = segment[pos];
+        if kind == TCP_OPT_END {
+            break;
+        }
+        if kind == TCP_OPT_NOP {
+            pos += 1;
+            continue;
+        }
+        // All other options have kind + length.
+        if pos + 1 >= opts_end {
+            break;
+        }
+        let opt_len = segment[pos + 1] as usize;
+        if opt_len < 2 || pos + opt_len > opts_end {
+            break;
+        }
+        if kind == TCP_OPT_WINDOW_SCALE && opt_len == 3 && pos + 2 < opts_end {
+            let shift = segment[pos + 2];
+            opts.window_scale = Some(shift.min(14));
+        }
+        pos += opt_len;
+    }
+    opts
 }

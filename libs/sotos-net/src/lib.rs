@@ -14,3 +14,6 @@ pub mod udp;
 pub mod tcp;
 pub mod dns;
 pub mod dhcp;
+pub mod ipv6;
+pub mod crypto;
+pub mod http;

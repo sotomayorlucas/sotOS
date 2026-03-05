@@ -7,7 +7,7 @@ pub const SUPERBLOCK_MAGIC: u64 = 0x534F544F_53465321;
 pub const WAL_MAGIC: u32 = 0x57414C48;
 
 /// Filesystem version.
-pub const FS_VERSION: u32 = 3;
+pub const FS_VERSION: u32 = 4;
 
 /// Directory entry flag: entry is a directory.
 pub const FLAG_DIR: u32 = 1;
@@ -26,19 +26,19 @@ pub const SECTOR_WAL_PAYLOAD: u32 = 2; // 2-5 (4 sectors)
 pub const WAL_MAX_ENTRIES: usize = 4;
 pub const SECTOR_BITMAP: u32 = 6;     // 6-7 (2 sectors)
 pub const BITMAP_SECTORS: u32 = 2;
-pub const SECTOR_DIR: u32 = 8;        // 8-15 (8 sectors)
-pub const DIR_SECTORS: u32 = 8;
-pub const SECTOR_REFCOUNT: u32 = 16;  // 16-23 (refcount table: 4096 × u8)
+pub const SECTOR_DIR: u32 = 8;        // 8-39 (32 sectors, 128 entries)
+pub const DIR_SECTORS: u32 = 32;
+pub const SECTOR_REFCOUNT: u32 = 40;  // 40-47 (refcount table: 4096 × u8)
 pub const REFCOUNT_SECTORS: u32 = 8;
 pub const REFCOUNT_ENTRIES: usize = REFCOUNT_SECTORS as usize * SECTOR_SIZE; // 4096
 
-pub const SECTOR_SNAP_META: u32 = 24; // 24-27 (4 × SnapMeta, 512 bytes each)
+pub const SECTOR_SNAP_META: u32 = 48; // 48-51 (4 × SnapMeta, 512 bytes each)
 pub const MAX_SNAPSHOTS: usize = 4;
 
-pub const SECTOR_SNAP_DIR: u32 = 28;  // 28-59 (4 × 8 dir sectors)
-pub const SECTOR_SNAP_BMP: u32 = 60;  // 60-67 (4 × 2 bitmap sectors)
+pub const SECTOR_SNAP_DIR: u32 = 52;  // 52-115 (4 × 32 dir sectors)
+pub const SECTOR_SNAP_BMP: u32 = 116; // 116-123 (4 × 2 bitmap sectors)
 
-pub const SECTOR_DATA: u32 = 68;      // 68+ (data region)
+pub const SECTOR_DATA: u32 = 124;     // 124+ (data region)
 
 /// Entries per sector (128 bytes each, 4 per 512-byte sector).
 pub const DIR_ENTRIES_PER_SECTOR: usize = 4;
@@ -124,13 +124,14 @@ pub struct DirEntry {
     pub sector_start: u32,
     pub sector_count: u32,
     pub flags: u32,
-    pub created_tick: u32,
-    pub modified_tick: u32,
+    pub created_time: u64,    // Unix timestamp in seconds (was created_tick: u32)
+    pub modified_time: u64,   // Unix timestamp in seconds (was modified_tick: u32)
+    pub accessed_time: u64,   // Unix timestamp in seconds (atime)
     pub parent_oid: u64,      // parent directory OID (0 = root's parent sentinel)
     pub permissions: u32,     // Unix-style rwxrwxrwx (owner/group/other, 9 bits)
     pub owner_uid: u16,       // owner user ID
     pub owner_gid: u16,       // owner group ID
-    pub _pad: [u8; 24],       // 128 - 104
+    pub _pad: [u8; 8],        // pad to 128 total
 }
 
 impl DirEntry {
@@ -142,13 +143,14 @@ impl DirEntry {
             sector_start: 0,
             sector_count: 0,
             flags: 0,
-            created_tick: 0,
-            modified_tick: 0,
+            created_time: 0,
+            modified_time: 0,
+            accessed_time: 0,
             parent_oid: 0,
             permissions: 0,
             owner_uid: 0,
             owner_gid: 0,
-            _pad: [0; 24],
+            _pad: [0; 8],
         }
     }
 
@@ -203,3 +205,43 @@ const _: () = assert!(core::mem::size_of::<Superblock>() == 512);
 const _: () = assert!(core::mem::size_of::<WalHeader>() == 512);
 const _: () = assert!(core::mem::size_of::<DirEntry>() == 128);
 const _: () = assert!(core::mem::size_of::<SnapMeta>() == 512);
+
+/// Approximate TSC frequency for time estimation.
+/// Assumes ~2 GHz TSC (common QEMU default). Real hardware would calibrate
+/// against PIT/HPET/ACPI PM timer, but this suffices for a development OS.
+const TSC_FREQ_HZ: u64 = 2_000_000_000;
+
+/// Approximate Unix epoch base as TSC ticks at boot.
+/// We store the TSC value at first call and use it as the reference point.
+/// Since we have no RTC, we assume boot time = 2026-01-01 00:00:00 UTC
+/// (epoch = 1767225600).
+const BOOT_EPOCH_SECS: u64 = 1767225600;
+
+/// TSC value captured at first call to `get_epoch_seconds()`.
+static mut BOOT_TSC: u64 = 0;
+/// Whether BOOT_TSC has been initialized.
+static mut BOOT_TSC_INIT: bool = false;
+
+/// Get an approximate Unix timestamp in seconds.
+///
+/// Uses RDTSC to estimate wall-clock time relative to an assumed boot epoch.
+/// This is approximate — without an RTC or NTP, the timestamp drifts.
+pub fn get_epoch_seconds() -> u64 {
+    let tsc: u64;
+    unsafe {
+        let lo: u32;
+        let hi: u32;
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
+        tsc = ((hi as u64) << 32) | lo as u64;
+    }
+
+    unsafe {
+        if !BOOT_TSC_INIT {
+            BOOT_TSC = tsc;
+            BOOT_TSC_INIT = true;
+        }
+        let elapsed_ticks = tsc.saturating_sub(BOOT_TSC);
+        let elapsed_secs = elapsed_ticks / TSC_FREQ_HZ;
+        BOOT_EPOCH_SECS + elapsed_secs
+    }
+}

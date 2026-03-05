@@ -49,9 +49,9 @@
 \newtheorem{invariant}{Invariant}[section]
 
 % --- Title ---
-\title{\textbf{sotOS: A Capability-Based Microkernel with Per-Core IPC,\\
-WASM Software Fault Isolation, and Formal Verification}\\[0.5em]
-\large Technical Report}
+\title{\textbf{sotOS: A 4th-Generation Microkernel with Per-Core IPC,\\
+Full Driver Stack, Distributed Computing, and Formal Verification}\\[0.5em]
+\large Technical Report --- v2.0}
 
 \author{Santiago Sotomonte\\
 \texttt{sotOS Project}}
@@ -69,12 +69,15 @@ virtualization, IPC, capability management, and frame allocation---with all
 other services running in userspace. We describe the evolution from a
 traditional microkernel toward a 4th-generation OS architecture featuring:
 (1)~per-core IPC endpoint pools that eliminate global lock contention,
-(2)~a bare-metal WASM interpreter for software fault isolation without hardware
-page tables, (3)~network-transparent IPC routing for distributed computing,
-(4)~heterogeneous compute scheduling across CPU/GPU/NPU targets, and
-(5)~TLA+ formal specifications proving safety properties of core protocols.
-The system boots on 1--4 CPU cores, runs a Linux-ABI compatible shell, and
-supports NVMe, USB xHCI, and virtio device drivers in userspace processes.
+(2)~a bare-metal WASM interpreter with metered SFI execution,
+(3)~network-transparent IPC routing with live process migration for distributed computing,
+(4)~heterogeneous compute scheduling with typed tensor/shader IPC payloads,
+(5)~a full driver stack (NVMe, AHCI/SATA, USB mass storage, AC97 audio, xHCI with hub/hotplug, PS/2+USB mouse),
+(6)~a complete networking stack (IPv4/IPv6, TCP with Reno congestion control, TLS crypto, HTTP client),
+(7)~a Linux-ABI shell with job control, functions, redirects, and an embedded Lua interpreter, and
+(8)~TLA+ formal specifications proving safety properties of core protocols.
+The system boots on 1--4 CPU cores with 512~MB RAM, supports multiuser accounts,
+a GUI window compositor, and a package manager. Over 30,000 lines of Rust.
 \end{abstract}
 
 \tableofcontents
@@ -631,6 +634,125 @@ The networking stack (\texttt{libs/sotos-net/}) implements a full IP stack:
 The network driver runs in a separate userspace process with its own address
 space, communicating with the shell via IPC.
 
+\subsection{IPv6 and Advanced TCP}
+
+The v2.0 networking stack adds:
+\begin{itemize}[nosep]
+    \item \textbf{IPv6}: 40-byte header parse/build, ICMPv6 echo, Neighbor Solicitation/Advertisement
+    \item \textbf{TCP Reno congestion control}: slow start (cwnd doubles per RTT until ssthresh),
+          congestion avoidance (linear growth), loss recovery (ssthresh = cwnd/2, cwnd = MSS)
+    \item \textbf{TCP window scaling} (RFC 7323): negotiated in SYN/SYN-ACK options
+    \item \textbf{Crypto}: SHA-256 (full 64-round), HMAC-SHA256, ChaCha20 (20-round), X25519 Curve25519
+    \item \textbf{HTTP/1.1 client}: GET/POST request builder, response parser with Content-Length
+\end{itemize}
+
+% ============================================================================
+\section{Driver Stack}
+\label{sec:drivers}
+% ============================================================================
+
+sotOS v2.0 includes 9 device driver libraries, all running in userspace:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{Driver} & \textbf{Protocol} & \textbf{Key Features} \\
+\midrule
+sotos-nvme & NVMe 1.4 & Interrupt-driven completion, PRP lists \\
+sotos-ahci & AHCI/SATA & HBA init, DMA EXT 48-bit LBA, port enum \\
+sotos-xhci & USB xHCI & Multi-device, hub support, hot-plug \\
+sotos-usb-storage & USB BBB & SCSI READ/WRITE(10), INQUIRY \\
+sotos-audio & AC97 & Mixer, BDL DMA, PCM playback \\
+sotos-mouse & PS/2 + USB HID & IntelliMouse scroll, event ring \\
+sotos-virtio & Virtio 0.9.5 & BLK + NET (legacy) \\
+sotos-pci & PCI 3.0 & Bus enumeration, BAR reading \\
+\bottomrule
+\end{tabular}
+\caption{Userspace device driver libraries.}
+\end{table}
+
+% ============================================================================
+\section{Distributed Computing}
+\label{sec:distributed}
+% ============================================================================
+
+\subsection{Live Process Migration}
+
+The \texttt{kernel/src/migrate.rs} module implements thread checkpoint/restore:
+
+\begin{enumerate}[nosep]
+    \item \textbf{Checkpoint}: capture register state (RIP, RSP, CR3), scheduling parameters,
+          IPC state, and enumerate memory regions by walking the 4-level page table
+    \item \textbf{Serialize}: convert \texttt{ThreadCheckpoint} + memory pages to byte stream
+    \item \textbf{Transfer}: send over network via IPC routing layer
+    \item \textbf{Restore}: create new address space, map regions, copy memory, spawn thread
+\end{enumerate}
+
+\subsection{Distributed VFS}
+
+The \texttt{libs/sotos-objstore/src/distributed.rs} module provides:
+\begin{itemize}[nosep]
+    \item Cluster membership (up to 8 nodes)
+    \item Operation sync log (circular buffer, 64 entries)
+    \item Configurable replication factor
+    \item Last-writer-wins conflict resolution with node ID tiebreaker
+\end{itemize}
+
+% ============================================================================
+\section{Userspace Applications}
+\label{sec:apps}
+% ============================================================================
+
+\subsection{LUCAS Shell}
+
+The Linux-ABI compatible shell (3,700+ lines) provides:
+\begin{itemize}[nosep]
+    \item \textbf{Job control}: 16-slot job table, \texttt{fg}/\texttt{bg}, Ctrl+C/Ctrl+Z
+    \item \textbf{History}: 64-entry circular buffer, up/down arrow navigation
+    \item \textbf{Tab completion}: file path and builtin name completion
+    \item \textbf{Redirects}: \texttt{>}, \texttt{>>}, \texttt{<}, combined
+    \item \textbf{Here documents}: \texttt{<<DELIM} inline stdin
+    \item \textbf{Functions}: \texttt{function name() \{ ... \}}, positional args \$1-\$8
+    \item \textbf{40+ builtins}: including \texttt{wc}, \texttt{sort}, \texttt{uniq}, \texttt{diff}
+\end{itemize}
+
+\subsection{Lua Interpreter}
+
+A Lua 5.4-compatible interpreter (\texttt{libs/sotos-lua/}) with:
+\begin{itemize}[nosep]
+    \item Lexer: full tokenization of Lua syntax
+    \item Compiler: direct token-to-bytecode (35 opcodes)
+    \item VM: stack-based execution (256-deep stack, 64 locals, 128 globals)
+    \item Types: nil, boolean, number (i64), string, table (64 entries), function
+    \item Stdlib: \texttt{print}, \texttt{type}, \texttt{tostring}, \texttt{tonumber}
+\end{itemize}
+
+\subsection{GUI Window Compositor}
+
+A framebuffer window compositor (\texttt{libs/sotos-gui/}) with:
+\begin{itemize}[nosep]
+    \item Up to 16 windows with z-ordering and focus tracking
+    \item Window decorations: title bar, close/minimize buttons
+    \item 16$\times$16 mouse cursor with hit testing
+    \item Drawing primitives: fill\_rect, draw\_line (Bresenham), draw\_char (8$\times$8 font), blit
+\end{itemize}
+
+% ============================================================================
+\section{Security Model}
+\label{sec:security}
+% ============================================================================
+
+Security is enforced at multiple layers:
+\begin{itemize}[nosep]
+    \item \textbf{Capabilities}: every kernel object requires a valid capability with explicit rights
+    \item \textbf{W\^{}X}: writable pages automatically get NX; \texttt{SYS\_PROTECT} enforces transitions
+    \item \textbf{ASLR}: stack randomized with RDTSC-seeded xorshift64 (0--64~KB jitter)
+    \item \textbf{Stack canaries}: \texttt{-Z stack-protector=strong} on all binaries
+    \item \textbf{Multiuser}: SHA-256 password hashing, UID/GID permission model, chmod/chown syscalls
+    \item \textbf{WASM SFI}: metered execution with instruction limits and bounded memory access
+\end{itemize}
+
 % ============================================================================
 \section{Implementation Statistics}
 \label{sec:stats}
@@ -642,16 +764,23 @@ space, communicating with the shell via IPC.
 \toprule
 \textbf{Component} & \textbf{Lines of Rust} \\
 \midrule
-Kernel & $\sim$4,500 \\
-sotos-common (ABI) & $\sim$800 \\
-sotos-wasm (interpreter) & $\sim$1,200 \\
-sotos-net (TCP/IP stack) & $\sim$2,000 \\
-sotos-objstore (filesystem) & $\sim$1,500 \\
-sotos-nvme (NVMe driver) & $\sim$800 \\
-sotos-xhci (USB driver) & $\sim$1,300 \\
-Services (init, shell, etc.) & $\sim$5,000 \\
+Kernel (sched, IPC, caps, mm, syscall, watchdog, migrate, user) & $\sim$6,000 \\
+sotos-common (ABI + syscall wrappers) & $\sim$950 \\
+sotos-wasm (WASM interpreter + SFI) & $\sim$1,800 \\
+sotos-net (IPv4/IPv6, TCP/UDP, TLS crypto, HTTP) & $\sim$3,500 \\
+sotos-objstore (filesystem + distributed VFS) & $\sim$2,000 \\
+sotos-nvme (NVMe SSD driver) & $\sim$900 \\
+sotos-xhci (USB xHCI + hub + hotplug) & $\sim$2,000 \\
+sotos-ahci (AHCI/SATA driver) & $\sim$1,200 \\
+sotos-audio (AC97 audio driver) & $\sim$800 \\
+sotos-usb-storage (USB BBB + SCSI) & $\sim$700 \\
+sotos-mouse (PS/2 + USB HID mouse) & $\sim$800 \\
+sotos-gui (window compositor) & $\sim$600 \\
+sotos-lua (Lua interpreter) & $\sim$1,200 \\
+sotos-pkg (package manager) & $\sim$400 \\
+Services (init, shell, kbd, net, nvme, xhci, vmm, hello) & $\sim$8,500 \\
 \midrule
-\textbf{Total} & $\sim$17,100 \\
+\textbf{Total} & $\sim$31,350 \\
 \bottomrule
 \end{tabular}
 \caption{Approximate lines of code by component.}
@@ -664,12 +793,14 @@ Services (init, shell, etc.) & $\sim$5,000 \\
 \toprule
 \textbf{Feature} & \textbf{Count} \\
 \midrule
-Syscall numbers defined & 42 \\
+Syscall numbers defined & 44 \\
 Capability object types & 10 \\
 Userspace processes & 8 \\
-Device drivers & 5 \\
-Shell builtins & 25+ \\
+Device driver libraries & 9 \\
+Shell builtins & 40+ \\
 WASM opcodes supported & 50+ \\
+Network protocols & 10 (Eth, ARP, IPv4, IPv6, ICMP, UDP, TCP, DNS, DHCP, HTTP) \\
+Crypto algorithms & 4 (SHA-256, HMAC, ChaCha20, X25519) \\
 TLA+ specifications & 3 \\
 Stack canary check sites & $\sim$1,800/binary \\
 \bottomrule
@@ -682,19 +813,30 @@ Stack canary check sites & $\sim$1,800/binary \\
 \section{Conclusion}
 % ============================================================================
 
-sotOS demonstrates that a formally-verifiable microkernel can combine the
-safety of capability-based security with the performance of per-core
-architecture. The per-core IPC design reduces lock contention by $C\times$ on
-$C$-core systems. The WASM runtime provides an alternative isolation mechanism
-that eliminates TLB flush overhead. And the TLA+ specifications provide a
-foundation for machine-checked correctness proofs.
+sotOS demonstrates that a formally-verifiable microkernel can scale to a
+full-featured operating system while maintaining capability-based security and
+per-core architecture. Key contributions:
+
+\begin{itemize}[nosep]
+    \item \textbf{Per-core IPC} reduces lock contention by $C\times$ on $C$-core systems
+    \item \textbf{WASM SFI runtime} with metered execution provides process isolation without hardware page tables
+    \item \textbf{Full driver stack}: NVMe (interrupt-driven), AHCI/SATA, USB mass storage, AC97 audio, xHCI (multi-device, hub, hotplug), PS/2+USB mouse
+    \item \textbf{Complete networking}: IPv4/IPv6, TCP with Reno congestion control and window scaling, SHA-256/ChaCha20/X25519 crypto, HTTP/1.1 client
+    \item \textbf{Distributed computing}: network-transparent IPC routing, live process migration with checkpoint/restore, distributed VFS with conflict resolution
+    \item \textbf{Linux-ABI shell}: job control, command history, tab completion, redirects, here-docs, shell functions, 40+ builtins
+    \item \textbf{Embedded applications}: Lua 5.4 interpreter, GUI window compositor, package manager
+    \item \textbf{Security}: W\^{}X enforcement, ASLR, stack canaries, multiuser accounts with SHA-256 auth, chmod/chown
+    \item \textbf{Formal verification}: TLA+ specifications of IPC, capabilities, and scheduler with safety proofs
+\end{itemize}
+
+The system comprises over 31,000 lines of Rust across 15+ crates, all compiled with
+\texttt{-Z stack-protector=strong} and targeting \texttt{x86\_64-unknown-none}.
 
 Future work includes:
 \begin{itemize}[nosep]
-    \item Connecting the WASM runtime to the service loading pipeline
-    \item Implementing the network transport for distributed IPC
-    \item Live process migration between nodes
-    \item GPU/NPU driver integration for heterogeneous scheduling
+    \item Self-hosting (port a language toolchain to sotOS)
+    \item Custom bootloader replacing Limine (pure 64-bit long mode from scratch)
+    \item GPU/NPU driver integration for real heterogeneous dispatch
     \item Mechanized proofs using Coq or Lean for the verified kernel subset
 \end{itemize}
 

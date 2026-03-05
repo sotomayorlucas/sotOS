@@ -27,10 +27,19 @@ impl FileHandle {
     }
 }
 
+/// Access permission bits for check_permission().
+pub const PERM_READ: u8 = 4;
+pub const PERM_WRITE: u8 = 2;
+pub const PERM_EXEC: u8 = 1;
+
 pub struct Vfs {
     store: &'static mut ObjectStore,
     handles: [FileHandle; MAX_HANDLES],
     pub cwd: u64,
+    /// Current user ID for permission checks (default: 0 = root).
+    pub uid: u16,
+    /// Current group ID for permission checks (default: 0 = root).
+    pub gid: u16,
 }
 
 fn dbg(s: &[u8]) {
@@ -64,12 +73,58 @@ impl Vfs {
             store,
             handles: [FileHandle::unused(); MAX_HANDLES],
             cwd: ROOT_OID,
+            uid: 0,
+            gid: 0,
         }
+    }
+
+    /// Check if the given uid/gid has the specified access permission on a DirEntry.
+    ///
+    /// - `access`: bitmask of PERM_READ(4), PERM_WRITE(2), PERM_EXEC(1).
+    /// - Returns true if access is granted, false if denied.
+    ///
+    /// Permission bits in `entry.permissions` follow Unix layout:
+    ///   bits 8-6: owner rwx
+    ///   bits 5-3: group rwx
+    ///   bits 2-0: other rwx
+    pub fn check_permission(entry: &crate::layout::DirEntry, uid: u16, gid: u16, access: u8) -> bool {
+        // Root (uid 0) always has access.
+        if uid == 0 {
+            return true;
+        }
+
+        let perms = entry.permissions;
+        let relevant_bits = if entry.owner_uid == uid {
+            // Owner permissions (bits 8-6)
+            ((perms >> 6) & 0x7) as u8
+        } else if entry.owner_gid == gid {
+            // Group permissions (bits 5-3)
+            ((perms >> 3) & 0x7) as u8
+        } else {
+            // Other permissions (bits 2-0)
+            (perms & 0x7) as u8
+        };
+
+        (relevant_bits & access) == access
     }
 
     /// Open an existing file by name (path resolved relative to cwd). Returns fd.
     pub fn open(&mut self, name: &[u8], flags: u32) -> Result<u32, &'static str> {
         let oid = self.resolve(name)?;
+
+        // Permission check.
+        if let Some(entry) = self.store.stat(oid) {
+            let access = match flags {
+                O_RDONLY => PERM_READ,
+                O_WRONLY => PERM_WRITE,
+                O_RDWR => PERM_READ | PERM_WRITE,
+                _ => PERM_READ,
+            };
+            if !Self::check_permission(&entry, self.uid, self.gid, access) {
+                return Err("permission denied");
+            }
+        }
+
         let fd = self.alloc_handle()?;
         self.handles[fd as usize] = FileHandle { oid, pos: 0, flags };
         Ok(fd)
@@ -102,6 +157,13 @@ impl Vfs {
         let oid = h.oid;
         let pos = h.pos as usize;
 
+        // Permission check.
+        if let Some(entry) = self.store.stat(oid) {
+            if !Self::check_permission(&entry, self.uid, self.gid, PERM_READ) {
+                return Err("permission denied");
+            }
+        }
+
         let n = self.store.read_obj_range(oid, pos, buf)?;
         self.handles[fd as usize].pos += n as u64;
         Ok(n)
@@ -116,6 +178,13 @@ impl Vfs {
 
         let oid = h.oid;
         let pos = h.pos as usize;
+
+        // Permission check.
+        if let Some(entry) = self.store.stat(oid) {
+            if !Self::check_permission(&entry, self.uid, self.gid, PERM_WRITE) {
+                return Err("permission denied");
+            }
+        }
 
         self.store.write_obj_range(oid, pos, data)?;
 
@@ -244,6 +313,40 @@ impl Vfs {
     pub fn rmdir(&mut self, path: &[u8]) -> Result<(), &'static str> {
         let oid = self.resolve(path)?;
         self.store.rmdir(oid)
+    }
+
+    /// Change permissions on a file/directory by path.
+    pub fn chmod(&mut self, path: &[u8], mode: u32) -> Result<(), &'static str> {
+        let oid = self.resolve(path)?;
+        if let Some(slot) = self.store.find_slot_pub(oid) {
+            // Only owner or root can chmod.
+            let entry = &self.store.dir[slot];
+            if self.uid != 0 && entry.owner_uid != self.uid {
+                return Err("permission denied");
+            }
+            self.store.dir[slot].permissions = mode & 0o777;
+            self.store.flush_dir().map_err(|_| "flush dir failed")?;
+            Ok(())
+        } else {
+            Err("not found")
+        }
+    }
+
+    /// Change ownership of a file/directory by path.
+    pub fn chown(&mut self, path: &[u8], uid: u16, gid: u16) -> Result<(), &'static str> {
+        let oid = self.resolve(path)?;
+        if let Some(slot) = self.store.find_slot_pub(oid) {
+            // Only root can chown.
+            if self.uid != 0 {
+                return Err("permission denied");
+            }
+            self.store.dir[slot].owner_uid = uid;
+            self.store.dir[slot].owner_gid = gid;
+            self.store.flush_dir().map_err(|_| "flush dir failed")?;
+            Ok(())
+        } else {
+            Err("not found")
+        }
     }
 
     /// Find a file/dir by path, resolving relative to cwd. Returns OID.

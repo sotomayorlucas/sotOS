@@ -6,3 +6,4 @@ pub mod controller;
 pub mod port;
 pub mod usb;
 pub mod hid;
+pub mod hub;

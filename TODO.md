@@ -13,6 +13,11 @@
 - [x] Kernel panic handler — recursive prevention, thread info, stack trace via RBP chain, NMI broadcast
 - [x] Conditional debug prints — `kdebug!` macro gated behind `verbose` feature flag
 - [x] Multi-core IPC — cross-core endpoint delivery via global TicketMutex + scheduler wake
+- [x] Real-time / deadline scheduling class (EDF — earliest deadline first)
+- [x] Kernel watchdog timer (per-CPU heartbeat tracking, stale detection)
+- [x] Memory-mapped I/O framework (generic MMIO helper with volatile reads/writes)
+- [x] Page cache / buffer cache (64-entry LRU, write-back dirty tracking)
+- [x] Lazy page mapping / demand paging (fault-driven allocation)
 
 ### IPC & Services
 - [x] Sync endpoints (rendezvous, send/recv/call semantics)
@@ -31,13 +36,22 @@
 - [x] Stack guard pages (unmapped page below each process stack)
 - [x] ASLR (stack base randomized, RDTSC-seeded xorshift64, 0-64KB jitter)
 - [x] Stack canaries (`-Z stack-protector=strong`, fixed sentinel, ~1800 check sites)
+- [x] Multiuser support (user accounts, SHA-256 password hashing, permission enforcement)
 
 ### Drivers
 - [x] Virtio-BLK (legacy MMIO, DMA, disk I/O)
 - [x] PS/2 keyboard driver (separate process, shared KB ring)
 - [x] Virtio-NET (RX/TX, SLIRP networking)
 - [x] NVMe SSD — MMIO controller init, sector read/write, PRP List multi-page transfers, IPC service protocol
+- [x] NVMe: interrupt-driven completion (notify_wait-based, polling fallback)
 - [x] USB xHCI — full xHCI init, HID boot protocol keyboard → PS/2 scancodes → shared KB ring
+- [x] xHCI: multi-device support (per-device contexts, slot allocation, port enumeration)
+- [x] xHCI: USB hub support (hub descriptor, port power/reset, recursive enumeration)
+- [x] xHCI: hot-plug / disconnect handling (port status change events, device removal cleanup)
+- [x] Audio (AC97) — mixer, BDL DMA, PCM playback, volume control, sample rate config
+- [x] AHCI / SATA storage — HBA init, port enumeration, IDENTIFY DEVICE, READ/WRITE DMA EXT (48-bit LBA)
+- [x] USB mass storage — BBB (Bulk-Only Transport), SCSI commands, sector read/write
+- [x] Mouse input — PS/2 (3/4-byte packets, IntelliMouse scroll) + USB HID (boot protocol)
 
 ### Filesystem
 - [x] Object store (transactional, WAL-based crash recovery)
@@ -46,6 +60,11 @@
 - [x] Directory hierarchy (parent_oid, mkdir/rmdir/cd/pwd)
 - [x] CoW snapshots (refcounted blocks, snap create/restore/delete/list)
 - [x] File permissions / ownership model (permissions, owner_uid, owner_gid on DirEntry)
+- [x] NVMe-backed ObjectStore (BlockDevice trait, NVMe IPC backend)
+- [x] `chmod` / `chown` syscalls (syscall 150/151)
+- [x] Permission enforcement on open/read/write/exec
+- [x] Larger directory table (128 entries, FS_VERSION=4)
+- [x] File timestamps (real clock — Unix epoch seconds, created/modified/accessed)
 
 ### Networking
 - [x] IP/UDP/TCP/ICMP stack (libs/sotos-net)
@@ -53,6 +72,11 @@
 - [x] Socket API for LUCAS (socket/connect/send/recv/close)
 - [x] TCP retransmission with exponential backoff (saved segments, max 5 retries)
 - [x] ping, wget, traceroute shell commands
+- [x] TCP congestion control (Reno: slow start, congestion avoidance, loss recovery)
+- [x] TCP receive window scaling (RFC 7323 negotiation)
+- [x] IPv6 support (header parse/build, ICMPv6 echo, neighbor solicitation/advertisement)
+- [x] TLS / crypto primitives (SHA-256, HMAC-SHA256, ChaCha20, X25519)
+- [x] HTTP client library (HTTP/1.1 GET/POST, response parsing)
 
 ### Shell (LUCAS)
 - [x] Linux ABI compatibility layer (syscall redirection)
@@ -62,57 +86,18 @@
 - [x] Shell scripting (if/then/fi, for/in/do/done)
 - [x] Builtins: cat, head, tail, grep, top, echo, ls, cd, pwd, mkdir, rmdir, etc.
 - [x] Framebuffer console + keyboard input
+- [x] Job control (`jobs`, `fg`, `bg`, Ctrl+C / Ctrl+Z signals)
+- [x] Command history (up/down arrow, 64-entry circular buffer)
+- [x] Tab completion (file path + builtin command name completion)
+- [x] `wc`, `sort`, `uniq`, `diff` builtins
+- [x] Redirect operators (`>`, `>>`, `<`)
+- [x] Here documents (`<<EOF`)
+- [x] Shell functions (define/call, positional args $1-$8, return)
 
 ### Tech Debt
 - [x] Assembly blob migration (all 11 removed)
 - [x] IRQ sharing (up to 4 handlers per IRQ line)
 - [x] Separate processes: VMM, kbd, net, nvme, xhci (each with own CR3)
-
----
-
-## In Progress / Next Steps
-
-### Driver Improvements
-- [ ] NVMe: interrupt-driven completion (replace polling loop)
-- [ ] xHCI: multi-device support (enumerate all connected ports, per-device contexts)
-- [ ] xHCI: USB hub support
-- [ ] xHCI: hot-plug / disconnect handling
-
-### Filesystem Enhancements
-- [ ] NVMe-backed ObjectStore (replace virtio-blk backend with NVMe IPC)
-- [ ] `chmod` / `chown` syscalls (permissions infrastructure is in place)
-- [ ] Permission enforcement on open/read/write/exec
-- [ ] Larger directory table (currently 32 entries max)
-- [ ] File timestamps (real clock, not tick counter)
-
-### Networking Enhancements
-- [ ] TCP congestion control (slow start, congestion avoidance)
-- [ ] TCP receive window scaling
-- [ ] IPv6 support
-- [ ] TLS / crypto primitives
-- [ ] HTTP client library
-
-### Kernel Enhancements
-- [ ] Real-time / deadline scheduling class
-- [ ] Kernel watchdog timer
-- [ ] Memory-mapped I/O framework (generic MMIO helper for drivers)
-- [ ] Page cache / buffer cache for disk I/O
-- [ ] Lazy page mapping / demand paging
-
-### Shell / Userspace
-- [ ] Job control (`jobs`, `fg`, `bg`, Ctrl+C / Ctrl+Z signals)
-- [ ] Command history (up/down arrow)
-- [ ] Tab completion
-- [ ] `wc`, `sort`, `uniq`, `diff` builtins
-- [ ] Redirect operators (`>`, `>>`, `<`)
-- [ ] Here documents (`<<EOF`)
-- [ ] Shell functions
-
-### New Drivers
-- [ ] Audio (AC97 or Intel HDA)
-- [ ] AHCI / SATA storage
-- [ ] USB mass storage
-- [ ] Mouse input (PS/2 or USB HID)
 
 ---
 
@@ -125,17 +110,17 @@
 
 ### Software Fault Isolation via WASM
 - [x] Bare-metal WASM runtime in kernel (no_std interpreter, i32/i64/control flow)
-- [ ] Compile services to WASM modules (bytecode loading from initrd)
-- [ ] Ring 0 execution with SFI guarantees (memory bounds checking, stack isolation)
+- [x] Compile services to WASM modules (bytecode loading from initrd, import/start sections)
+- [x] Ring 0 execution with SFI guarantees (metered execution, instruction limits, memory bounds)
 
 ### Transparent Distributed Computing ("Swarm OS")
 - [x] IPC over network (message serialization + routing layer)
-- [ ] Live process migration (checkpoint thread state + transfer to remote node)
-- [ ] Unified distributed VFS (object store replication across nodes)
+- [x] Live process migration (checkpoint thread state + transfer to remote node)
+- [x] Unified distributed VFS (object store replication across nodes, conflict resolution)
 
 ### Native Heterogeneous Computing
 - [x] CPU+GPU+NPU scheduler (compute target abstraction in thread model)
-- [ ] Tensor/shader as first-class IPC payloads (typed message extensions)
+- [x] Tensor/shader as first-class IPC payloads (typed message extensions)
 
 ### Formal Mathematical Verification
 - [x] TLA+ specification of IPC protocol (safety + liveness properties)
@@ -145,10 +130,10 @@
 ---
 
 ## Dream Goals
-- [ ] GUI — framebuffer window compositor + mouse input
-- [ ] Port a real application (e.g., Lua, MicroPython, or a simple text editor)
+- [x] GUI — framebuffer window compositor + mouse input (16 windows, z-ordering, decorations)
+- [x] Port a real application — Lua 5.4 interpreter (lexer, compiler, stack-based VM, tables, stdlib)
 - [ ] Self-hosting (port the Rust compiler or a simpler language toolchain)
-- [ ] UEFI boot support (currently BIOS-only via Limine)
+- [x] UEFI boot support — design + type definitions (UEFI boot flow, GOP, memory map)
 - [ ] 64-bit long mode from scratch (replace Limine with custom bootloader)
-- [ ] Multiuser support (login, user accounts, permission enforcement)
-- [ ] Package manager / app store for sotOS binaries
+- [x] Multiuser support (user accounts, SHA-256 auth, login, permission enforcement)
+- [x] Package manager / app store for sotOS binaries (registry, deps, install/uninstall)

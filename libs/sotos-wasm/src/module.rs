@@ -25,6 +25,8 @@ const MAX_GLOBALS: usize = 32;
 const MAX_PARAMS: usize = 8;
 /// Maximum locals per function.
 const MAX_LOCALS: usize = 32;
+/// Maximum number of imports.
+const MAX_IMPORTS: usize = 16;
 
 /// Error during module parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,9 +40,44 @@ pub enum ParseError {
     TooManyGlobals,
     TooManyParams,
     TooManyLocals,
+    TooManyImports,
     CodeTooLarge,
     UnexpectedEof,
     InvalidEncoding,
+}
+
+/// An imported item (function or memory).
+#[derive(Clone, Copy)]
+pub struct Import {
+    /// Module name (e.g. "env").
+    pub module_name: [u8; 32],
+    pub module_name_len: usize,
+    /// Field name (e.g. "memory" or "print").
+    pub field_name: [u8; 32],
+    pub field_name_len: usize,
+    /// Import kind: 0=function, 2=memory.
+    pub kind: u8,
+    /// For function imports: index into types array.
+    pub type_idx: u32,
+    /// For memory imports: minimum pages.
+    pub mem_min: u32,
+    /// For memory imports: maximum pages (0 = no max).
+    pub mem_max: u32,
+}
+
+impl Import {
+    const fn empty() -> Self {
+        Self {
+            module_name: [0; 32],
+            module_name_len: 0,
+            field_name: [0; 32],
+            field_name_len: 0,
+            kind: 0,
+            type_idx: 0,
+            mem_min: 0,
+            mem_max: 0,
+        }
+    }
 }
 
 /// Function type (signature): params → results.
@@ -140,10 +177,17 @@ pub struct Module {
     /// Global variables.
     pub globals: [Global; MAX_GLOBALS],
     pub global_count: usize,
+    /// Imports.
+    pub imports: [Import; MAX_IMPORTS],
+    pub import_count: usize,
+    /// Number of imported functions (these occupy function indices before local functions).
+    pub import_func_count: usize,
     /// Linear memory initial size (in WASM pages = 64 KiB).
     pub memory_pages: u32,
     /// Linear memory max size (in pages, 0 = no max).
     pub memory_max: u32,
+    /// Start function index (auto-called on instantiation), or u32::MAX if none.
+    pub start_func: u32,
     /// Flat code buffer (all function bytecodes concatenated).
     pub code: [u8; MAX_FUNCTIONS * MAX_CODE_SIZE / 4],
     pub code_len: usize,
@@ -173,8 +217,12 @@ impl Module {
             export_count: 0,
             globals: [Global::empty(); MAX_GLOBALS],
             global_count: 0,
+            imports: [Import::empty(); MAX_IMPORTS],
+            import_count: 0,
+            import_func_count: 0,
             memory_pages: 0,
             memory_max: 0,
+            start_func: u32::MAX,
             code: [0; MAX_FUNCTIONS * MAX_CODE_SIZE / 4],
             code_len: 0,
         };
@@ -202,6 +250,9 @@ impl Module {
                 section::TYPE => {
                     pos = parse_type_section(data, pos, section_end, &mut module)?;
                 }
+                section::IMPORT => {
+                    pos = parse_import_section(data, pos, section_end, &mut module)?;
+                }
                 section::FUNCTION => {
                     let (count, new_pos) = parse_function_section(
                         data,
@@ -221,6 +272,9 @@ impl Module {
                 }
                 section::EXPORT => {
                     pos = parse_export_section(data, pos, section_end, &mut module)?;
+                }
+                section::START => {
+                    pos = parse_start_section(data, pos, section_end, &mut module)?;
                 }
                 section::CODE => {
                     pos = parse_code_section(
@@ -248,6 +302,44 @@ impl Module {
             let exp = &self.exports[i];
             if exp.name_len == name.len() && &exp.name[..exp.name_len] == name {
                 return Some(exp.func_idx);
+            }
+        }
+        None
+    }
+
+    /// Parse a WASM module from raw bytes loaded from initrd.
+    ///
+    /// This is a convenience wrapper around `parse()` for loading modules
+    /// that were read from an initrd/CPIO archive. The bytes must contain
+    /// a valid WASM binary module (magic + version header + sections).
+    pub fn from_initrd_bytes(data: &[u8]) -> Result<Self, ParseError> {
+        Self::parse(data)
+    }
+
+    /// Returns true if this module has a start function.
+    pub fn has_start(&self) -> bool {
+        self.start_func != u32::MAX
+    }
+
+    /// Returns the start function index, if any.
+    pub fn start_function(&self) -> Option<u32> {
+        if self.start_func != u32::MAX {
+            Some(self.start_func)
+        } else {
+            None
+        }
+    }
+
+    /// Find an import by module and field name.
+    pub fn find_import(&self, module_name: &[u8], field_name: &[u8]) -> Option<&Import> {
+        for i in 0..self.import_count {
+            let imp = &self.imports[i];
+            if imp.module_name_len == module_name.len()
+                && &imp.module_name[..imp.module_name_len] == module_name
+                && imp.field_name_len == field_name.len()
+                && &imp.field_name[..imp.field_name_len] == field_name
+            {
+                return Some(imp);
             }
         }
         None
@@ -516,6 +608,133 @@ fn parse_code_section(
         pos = body_end;
     }
 
+    Ok(pos.min(end))
+}
+
+/// Parse the import section (section ID 2).
+fn parse_import_section(
+    data: &[u8],
+    mut pos: usize,
+    end: usize,
+    module: &mut Module,
+) -> Result<usize, ParseError> {
+    let (count, n) = decode::read_u32_leb128(&data[pos..]).ok_or(ParseError::InvalidEncoding)?;
+    pos += n;
+
+    for _ in 0..count {
+        if module.import_count >= MAX_IMPORTS {
+            return Err(ParseError::TooManyImports);
+        }
+
+        let mut imp = Import::empty();
+
+        // Read module name.
+        let (mod_name_len, n) =
+            decode::read_u32_leb128(&data[pos..]).ok_or(ParseError::InvalidEncoding)?;
+        pos += n;
+        let copy_len = (mod_name_len as usize).min(31);
+        if pos + mod_name_len as usize > end {
+            return Err(ParseError::UnexpectedEof);
+        }
+        imp.module_name[..copy_len].copy_from_slice(&data[pos..pos + copy_len]);
+        imp.module_name_len = copy_len;
+        pos += mod_name_len as usize;
+
+        // Read field name.
+        let (field_name_len, n) =
+            decode::read_u32_leb128(&data[pos..]).ok_or(ParseError::InvalidEncoding)?;
+        pos += n;
+        let copy_len = (field_name_len as usize).min(31);
+        if pos + field_name_len as usize > end {
+            return Err(ParseError::UnexpectedEof);
+        }
+        imp.field_name[..copy_len].copy_from_slice(&data[pos..pos + copy_len]);
+        imp.field_name_len = copy_len;
+        pos += field_name_len as usize;
+
+        // Read import kind.
+        if pos >= end {
+            return Err(ParseError::UnexpectedEof);
+        }
+        imp.kind = data[pos];
+        pos += 1;
+
+        match imp.kind {
+            0x00 => {
+                // Function import: read type index.
+                let (type_idx, n) =
+                    decode::read_u32_leb128(&data[pos..]).ok_or(ParseError::InvalidEncoding)?;
+                pos += n;
+                imp.type_idx = type_idx;
+                module.import_func_count += 1;
+            }
+            0x02 => {
+                // Memory import: read limits.
+                let flags = data[pos];
+                pos += 1;
+                let (min, n) =
+                    decode::read_u32_leb128(&data[pos..]).ok_or(ParseError::InvalidEncoding)?;
+                pos += n;
+                imp.mem_min = min;
+                if module.memory_pages == 0 {
+                    module.memory_pages = min;
+                }
+                if flags & 1 != 0 {
+                    let (max, n) = decode::read_u32_leb128(&data[pos..])
+                        .ok_or(ParseError::InvalidEncoding)?;
+                    pos += n;
+                    imp.mem_max = max;
+                    if module.memory_max == 0 {
+                        module.memory_max = max;
+                    }
+                }
+            }
+            _ => {
+                // Skip unknown import kinds (table=0x01, global=0x03).
+                // We must skip the descriptor; for simplicity, scan to next entry
+                // by skipping based on kind. Tables have element type + limits,
+                // globals have valtype + mutability.
+                match imp.kind {
+                    0x01 => {
+                        // Table: elemtype + limits
+                        pos += 1; // element type
+                        let flags = data[pos];
+                        pos += 1;
+                        let (_min, n) = decode::read_u32_leb128(&data[pos..])
+                            .ok_or(ParseError::InvalidEncoding)?;
+                        pos += n;
+                        if flags & 1 != 0 {
+                            let (_max, n) = decode::read_u32_leb128(&data[pos..])
+                                .ok_or(ParseError::InvalidEncoding)?;
+                            pos += n;
+                        }
+                    }
+                    0x03 => {
+                        // Global: valtype + mutability
+                        pos += 2;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        module.imports[module.import_count] = imp;
+        module.import_count += 1;
+    }
+    Ok(pos.min(end))
+}
+
+/// Parse the start section (section ID 8).
+fn parse_start_section(
+    data: &[u8],
+    mut pos: usize,
+    end: usize,
+    module: &mut Module,
+) -> Result<usize, ParseError> {
+    let (func_idx, n) =
+        decode::read_u32_leb128(&data[pos..]).ok_or(ParseError::InvalidEncoding)?;
+    pos += n;
+    module.start_func = func_idx;
     Ok(pos.min(end))
 }
 

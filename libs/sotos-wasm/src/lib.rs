@@ -20,10 +20,11 @@
 mod decode;
 mod exec;
 mod module;
+pub mod sfi;
 mod types;
 
-pub use exec::{Runtime, Trap};
-pub use module::{Module, ParseError};
+pub use exec::{HostFn, Runtime, Trap};
+pub use module::{Import, Module, ParseError};
 pub use types::{Value, ValType};
 
 /// Maximum stack depth (in values).

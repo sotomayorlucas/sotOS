@@ -99,6 +99,10 @@ const SYS_BOOTINFO_WRITE: u64 = 133;
 /// Syscall number — page permission change (mprotect-like).
 const SYS_PROTECT: u64 = 134;
 
+/// Syscall numbers — file permission management.
+const SYS_CHMOD: u64 = 150;
+const SYS_CHOWN: u64 = 151;
+
 /// Syscall numbers — thread info and resource limits.
 const SYS_THREAD_INFO: u64 = 140;
 const SYS_RESOURCE_LIMIT: u64 = 141;
@@ -1233,6 +1237,41 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         // SYS_THREAD_COUNT — get total live thread count
         SYS_THREAD_COUNT => {
             frame.rax = sched::thread_count() as u64;
+        }
+
+        // SYS_CHMOD — change file permissions
+        // rdi = path_ptr, rsi = path_len, rdx = mode
+        // Forwarded to LUCAS interceptor for threads with redirect set.
+        // For non-redirected threads, returns InvalidArg (FS lives in userspace).
+        SYS_CHMOD => {
+            let path_ptr = frame.rdi;
+            let path_len = frame.rsi as usize;
+            let _mode = frame.rdx;
+
+            if path_len == 0 || path_len > 255 || path_ptr >= USER_ADDR_LIMIT {
+                frame.rax = SysError::InvalidArg as i64 as u64;
+            } else {
+                // Non-redirected thread — FS operations require LUCAS.
+                frame.rax = SysError::InvalidArg as i64 as u64;
+            }
+        }
+
+        // SYS_CHOWN — change file ownership
+        // rdi = path_ptr, rsi = path_len, rdx = uid, r8 = gid
+        // Forwarded to LUCAS interceptor for threads with redirect set.
+        // For non-redirected threads, returns InvalidArg (FS lives in userspace).
+        SYS_CHOWN => {
+            let path_ptr = frame.rdi;
+            let path_len = frame.rsi as usize;
+            let _uid = frame.rdx;
+            let _gid = frame.r8;
+
+            if path_len == 0 || path_len > 255 || path_ptr >= USER_ADDR_LIMIT {
+                frame.rax = SysError::InvalidArg as i64 as u64;
+            } else {
+                // Non-redirected thread — FS operations require LUCAS.
+                frame.rax = SysError::InvalidArg as i64 as u64;
+            }
         }
 
         // SYS_DEBUG_PRINT — write a single byte to serial (temporary)

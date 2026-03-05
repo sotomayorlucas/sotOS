@@ -122,6 +122,12 @@ pub struct Thread {
     pub mem_page_limit: u32,
     /// Compute target for heterogeneous scheduling.
     pub compute_target: ComputeTarget,
+    /// Absolute tick deadline (0 = not deadline-scheduled).
+    /// When non-zero, this thread participates in EDF scheduling.
+    pub deadline_ticks: u64,
+    /// Period for periodic deadline tasks (0 = aperiodic).
+    /// After a deadline fires, the next deadline = current + period.
+    pub period_ticks: u64,
 }
 
 impl Thread {
@@ -173,6 +179,8 @@ impl Thread {
             mem_pages: 0,
             mem_page_limit: 0,
             compute_target: ComputeTarget::Cpu,
+            deadline_ticks: 0,
+            period_ticks: 0,
         }
     }
 
@@ -228,6 +236,8 @@ impl Thread {
             mem_pages: 0,
             mem_page_limit: 0,
             compute_target: ComputeTarget::Cpu,
+            deadline_ticks: 0,
+            period_ticks: 0,
         }
     }
 }

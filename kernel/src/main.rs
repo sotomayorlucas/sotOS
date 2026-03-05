@@ -14,12 +14,14 @@
 extern crate alloc;
 
 mod arch;
+mod boot_uefi;
 mod cap;
 mod elf;
 mod fault;
 mod initrd;
 mod ipc;
 mod irq;
+mod migrate;
 mod mm;
 mod panic;
 mod pool;
@@ -27,6 +29,8 @@ mod sched;
 mod svc_registry;
 mod sync;
 mod syscall;
+mod user;
+pub mod watchdog;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 // ---------------------------------------------------------------

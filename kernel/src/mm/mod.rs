@@ -4,7 +4,10 @@
 //! is handled by the userspace VMM server — this is the key
 //! microkernel/exokernel hybrid design decision.
 
+pub mod demand;
 pub mod frame;
+pub mod mmio;
+pub mod page_cache;
 pub mod paging;
 pub mod slab;
 

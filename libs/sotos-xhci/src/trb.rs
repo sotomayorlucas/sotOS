@@ -56,8 +56,11 @@ pub const TRB_STATUS_STAGE: u8 = 4;
 pub const TRB_LINK: u8 = 6;
 pub const TRB_NO_OP_CMD: u8 = 23;
 pub const TRB_ENABLE_SLOT: u8 = 9;
+pub const TRB_DISABLE_SLOT: u8 = 10;
 pub const TRB_ADDRESS_DEV: u8 = 11;
 pub const TRB_CONFIGURE_EP: u8 = 12;
+pub const TRB_RESET_EP: u8 = 14;
+pub const TRB_STOP_EP: u8 = 15;
 pub const TRB_XFER_EVENT: u8 = 32;
 pub const TRB_CMD_COMPLETE: u8 = 33;
 pub const TRB_PORT_STATUS: u8 = 34;
@@ -96,6 +99,16 @@ pub fn cmd_enable_slot() -> Trb {
         param: 0,
         status: 0,
         control: (TRB_ENABLE_SLOT as u32) << 10,
+    }
+}
+
+/// Build a Disable Slot Command TRB.
+/// `slot_id`: slot to disable.
+pub fn cmd_disable_slot(slot_id: u8) -> Trb {
+    Trb {
+        param: 0,
+        status: 0,
+        control: (TRB_DISABLE_SLOT as u32) << 10 | ((slot_id as u32) << 24),
     }
 }
 

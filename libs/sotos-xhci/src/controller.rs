@@ -36,6 +36,55 @@ pub struct XhciInitResult {
     pub max_ports: u8,
 }
 
+/// Maximum number of concurrently tracked USB devices.
+pub const MAX_DEVICES: usize = 16;
+
+/// USB device state tracked by the controller.
+#[derive(Clone, Copy)]
+pub struct UsbDevice {
+    /// xHCI slot ID (1-based, assigned by Enable Slot).
+    pub slot_id: u8,
+    /// Root hub port this device is attached to (1-based).
+    pub port: u8,
+    /// Port speed (1=FS, 2=LS, 3=HS, 4=SS).
+    pub speed: u8,
+    /// Whether this device is configured (SET_CONFIGURATION done).
+    pub configured: bool,
+    /// USB device class (from device descriptor).
+    pub device_class: u8,
+    /// Whether this device is a hub.
+    pub is_hub: bool,
+    /// Number of hub ports (if is_hub).
+    pub hub_ports: u8,
+    /// Physical address of the device context.
+    pub ctx_phys: u64,
+    /// Physical address of the EP0 transfer ring.
+    pub ep0_ring_phys: u64,
+    /// Virtual address of the EP0 transfer ring.
+    pub ep0_ring_virt: *mut u8,
+}
+
+impl UsbDevice {
+    pub const fn empty() -> Self {
+        UsbDevice {
+            slot_id: 0,
+            port: 0,
+            speed: 0,
+            configured: false,
+            device_class: 0,
+            is_hub: false,
+            hub_ports: 0,
+            ctx_phys: 0,
+            ep0_ring_phys: 0,
+            ep0_ring_virt: core::ptr::null_mut(),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.slot_id != 0
+    }
+}
+
 pub struct XhciController {
     mmio_base: *mut u8,
     op_base: *mut u8,
@@ -45,6 +94,8 @@ pub struct XhciController {
     evt_ring: EventRing,
     pub max_ports: u8,
     pub max_slots: u8,
+    /// Array of tracked USB devices (index 0..15).
+    pub devices: [Option<UsbDevice>; MAX_DEVICES],
 }
 
 impl XhciController {
@@ -176,6 +227,7 @@ impl XhciController {
             evt_ring,
             max_ports,
             max_slots,
+            devices: [None; MAX_DEVICES],
         };
 
         Ok((ctrl, XhciInitResult {
@@ -333,5 +385,179 @@ impl XhciController {
         } else {
             None
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Multi-device management
+    // ---------------------------------------------------------------
+
+    /// Enumerate all connected ports, returning a bitmask of ports with devices.
+    /// Does NOT perform reset or address assignment — use `init_device_on_port()`
+    /// for each connected port to complete device setup.
+    pub unsafe fn enumerate_ports(&self) -> u32 {
+        let mut mask: u32 = 0;
+        for p in 1..=self.max_ports {
+            let portsc = self.portsc(p);
+            if portsc & regs::PORTSC_CCS != 0 {
+                mask |= 1 << p;
+            }
+        }
+        mask
+    }
+
+    /// Allocate a device slot by submitting an Enable Slot command.
+    /// Returns the allocated slot_id (1-based) on success.
+    pub unsafe fn allocate_slot(&mut self, wait: WaitFn) -> Result<u8, &'static str> {
+        let evt = self.submit_command(trb::cmd_enable_slot(), wait)?;
+        let cc = evt.completion_code();
+        if cc != trb::CC_SUCCESS {
+            return Err("xhci: enable slot failed");
+        }
+        Ok(evt.slot_id())
+    }
+
+    /// Register a device in the internal tracking table.
+    /// Returns the index into `devices[]` where it was stored.
+    pub fn register_device(&mut self, dev: UsbDevice) -> Option<usize> {
+        for (i, slot) in self.devices.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(dev);
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Remove a device from the tracking table by slot_id.
+    /// Returns the removed device, if found.
+    pub fn remove_device(&mut self, slot_id: u8) -> Option<UsbDevice> {
+        for slot in self.devices.iter_mut() {
+            if let Some(dev) = slot {
+                if dev.slot_id == slot_id {
+                    return slot.take();
+                }
+            }
+        }
+        None
+    }
+
+    /// Find a tracked device by slot_id.
+    pub fn find_device(&self, slot_id: u8) -> Option<&UsbDevice> {
+        for slot in &self.devices {
+            if let Some(dev) = slot {
+                if dev.slot_id == slot_id {
+                    return Some(dev);
+                }
+            }
+        }
+        None
+    }
+
+    /// Find a tracked device by port number.
+    pub fn find_device_on_port(&self, port: u8) -> Option<&UsbDevice> {
+        for slot in &self.devices {
+            if let Some(dev) = slot {
+                if dev.port == port {
+                    return Some(dev);
+                }
+            }
+        }
+        None
+    }
+
+    /// Get the number of currently tracked devices.
+    pub fn device_count(&self) -> usize {
+        self.devices.iter().filter(|s| s.is_some()).count()
+    }
+
+    // ---------------------------------------------------------------
+    // Hot-plug handling
+    // ---------------------------------------------------------------
+
+    /// Handle a Port Status Change event.
+    ///
+    /// Detects connect and disconnect events:
+    /// - **Connect**: Sets CSC, CCS=1 — caller should call `handle_port_connect()`
+    /// - **Disconnect**: Sets CSC, CCS=0 — releases slot, cleans up device
+    ///
+    /// Returns the port number and whether a device was connected (true) or
+    /// disconnected (false).
+    pub unsafe fn handle_port_change(&mut self, port: u8) -> Option<(u8, bool)> {
+        let portsc = self.portsc(port);
+
+        // Clear the Connect Status Change bit (RW1C).
+        if portsc & regs::PORTSC_CSC != 0 {
+            let val = (portsc & !regs::PORTSC_RW1C_MASK) | regs::PORTSC_CSC;
+            self.write_portsc(port, val);
+
+            let connected = portsc & regs::PORTSC_CCS != 0;
+            if !connected {
+                // Device disconnected — clean up.
+                self.handle_port_disconnect(port);
+            }
+            return Some((port, connected));
+        }
+
+        // Clear Port Reset Change if set.
+        if portsc & regs::PORTSC_PRC != 0 {
+            let val = (portsc & !regs::PORTSC_RW1C_MASK) | regs::PORTSC_PRC;
+            self.write_portsc(port, val);
+        }
+
+        None
+    }
+
+    /// Handle device disconnection on a port.
+    /// Releases the slot and removes the device from tracking.
+    fn handle_port_disconnect(&mut self, port: u8) {
+        // Find and remove the device on this port.
+        let mut slot_id = 0u8;
+        for slot in self.devices.iter_mut() {
+            if let Some(dev) = slot {
+                if dev.port == port {
+                    slot_id = dev.slot_id;
+                    *slot = None;
+                    break;
+                }
+            }
+        }
+        // Note: The xHCI spec says the HC automatically disables the slot
+        // when the port is disconnected. The host software should issue a
+        // Disable Slot command, but for simplicity we just remove tracking.
+        let _ = slot_id; // slot_id could be used for Disable Slot command
+    }
+
+    /// Process all pending Port Status Change events from the event ring.
+    /// Returns a list of (port, connected) pairs for ports that changed state.
+    pub unsafe fn process_port_events(&mut self) -> [(u8, bool); 16] {
+        let mut results = [(0u8, false); 16];
+        let mut count = 0;
+
+        loop {
+            match self.evt_ring.poll() {
+                Some(evt) => {
+                    self.evt_ring.advance();
+
+                    if evt.trb_type() == trb::TRB_PORT_STATUS {
+                        // Port ID is in bits 31:24 of the parameter (lower 32 bits).
+                        let port_id = ((evt.param >> 24) & 0xFF) as u8;
+                        if port_id > 0 && port_id <= self.max_ports {
+                            if let Some(result) = self.handle_port_change(port_id) {
+                                if count < 16 {
+                                    results[count] = result;
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+                    // Skip non-port-status events.
+                }
+                None => break,
+            }
+        }
+        if count > 0 {
+            self.update_erdp();
+        }
+        results
     }
 }

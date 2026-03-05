@@ -237,8 +237,69 @@ fn dequeue_from_any(my_cpu: usize) -> Option<usize> {
 /// Dequeue a non-depleted, CPU-targeted thread. If a dequeued thread belongs
 /// to a depleted domain, park it in the domain's suspended list and try the
 /// next one. GPU/NPU-targeted threads are re-enqueued (they await offload).
+///
+/// EDF priority: deadline threads (deadline_ticks > 0) are checked first.
+/// Among them, the one with the earliest deadline wins.
 fn dequeue_non_depleted(my_cpu: usize, sched: &mut Scheduler) -> Option<usize> {
-    // Limit iterations to prevent infinite loop if all threads are depleted.
+    // --- Phase 1: EDF scan for deadline threads ---
+    // Scan all per-CPU queues for the ready thread with the earliest deadline.
+    let mut best_idx: Option<usize> = None;
+    let mut best_deadline: u64 = u64::MAX;
+    let mut best_cpu: usize = 0;
+    let mut best_level: usize = 0;
+    let mut best_pos: usize = 0;
+
+    for offset in 0..MAX_CPUS {
+        let cpu = (my_cpu + offset) % MAX_CPUS;
+        let q = PER_CPU_QUEUES[cpu].lock();
+        for (level, queue) in q.levels.iter().enumerate() {
+            for (pos, &tidx) in queue.iter().enumerate() {
+                if let Some(t) = sched.threads.get_by_index(tidx as u32) {
+                    if t.deadline_ticks > 0
+                        && t.deadline_ticks < best_deadline
+                        && t.compute_target == ComputeTarget::Cpu
+                    {
+                        // Check domain is not depleted.
+                        let domain_ok = match t.domain_idx {
+                            None => true,
+                            Some(dom_idx) => sched.domains.get_by_index(dom_idx)
+                                .map_or(true, |d| d.state == DomainState::Active),
+                        };
+                        if domain_ok {
+                            best_deadline = t.deadline_ticks;
+                            best_idx = Some(tidx);
+                            best_cpu = cpu;
+                            best_level = level;
+                            best_pos = pos;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // If we found a deadline thread, remove it from its queue and return it.
+    if let Some(idx) = best_idx {
+        let mut q = PER_CPU_QUEUES[best_cpu].lock();
+        // Remove by position from the specific level.
+        if best_pos < q.levels[best_level].len() {
+            // Verify it's still the same thread (queue may have changed).
+            if q.levels[best_level].get(best_pos) == Some(&idx) {
+                q.levels[best_level].remove(best_pos);
+                return Some(idx);
+            }
+        }
+        // Fallback: linear scan to find and remove it.
+        for (level, queue) in q.levels.iter_mut().enumerate() {
+            if let Some(pos) = queue.iter().position(|&x| x == idx) {
+                queue.remove(pos);
+                return Some(idx);
+            }
+            let _ = level;
+        }
+    }
+
+    // --- Phase 2: Normal priority-based dequeue (original logic) ---
     for _ in 0..MAX_THREADS {
         let idx = dequeue_from_any(my_cpu)?;
 
@@ -369,6 +430,8 @@ pub fn init() {
         mem_pages: 0,
         mem_page_limit: 0,
         compute_target: ComputeTarget::Cpu,
+        deadline_ticks: 0,
+        period_ticks: 0,
     };
     let tid = ThreadId(sched.next_id);
     let handle = sched.threads.alloc(idle);
@@ -379,7 +442,7 @@ pub fn init() {
     percpu.idle_thread = slot;
     percpu.current_thread = slot;
 
-    kdebug!("  scheduler: priority MLQ with work stealing (SMP)");
+    kdebug!("  scheduler: priority MLQ with work stealing + EDF (SMP)");
 }
 
 /// Create an idle thread for an AP. Returns the pool index.
@@ -410,6 +473,8 @@ pub fn create_idle_thread() -> usize {
         mem_pages: 0,
         mem_page_limit: 0,
         compute_target: ComputeTarget::Cpu,
+        deadline_ticks: 0,
+        period_ticks: 0,
     };
     let handle = sched.threads.alloc(idle);
     let slot = handle.index();
@@ -681,6 +746,23 @@ pub fn set_compute_target(tid: ThreadId, target: ComputeTarget) {
     }
 }
 
+/// Set deadline scheduling parameters for a thread.
+///
+/// `deadline` is the absolute tick count by which the thread must complete.
+/// `period` is the repetition interval (0 = aperiodic / one-shot deadline).
+/// When a periodic deadline expires, the next deadline = old + period.
+/// Setting deadline=0 removes the thread from EDF scheduling.
+pub fn set_deadline(tid: ThreadId, deadline: u64, period: u64) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(slot) = sched.slot_of(tid) {
+        if let Some(t) = sched.threads.get_mut_by_index(slot) {
+            t.deadline_ticks = deadline;
+            t.period_ticks = period;
+            kdebug!("  sched: tid {} deadline={} period={}", tid.0, deadline, period);
+        }
+    }
+}
+
 /// Get the total number of live threads.
 pub fn thread_count() -> u32 {
     let sched = SCHEDULER.lock();
@@ -824,6 +906,18 @@ pub fn tick() {
                 }
                 if t.timeslice == 0 {
                     resched = true;
+                }
+
+                // Deadline check: if this thread has a deadline and it has passed,
+                // renew periodic deadlines or clear aperiodic ones.
+                if t.deadline_ticks > 0 && global_now >= t.deadline_ticks {
+                    if t.period_ticks > 0 {
+                        // Periodic: advance deadline to the next period.
+                        t.deadline_ticks += t.period_ticks;
+                    } else {
+                        // Aperiodic: deadline expired, clear it.
+                        t.deadline_ticks = 0;
+                    }
                 }
 
                 // Domain budget tracking.
