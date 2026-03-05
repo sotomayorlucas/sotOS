@@ -264,11 +264,11 @@ unsafe impl GlobalAlloc for KernelAllocator {
 static ALLOCATOR: KernelAllocator = KernelAllocator;
 
 pub fn init() {
-    use crate::kprintln;
+    use crate::kdebug;
     // Initialize all CPU caches (only CPU 0 is active at this point).
     for cache in CPU_CACHES.iter() {
         cache.lock().init();
     }
-    kprintln!("  slab: {} size classes ({}..{}), per-CPU caches ({} CPUs), multi-page for >4096",
+    kdebug!("  slab: {} size classes ({}..{}), per-CPU caches ({} CPUs), multi-page for >4096",
         NUM_CLASSES, SIZE_CLASSES[0], SIZE_CLASSES[NUM_CLASSES - 1], MAX_CPUS);
 }

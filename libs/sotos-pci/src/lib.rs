@@ -33,6 +33,7 @@ pub struct PciDevice {
     pub device_id: u16,
     pub class: u8,
     pub subclass: u8,
+    pub prog_if: u8,
     pub header_type: u8,
     pub irq_line: u8,
 }
@@ -74,9 +75,37 @@ impl PciBus {
         (vendor, device)
     }
 
-    /// Read BAR0 value.
+    /// Read BAR0 value (32-bit I/O or memory BAR).
     pub fn bar0(&self, addr: PciAddr) -> u32 {
         self.read32(addr, 0x10)
+    }
+
+    /// Read BAR0 as a 64-bit MMIO base address.
+    /// Returns None if BAR0 is an I/O port BAR.
+    /// Handles 64-bit BARs (type 2) by reading BAR0 + BAR1.
+    pub fn bar0_mmio(&self, addr: PciAddr) -> Option<u64> {
+        let bar0 = self.read32(addr, 0x10);
+        // Bit 0 = 0 means memory BAR
+        if bar0 & 1 != 0 {
+            return None; // I/O port BAR
+        }
+        let bar_type = (bar0 >> 1) & 3;
+        let base_lo = (bar0 & !0xF) as u64;
+        match bar_type {
+            0 => Some(base_lo),        // 32-bit
+            2 => {                      // 64-bit
+                let bar1 = self.read32(addr, 0x14);
+                Some(base_lo | ((bar1 as u64) << 32))
+            }
+            _ => None,
+        }
+    }
+
+    /// Enable memory space access (bit 1 of PCI Command register).
+    /// Required before accessing MMIO BARs.
+    pub fn enable_memory_space(&self, addr: PciAddr) {
+        let cmd = self.read32(addr, 0x04);
+        self.write32(addr, 0x04, cmd | (1 << 1));
     }
 
     /// Read the IRQ line from config space (offset 0x3C, byte 0).
@@ -98,6 +127,7 @@ impl PciBus {
             device_id: 0,
             class: 0,
             subclass: 0,
+            prog_if: 0,
             header_type: 0,
             irq_line: 0,
         }; N];
@@ -121,6 +151,7 @@ impl PciBus {
                     device_id: device,
                     class: (class_rev >> 24) as u8,
                     subclass: ((class_rev >> 16) & 0xFF) as u8,
+                    prog_if: ((class_rev >> 8) & 0xFF) as u8,
                     header_type: header_type & 0x7F,
                     irq_line: self.irq_line(addr),
                 };
@@ -143,6 +174,7 @@ impl PciBus {
                             device_id: fd,
                             class: (fc >> 24) as u8,
                             subclass: ((fc >> 16) & 0xFF) as u8,
+                            prog_if: ((fc >> 8) & 0xFF) as u8,
                             header_type: 0,
                             irq_line: self.irq_line(faddr),
                         };

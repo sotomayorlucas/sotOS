@@ -8,12 +8,16 @@ members = [
     "libs/sotos-objstore",
     "libs/sotos-net",
     "libs/sotos-ld",
+    "libs/sotos-nvme",
+    "libs/sotos-xhci",
 ]
 exclude = [
     "services/init",
     "services/lucas-shell",
     "services/kbd",
     "services/net",
+    "services/nvme",
+    "services/xhci",
     "services/vmm",
     "services/hello",
     "libs/sotos-testlib",

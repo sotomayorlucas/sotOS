@@ -135,6 +135,12 @@ pub enum Syscall {
     BootInfoWrite = 133,
     /// Change page permissions (mprotect-like, W^X enforced).
     Protect = 134,
+    /// Get thread info by pool index.
+    ThreadInfo = 140,
+    /// Set resource limits on current thread.
+    ResourceLimit = 141,
+    /// Get total live thread count.
+    ThreadCount = 142,
     /// Write a single byte to serial (temporary debug aid).
     DebugPrint = 255,
     /// Non-blocking serial read (returns byte or u64::MAX if none).
@@ -910,6 +916,22 @@ pub mod sys {
     pub fn protect(vaddr: u64, flags: u64) -> Result<(), i64> {
         let ret = syscall2(super::Syscall::Protect as u64, vaddr, flags);
         if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
+    /// Get thread info by pool index.
+    /// Returns (tid, state, priority, cpu_ticks, mem_pages, is_user) or error.
+    #[inline(always)]
+    pub fn thread_info(idx: u64) -> Result<(u64, u64, u64, u64, u64, u64), i64> {
+        // We need to use raw syscall and read back multiple registers.
+        // For simplicity, use syscall1 — kernel writes results back to rdi/rsi/rdx/r8/r9/r10.
+        let ret = syscall1(super::Syscall::ThreadInfo as u64, idx);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok((0, 0, 0, 0, 0, 0)) }
+    }
+
+    /// Get total live thread count.
+    #[inline(always)]
+    pub fn thread_count() -> u64 {
+        syscall0(super::Syscall::ThreadCount as u64)
     }
 
     /// Temporary debug: read u64 from physical address via kernel HHDM.

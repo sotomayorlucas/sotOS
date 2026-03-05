@@ -10,7 +10,7 @@
 pub mod table;
 
 pub use table::{CapId, CapObject, CapabilityTable, Rights};
-use crate::kprintln;
+use crate::kdebug;
 use sotos_common::SysError;
 
 use spin::Mutex;
@@ -20,7 +20,7 @@ static CAP_TABLE: Mutex<CapabilityTable> = Mutex::new(CapabilityTable::new());
 pub fn init() {
     // The root capability table is ready — it starts empty.
     // Pool-backed: grows dynamically as capabilities are created.
-    kprintln!("  capability table ready (dynamic pool, generation-checked)");
+    kdebug!("  capability table ready (dynamic pool, generation-checked)");
 }
 
 /// Insert a new capability and return its ID.

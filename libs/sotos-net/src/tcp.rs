@@ -29,6 +29,13 @@ pub enum TcpState {
     Closed,
 }
 
+/// Maximum retransmit buffer size (enough for SYN/FIN + small data).
+const RETRANSMIT_BUF_SIZE: usize = 128;
+/// Maximum retransmit attempts before giving up.
+const MAX_RETRANSMITS: u8 = 5;
+/// Retransmit interval in ticks (caller's tick rate).
+const RETRANSMIT_TICKS: u32 = 100;
+
 /// A single TCP connection.
 pub struct TcpConn {
     pub state: TcpState,
@@ -42,6 +49,11 @@ pub struct TcpConn {
     pub recv_buf: [u8; 512],
     pub recv_len: usize,
     pub active: bool,
+    /// Retransmit state: saved last unACKed segment.
+    retransmit_buf: [u8; RETRANSMIT_BUF_SIZE],
+    retransmit_len: usize,
+    retransmit_count: u8,
+    retransmit_tick: u32,
 }
 
 impl TcpConn {
@@ -57,6 +69,10 @@ impl TcpConn {
             recv_buf: [0; 512],
             recv_len: 0,
             active: false,
+            retransmit_buf: [0; RETRANSMIT_BUF_SIZE],
+            retransmit_len: 0,
+            retransmit_count: 0,
+            retransmit_tick: 0,
         }
     }
 }
@@ -137,6 +153,7 @@ impl TcpTable {
             iss, 0,
             SYN, TCP_WINDOW, &[],
         );
+        Self::save_for_retransmit(&mut self.conns[ci], &reply_buf[..seg_len], 0);
         Some((ci, seg_len))
     }
 
@@ -205,6 +222,8 @@ impl TcpTable {
                     c.snd_una = hdr.ack;
                     c.rcv_nxt = hdr.seq.wrapping_add(1);
                     c.state = TcpState::Established;
+                    c.retransmit_len = 0;
+                    c.retransmit_count = 0;
                     // Send ACK to complete 3-way handshake.
                     return Some(build_segment(
                         reply_buf, our_ip, src_ip,
@@ -226,9 +245,13 @@ impl TcpTable {
             TcpState::Established => {
                 let c = &mut self.conns[ci];
 
-                // Process ACK.
+                // Process ACK — clear retransmit if all data acknowledged.
                 if hdr.flags & ACK != 0 {
                     c.snd_una = hdr.ack;
+                    if c.snd_una == c.snd_nxt {
+                        c.retransmit_len = 0;
+                        c.retransmit_count = 0;
+                    }
                 }
 
                 // Process incoming data.
@@ -340,6 +363,7 @@ impl TcpTable {
             ACK | PSH, TCP_WINDOW, data,
         );
         c.snd_nxt = c.snd_nxt.wrapping_add(data.len() as u32);
+        Self::save_for_retransmit(c, &reply_buf[..len], 0);
         Some(len)
     }
 
@@ -354,6 +378,50 @@ impl TcpTable {
         }
         c.recv_len -= n;
         n
+    }
+
+    /// Check all connections for retransmit timeouts. Returns the first segment
+    /// that needs retransmission as (conn_id, segment_bytes, length), or None.
+    /// `current_tick` is a monotonic counter provided by the caller.
+    pub fn check_retransmit(&mut self, current_tick: u32, out: &mut [u8]) -> Option<(usize, usize)> {
+        for (i, c) in self.conns.iter_mut().enumerate() {
+            if !c.active || c.retransmit_len == 0 {
+                continue;
+            }
+            // Check if all sent data has been ACKed.
+            if c.snd_una == c.snd_nxt {
+                c.retransmit_len = 0;
+                c.retransmit_count = 0;
+                continue;
+            }
+            let elapsed = current_tick.wrapping_sub(c.retransmit_tick);
+            // Exponential backoff: base interval * 2^retransmit_count.
+            let interval = RETRANSMIT_TICKS << (c.retransmit_count as u32).min(4);
+            if elapsed >= interval {
+                if c.retransmit_count >= MAX_RETRANSMITS {
+                    // Give up — reset connection.
+                    c.state = TcpState::Closed;
+                    c.active = false;
+                    c.retransmit_len = 0;
+                    continue;
+                }
+                c.retransmit_count += 1;
+                c.retransmit_tick = current_tick;
+                let len = c.retransmit_len.min(out.len());
+                out[..len].copy_from_slice(&c.retransmit_buf[..len]);
+                return Some((i, len));
+            }
+        }
+        None
+    }
+
+    /// Save a segment for potential retransmission.
+    fn save_for_retransmit(conn: &mut TcpConn, segment: &[u8], current_tick: u32) {
+        let len = segment.len().min(RETRANSMIT_BUF_SIZE);
+        conn.retransmit_buf[..len].copy_from_slice(&segment[..len]);
+        conn.retransmit_len = len;
+        conn.retransmit_count = 0;
+        conn.retransmit_tick = current_tick;
     }
 
     /// Close a connection (active close). Returns FIN segment to transmit.

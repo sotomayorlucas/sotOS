@@ -3,6 +3,10 @@ name = "sotos-kernel"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["verbose"]
+verbose = []
+
 [dependencies]
 limine = "0.5"
 x86_64 = "0.15"

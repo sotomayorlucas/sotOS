@@ -12,6 +12,10 @@ pub const FS_VERSION: u32 = 3;
 /// Directory entry flag: entry is a directory.
 pub const FLAG_DIR: u32 = 1;
 
+/// Default permissions: rwxr-xr-x (0o755) for dirs, rw-r--r-- (0o644) for files.
+pub const DEFAULT_DIR_PERMS: u32 = 0o755;
+pub const DEFAULT_FILE_PERMS: u32 = 0o644;
+
 /// Root directory OID (always 1).
 pub const ROOT_OID: u64 = 1;
 
@@ -123,7 +127,10 @@ pub struct DirEntry {
     pub created_tick: u32,
     pub modified_tick: u32,
     pub parent_oid: u64,      // parent directory OID (0 = root's parent sentinel)
-    pub _pad: [u8; 32],       // 128 - 96 (4 bytes alignment pad before parent_oid)
+    pub permissions: u32,     // Unix-style rwxrwxrwx (owner/group/other, 9 bits)
+    pub owner_uid: u16,       // owner user ID
+    pub owner_gid: u16,       // owner group ID
+    pub _pad: [u8; 24],       // 128 - 104
 }
 
 impl DirEntry {
@@ -138,7 +145,10 @@ impl DirEntry {
             created_tick: 0,
             modified_tick: 0,
             parent_oid: 0,
-            _pad: [0; 32],
+            permissions: 0,
+            owner_uid: 0,
+            owner_gid: 0,
+            _pad: [0; 24],
         }
     }
 

@@ -10,6 +10,8 @@ USER_INIT := "services/init/target/x86_64-unknown-none/debug/sotos-init"
 USER_SHELL := "services/lucas-shell/target/x86_64-unknown-none/debug/sotos-lucas-shell"
 USER_KBD := "services/kbd/target/x86_64-unknown-none/debug/sotos-kbd"
 USER_NET := "services/net/target/x86_64-unknown-none/debug/sotos-net-svc"
+USER_NVME := "services/nvme/target/x86_64-unknown-none/debug/sotos-nvme-svc"
+USER_XHCI := "services/xhci/target/x86_64-unknown-none/debug/sotos-xhci-svc"
 USER_VMM := "services/vmm/target/x86_64-unknown-none/debug/sotos-vmm"
 USER_HELLO := "services/hello/target/x86_64-unknown-none/debug/sotos-hello"
 TESTLIB := "target/libtest.so"
@@ -42,6 +44,14 @@ build-vmm:
 build-hello:
     cd services/hello && CARGO_ENCODED_RUSTFLAGS="$(printf '%s\x1f%s\x1f%s' '-Clink-arg=-Tlinker.ld' '-Crelocation-model=static' '-Zstack-protector=strong')" cargo build
 
+# Build NVMe driver (separate process)
+build-nvme:
+    cd services/nvme && CARGO_ENCODED_RUSTFLAGS="$(printf '%s\x1f%s\x1f%s' '-Clink-arg=-Tlinker.ld' '-Crelocation-model=static' '-Zstack-protector=strong')" cargo build
+
+# Build xHCI USB driver (separate process)
+build-xhci:
+    cd services/xhci && CARGO_ENCODED_RUSTFLAGS="$(printf '%s\x1f%s\x1f%s' '-Clink-arg=-Tlinker.ld' '-Crelocation-model=static' '-Zstack-protector=strong')" cargo build
+
 # Build test shared library (for dynamic linking)
 build-testlib:
     cd libs/sotos-testlib && CARGO_ENCODED_RUSTFLAGS="$(printf '%s' '-Crelocation-model=pic')" cargo build
@@ -59,8 +69,8 @@ release:
     cargo build --package sotos-kernel --release
 
 # Create CPIO initrd from userspace binaries
-initrd: build-user build-shell build-kbd build-net build-vmm build-hello build-testlib
-    python scripts/mkinitrd.py --output {{INITRD}} --file init={{USER_INIT}} --file shell={{USER_SHELL}} --file kbd={{USER_KBD}} --file net={{USER_NET}} --file vmm={{USER_VMM}} --file hello={{USER_HELLO}} --file libtest.so={{TESTLIB}}
+initrd: build-user build-shell build-kbd build-net build-nvme build-xhci build-vmm build-hello build-testlib
+    python scripts/mkinitrd.py --output {{INITRD}} --file init={{USER_INIT}} --file shell={{USER_SHELL}} --file kbd={{USER_KBD}} --file net={{USER_NET}} --file nvme={{USER_NVME}} --file xhci={{USER_XHCI}} --file vmm={{USER_VMM}} --file hello={{USER_HELLO}} --file libtest.so={{TESTLIB}}
 
 # Create the bootable disk image (BIOS + Limine)
 image: build initrd
@@ -145,6 +155,36 @@ run-blk: image create-test-disk
         -drive format=raw,file={{IMAGE}} \
         -drive if=none,format=raw,file=target/disk.img,id=disk0 \
         -device virtio-blk-pci,drive=disk0,disable-modern=on \
+        -serial stdio \
+        -no-reboot \
+        -m 256M \
+        -smp 4
+
+# Create a 64 MiB NVMe test disk
+create-nvme-disk:
+    python scripts/mknvmedisk.py
+
+# Run with NVMe SSD (and virtio-blk for ObjectStore)
+run-nvme: image create-test-disk create-nvme-disk
+    "{{QEMU}}" \
+        -drive format=raw,file={{IMAGE}} \
+        -drive if=none,format=raw,file=target/disk.img,id=disk0 \
+        -device virtio-blk-pci,drive=disk0,disable-modern=on \
+        -drive file=target/nvme-disk.img,format=raw,if=none,id=nvme0 \
+        -device nvme,serial=sotOS-NVMe,drive=nvme0 \
+        -serial stdio \
+        -no-reboot \
+        -m 256M \
+        -smp 4
+
+# Run with xHCI USB controller (and virtio-blk for ObjectStore)
+run-xhci: image create-test-disk
+    "{{QEMU}}" \
+        -drive format=raw,file={{IMAGE}} \
+        -drive if=none,format=raw,file=target/disk.img,id=disk0 \
+        -device virtio-blk-pci,drive=disk0,disable-modern=on \
+        -device qemu-xhci,id=xhci \
+        -device usb-kbd,bus=xhci.0 \
         -serial stdio \
         -no-reboot \
         -m 256M \

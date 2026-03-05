@@ -24,7 +24,7 @@ use crate::ipc::endpoint::Message;
 use crate::pool::{Pool, PoolHandle};
 use crate::sync::ticket::TicketMutex;
 
-use crate::kprintln;
+use crate::kdebug;
 use domain::{DomainState, SchedDomain};
 use spin::Mutex;
 use x86_64::VirtAddr;
@@ -35,6 +35,15 @@ static GLOBAL_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Timeslice in ticks (100 ms at 100 Hz).
 const TIMESLICE: u32 = 10;
+
+/// Number of priority classes for multi-level feedback queues.
+/// 0 = realtime (0-63), 1 = high (64-127), 2 = normal (128-191), 3 = low (192-255).
+const PRIORITY_CLASSES: usize = 4;
+
+/// Map a thread's priority (0-255) to a priority class index (0-3).
+fn priority_class(priority: u8) -> usize {
+    (priority as usize / 64).min(PRIORITY_CLASSES - 1)
+}
 
 // ---------------------------------------------------------------------------
 // Context switch — assembly trampoline
@@ -147,12 +156,45 @@ fn finish_switch() {
 const MAX_CPUS: usize = 16;
 
 struct CpuQueue {
-    queue: VecDeque<usize>,
+    /// Multi-level priority queues: index 0 = highest priority (realtime).
+    levels: [VecDeque<usize>; PRIORITY_CLASSES],
 }
 
 impl CpuQueue {
     const fn new() -> Self {
-        Self { queue: VecDeque::new() }
+        Self {
+            levels: [
+                VecDeque::new(),
+                VecDeque::new(),
+                VecDeque::new(),
+                VecDeque::new(),
+            ],
+        }
+    }
+
+    /// Dequeue from highest priority non-empty level.
+    fn pop_front(&mut self) -> Option<usize> {
+        for level in self.levels.iter_mut() {
+            if let Some(idx) = level.pop_front() {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// Steal from lowest priority non-empty level (steal cold/low-priority work).
+    fn pop_back_lowest(&mut self) -> Option<usize> {
+        for level in self.levels.iter_mut().rev() {
+            if let Some(idx) = level.pop_back() {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    #[allow(dead_code)]
+    fn is_empty(&self) -> bool {
+        self.levels.iter().all(|l| l.is_empty())
     }
 }
 
@@ -162,22 +204,29 @@ static PER_CPU_QUEUES: [TicketMutex<CpuQueue>; MAX_CPUS] = {
     [INIT; MAX_CPUS]
 };
 
-/// Enqueue a thread index to a specific CPU's run queue.
+/// Enqueue a thread index to a specific CPU's run queue at the given priority class.
+fn enqueue_to_cpu_pri(cpu: usize, idx: usize, pri_class: usize) {
+    PER_CPU_QUEUES[cpu % MAX_CPUS].lock().levels[pri_class].push_back(idx);
+}
+
+/// Enqueue a thread index to a specific CPU's run queue (default: normal priority).
+#[allow(dead_code)]
 fn enqueue_to_cpu(cpu: usize, idx: usize) {
-    PER_CPU_QUEUES[cpu % MAX_CPUS].lock().queue.push_back(idx);
+    enqueue_to_cpu_pri(cpu, idx, 2); // normal priority
 }
 
 /// Dequeue from the current CPU's queue, or work-steal from others.
+/// Priority-aware: always dequeues highest priority available.
 fn dequeue_from_any(my_cpu: usize) -> Option<usize> {
-    // Try own queue first.
-    if let Some(idx) = PER_CPU_QUEUES[my_cpu % MAX_CPUS].lock().queue.pop_front() {
+    // Try own queue first (highest priority first).
+    if let Some(idx) = PER_CPU_QUEUES[my_cpu % MAX_CPUS].lock().pop_front() {
         return Some(idx);
     }
-    // Work stealing: try other CPUs, steal oldest (pop_back = LIFO steal).
+    // Work stealing: try other CPUs, steal lowest-priority work.
     for offset in 1..MAX_CPUS {
         let victim = (my_cpu + offset) % MAX_CPUS;
         if let Some(mut q) = PER_CPU_QUEUES[victim].try_lock() {
-            if let Some(idx) = q.queue.pop_back() {
+            if let Some(idx) = q.pop_back_lowest() {
                 return Some(idx);
             }
         }
@@ -238,11 +287,15 @@ impl Scheduler {
     }
 
     /// Enqueue a thread to its preferred CPU's queue (or current CPU if no preference).
+    /// Uses the thread's priority to select the correct multi-level queue.
     pub fn enqueue(&self, idx: usize) {
-        let target_cpu = self.threads.get_by_index(idx as u32)
-            .and_then(|t| t.preferred_cpu)
-            .unwrap_or_else(|| percpu::current_percpu().cpu_index) as usize;
-        enqueue_to_cpu(target_cpu, idx);
+        let (target_cpu, pri_class) = self.threads.get_by_index(idx as u32)
+            .map(|t| {
+                let cpu = t.preferred_cpu.unwrap_or(percpu::current_percpu().cpu_index) as usize;
+                (cpu, priority_class(t.priority))
+            })
+            .unwrap_or_else(|| (percpu::current_percpu().cpu_index as usize, 2));
+        enqueue_to_cpu_pri(target_cpu, idx, pri_class);
     }
 
     /// Get pool slot index for a ThreadId. O(1).
@@ -300,6 +353,10 @@ pub fn init() {
         preferred_cpu: None,
         domain_idx: None,
         redirect_ep: None,
+        cpu_ticks: 0,
+        cpu_tick_limit: 0,
+        mem_pages: 0,
+        mem_page_limit: 0,
     };
     let tid = ThreadId(sched.next_id);
     let handle = sched.threads.alloc(idle);
@@ -310,7 +367,7 @@ pub fn init() {
     percpu.idle_thread = slot;
     percpu.current_thread = slot;
 
-    kprintln!("  scheduler: per-core queues with work stealing (SMP)");
+    kdebug!("  scheduler: priority MLQ with work stealing (SMP)");
 }
 
 /// Create an idle thread for an AP. Returns the pool index.
@@ -336,6 +393,10 @@ pub fn create_idle_thread() -> usize {
         preferred_cpu: None,
         domain_idx: None,
         redirect_ep: None,
+        cpu_ticks: 0,
+        cpu_tick_limit: 0,
+        mem_pages: 0,
+        mem_page_limit: 0,
     };
     let handle = sched.threads.alloc(idle);
     let slot = handle.index();
@@ -540,6 +601,76 @@ pub fn current_ipc_msg() -> Message {
 }
 
 // ---------------------------------------------------------------------------
+// Resource Limits
+// ---------------------------------------------------------------------------
+
+/// Set resource limits for a thread.
+pub fn set_resource_limits(tid: ThreadId, cpu_limit: u64, mem_limit: u32) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(slot) = sched.slot_of(tid) {
+        if let Some(t) = sched.threads.get_mut_by_index(slot) {
+            t.cpu_tick_limit = cpu_limit;
+            t.mem_page_limit = mem_limit;
+        }
+    }
+}
+
+/// Get thread info: (tid, state, priority, cpu_ticks, mem_pages, is_user).
+pub fn thread_info(idx: u32) -> Option<(u32, u8, u8, u64, u32, bool)> {
+    let sched = SCHEDULER.lock();
+    sched.threads.get_by_index(idx).map(|t| {
+        let state_byte = match t.state {
+            ThreadState::Ready => 0,
+            ThreadState::Running => 1,
+            ThreadState::Blocked => 2,
+            ThreadState::Faulted => 3,
+            ThreadState::Dead => 4,
+        };
+        (t.id.0, state_byte, t.priority, t.cpu_ticks, t.mem_pages, t.is_user)
+    })
+}
+
+/// Track a memory page allocation for the current thread.
+pub fn track_mem_alloc() -> bool {
+    let percpu = percpu::current_percpu();
+    let idx = percpu.current_thread;
+    if idx == usize::MAX { return true; }
+    let mut sched = SCHEDULER.lock();
+    if let Some(t) = sched.threads.get_mut_by_index(idx as u32) {
+        if t.mem_page_limit > 0 && t.mem_pages >= t.mem_page_limit {
+            return false; // limit reached
+        }
+        t.mem_pages += 1;
+    }
+    true
+}
+
+/// Track a memory page free for the current thread.
+pub fn track_mem_free() {
+    let percpu = percpu::current_percpu();
+    let idx = percpu.current_thread;
+    if idx == usize::MAX { return; }
+    let mut sched = SCHEDULER.lock();
+    if let Some(t) = sched.threads.get_mut_by_index(idx as u32) {
+        if t.mem_pages > 0 {
+            t.mem_pages -= 1;
+        }
+    }
+}
+
+/// Get the total number of live threads.
+pub fn thread_count() -> u32 {
+    let sched = SCHEDULER.lock();
+    let mut count = 0u32;
+    for i in 0..MAX_THREADS as u32 {
+        if sched.threads.get_by_index(i).is_some() {
+            count += 1;
+        }
+    }
+    count
+}
+
+// ---------------------------------------------------------------------------
 // Syscall Redirect (LUCAS)
 // ---------------------------------------------------------------------------
 
@@ -576,7 +707,7 @@ pub fn create_domain(quantum_ticks: u32, period_ticks: u32) -> Option<PoolHandle
     let dom = SchedDomain::new(quantum_ticks, period_ticks, global_now);
     let mut sched = SCHEDULER.lock();
     let handle = sched.domains.alloc(dom);
-    kprintln!("  domain: created (quantum={} period={} ticks)", quantum_ticks, period_ticks);
+    kdebug!("  domain: created (quantum={} period={} ticks)", quantum_ticks, period_ticks);
     Some(handle)
 }
 
@@ -656,6 +787,15 @@ pub fn tick() {
 
         if idx != usize::MAX {
             if let Some(t) = sched.threads.get_mut_by_index(idx as u32) {
+                // Track CPU usage.
+                t.cpu_ticks += 1;
+
+                // Check CPU tick limit.
+                if t.cpu_tick_limit > 0 && t.cpu_ticks >= t.cpu_tick_limit {
+                    t.state = ThreadState::Dead;
+                    resched = true;
+                }
+
                 if t.timeslice > 0 {
                     t.timeslice -= 1;
                 }
@@ -669,7 +809,7 @@ pub fn tick() {
                         dom.consumed_ticks += 1;
                         if dom.consumed_ticks >= dom.quantum_ticks && dom.state == DomainState::Active {
                             dom.state = DomainState::Depleted;
-                            kprintln!("  domain: depleted (consumed={}/{})", dom.consumed_ticks, dom.quantum_ticks);
+                            kdebug!("  domain: depleted (consumed={}/{})", dom.consumed_ticks, dom.quantum_ticks);
                             resched = true;
                         }
                     }
@@ -700,7 +840,7 @@ fn check_domain_refills(sched: &mut Scheduler, global_now: u64) {
                 // Drain suspended list.
                 let suspended: Vec<usize> = dom.suspended.drain(..).collect();
                 if !suspended.is_empty() {
-                    kprintln!("  domain: refilled, {} threads re-enqueued", suspended.len());
+                    kdebug!("  domain: refilled, {} threads re-enqueued", suspended.len());
                 }
                 Some(suspended)
             } else {

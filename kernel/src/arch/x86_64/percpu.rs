@@ -88,7 +88,7 @@ pub fn init_bsp() -> &'static mut PerCpu {
     // Signal to slab allocator that percpu is ready for CPU index lookups.
     crate::mm::slab::mark_percpu_ready();
 
-    crate::kprintln!("  percpu: BSP gs_base = {:#x}", addr);
+    crate::kdebug!("  percpu: BSP gs_base = {:#x}", addr);
     percpu
 }
 

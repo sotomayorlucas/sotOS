@@ -61,6 +61,13 @@ name = "sotos-net"
 version = "0.1.0"
 
 [[package]]
+name = "sotos-nvme"
+version = "0.1.0"
+dependencies = [
+ "sotos-common",
+]
+
+[[package]]
 name = "sotos-objstore"
 version = "0.1.0"
 dependencies = [
@@ -82,6 +89,13 @@ version = "0.1.0"
 dependencies = [
  "sotos-common",
  "sotos-pci",
+]
+
+[[package]]
+name = "sotos-xhci"
+version = "0.1.0"
+dependencies = [
+ "sotos-common",
 ]
 
 [[package]]

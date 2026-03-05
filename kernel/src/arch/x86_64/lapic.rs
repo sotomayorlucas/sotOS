@@ -149,7 +149,7 @@ pub fn calibrate() -> u32 {
 
     CALIBRATED_TICKS.store(ticks, Ordering::Relaxed);
 
-    crate::kprintln!("  lapic: calibrated {} ticks/10ms", ticks);
+    crate::kdebug!("  lapic: calibrated {} ticks/10ms", ticks);
     ticks
 }
 

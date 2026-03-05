@@ -111,6 +111,7 @@ impl ObjectStore {
         store.dir[0].name[0] = b'/';
         store.dir[0].flags = FLAG_DIR;
         store.dir[0].parent_oid = 0; // sentinel: root's parent
+        store.dir[0].permissions = DEFAULT_DIR_PERMS;
         store.dir[0].created_tick = sys::rdtsc() as u32;
         store.dir[0].modified_tick = store.dir[0].created_tick;
 
@@ -212,6 +213,7 @@ impl ObjectStore {
             store.dir[root_slot].name[0] = b'/';
             store.dir[root_slot].flags = FLAG_DIR;
             store.dir[root_slot].parent_oid = 0;
+            store.dir[root_slot].permissions = DEFAULT_DIR_PERMS;
             store.dir[root_slot].created_tick = sys::rdtsc() as u32;
             store.dir[root_slot].modified_tick = store.dir[root_slot].created_tick;
 
@@ -307,6 +309,7 @@ impl ObjectStore {
         self.dir[slot].sector_start = sector_start;
         self.dir[slot].sector_count = sector_count;
         self.dir[slot].parent_oid = parent_oid;
+        self.dir[slot].permissions = DEFAULT_FILE_PERMS;
         self.dir[slot].created_tick = sys::rdtsc() as u32;
         self.dir[slot].modified_tick = self.dir[slot].created_tick;
 
@@ -611,6 +614,7 @@ impl ObjectStore {
         self.dir[slot].name[..copy_len].copy_from_slice(&name[..copy_len]);
         self.dir[slot].flags = FLAG_DIR;
         self.dir[slot].parent_oid = parent_oid;
+        self.dir[slot].permissions = DEFAULT_DIR_PERMS;
         self.dir[slot].created_tick = sys::rdtsc() as u32;
         self.dir[slot].modified_tick = self.dir[slot].created_tick;
 

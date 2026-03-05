@@ -39,13 +39,16 @@ All core kernel primitives are implemented and tested on x86_64.
 ### Userspace Services (each in separate address space)
 - **init** — VMM server, LUCAS syscall interceptor, framebuffer console, process spawner
 - **kbd** — PS/2 keyboard driver (IRQ 1, shared ring buffer with init)
+- **xhci** — USB xHCI host controller driver (HID boot keyboard → PS/2 scancodes → KB ring)
 - **net** — Virtio-NET driver + full IP stack with IPC command interface
+- **nvme** — NVMe SSD driver (MMIO controller init, sector read/write, PCI discovery)
 - **vmm** — Demand paging server (page fault handler for init's address space)
 - **hello** — Minimal test process (spawned from userspace via spawn_process)
 - **lucas-shell** — Linux-ABI compatible shell (fork/exec/signals/FD table)
 
 ### Storage
 - Virtio-BLK driver with transactional object store (WAL, bitmap, directory)
+- NVMe SSD driver — first MMIO hardware driver (controller init, admin/IO queues, sector read/write)
 - VFS shim with file handles, read/write, stat
 
 ### Networking
@@ -77,7 +80,9 @@ All core kernel primitives are implemented and tested on x86_64.
 - Custom syscalls: DNS resolve (200), traceroute hop (201)
 - Shell builtins: ls, cat, echo, ps, uptime, kill, touch, rm, ping, wget, resolve, traceroute, uname, help
 
-### Display
+### Input / Display
+- USB xHCI keyboard driver (full device enumeration, HID boot protocol, 116+ key mapping)
+- PS/2 keyboard driver (IRQ 1, scancode set 1)
 - Framebuffer console (1024x768, VGA 8x16 font, 128x48 text grid)
 - Serial output (COM1)
 
@@ -97,6 +102,7 @@ just run-gui   # with QEMU display window (framebuffer + keyboard)
 just run-net   # with virtio-net networking (SLIRP)
 just run-smp   # with 4 CPU cores
 just run-blk   # with virtio-blk test disk
+just run-nvme  # with NVMe SSD test disk
 just debug     # with GDB server (connect: gdb -ex "target remote :1234")
 ```
 
@@ -134,10 +140,14 @@ libs/
   sotos-net/            Protocol stack (eth, arp, ip, icmp, udp, tcp, dns, dhcp)
   sotos-ld/             Userspace dynamic linker (dl_open, dl_sym, dl_close)
   sotos-testlib/        PIC test shared library for dynamic linking verification
+  sotos-nvme/           NVMe SSD driver library (MMIO regs, queues, controller, sector I/O)
+  sotos-xhci/           xHCI USB host controller library (TRBs, rings, ports, HID keyboard)
 services/
   init/                 Init process (VMM, LUCAS interceptor, framebuffer, process spawner)
   kbd/                  PS/2 keyboard driver (separate process)
+  xhci/                 USB xHCI keyboard driver (separate process)
   net/                  Network driver + protocol handler (separate process)
+  nvme/                 NVMe SSD driver (separate process)
   vmm/                  Demand paging VMM server (separate process)
   hello/                Minimal test process (spawned from userspace)
   lucas-shell/          Linux-ABI compatible shell
@@ -153,6 +163,7 @@ scripts/                Build tools (mkimage.py, mkinitrd.py, mkdisk.py, mkshare
 - **Image builder**: `scripts/mkimage.py` — pure Python GPT+FAT32 with LFN support
 - **Initrd**: `scripts/mkinitrd.py` — CPIO newc archive with all services + shared libs
 - **Shared libraries**: `scripts/mksharedlib.py` — staticlib (.a) → PIC .so conversion
+- **NVMe test disk**: `scripts/mknvmedisk.py` — 64 MiB raw disk with test marker
 
 ## Roadmap
 

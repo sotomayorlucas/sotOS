@@ -77,3 +77,12 @@ macro_rules! kprintln {
     () => ($crate::kprint!("\n"));
     ($($arg:tt)*) => ($crate::kprint!("{}\n", format_args!($($arg)*)));
 }
+
+/// Debug-only print macro — compiles to nothing without the `verbose` feature.
+#[macro_export]
+macro_rules! kdebug {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "verbose")]
+        { $crate::kprintln!($($arg)*) }
+    };
+}

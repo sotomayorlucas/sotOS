@@ -100,6 +100,14 @@ pub struct Thread {
     /// Endpoint for syscall redirection (LUCAS). When set, unknown syscalls
     /// are forwarded as IPC messages to this endpoint.
     pub redirect_ep: Option<u32>,
+    /// Total CPU ticks consumed by this thread.
+    pub cpu_ticks: u64,
+    /// CPU tick limit (0 = unlimited). Thread is killed when reached.
+    pub cpu_tick_limit: u64,
+    /// Memory pages allocated by this thread.
+    pub mem_pages: u32,
+    /// Memory page limit (0 = unlimited).
+    pub mem_page_limit: u32,
 }
 
 impl Thread {
@@ -146,6 +154,10 @@ impl Thread {
             preferred_cpu: None,
             domain_idx: None,
             redirect_ep: None,
+            cpu_ticks: 0,
+            cpu_tick_limit: 0,
+            mem_pages: 0,
+            mem_page_limit: 0,
         }
     }
 
@@ -196,6 +208,10 @@ impl Thread {
             preferred_cpu: None,
             domain_idx: None,
             redirect_ep: None,
+            cpu_ticks: 0,
+            cpu_tick_limit: 0,
+            mem_pages: 0,
+            mem_page_limit: 0,
         }
     }
 }

@@ -4,7 +4,7 @@
 //! saved register frame. Decodes rax as the syscall number and
 //! dispatches to the appropriate handler.
 
-use crate::kprintln;
+use crate::kdebug;
 use crate::arch::serial;
 use crate::arch::x86_64::io;
 use crate::arch::x86_64::syscall::TrapFrame;
@@ -98,6 +98,11 @@ const SYS_BOOTINFO_WRITE: u64 = 133;
 
 /// Syscall number — page permission change (mprotect-like).
 const SYS_PROTECT: u64 = 134;
+
+/// Syscall numbers — thread info and resource limits.
+const SYS_THREAD_INFO: u64 = 140;
+const SYS_RESOURCE_LIMIT: u64 = 141;
+const SYS_THREAD_COUNT: u64 = 142;
 
 /// Temporary syscall number for debug serial output.
 const SYS_DEBUG_PRINT: u64 = 255;
@@ -327,22 +332,31 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
 
         // SYS_FRAME_ALLOC — allocate a physical frame, return cap_id
         SYS_FRAME_ALLOC => {
-            match mm::alloc_frame() {
-                Some(f) => {
-                    // Zero the page via HHDM so physical memory is clean.
-                    let hhdm = mm::hhdm_offset();
-                    unsafe {
-                        core::ptr::write_bytes((f.addr() + hhdm) as *mut u8, 0, 4096);
-                    }
-                    match cap::insert(CapObject::Memory { base: f.addr(), size: 4096 }, Rights::ALL, None) {
-                        Some(cap_id) => frame.rax = cap_id.raw() as u64,
-                        None => {
-                            mm::free_frame(f);
-                            frame.rax = SysError::OutOfResources as i64 as u64;
+            // Check per-process memory limit.
+            if !sched::track_mem_alloc() {
+                frame.rax = SysError::OutOfResources as i64 as u64;
+            } else {
+                match mm::alloc_frame() {
+                    Some(f) => {
+                        // Zero the page via HHDM so physical memory is clean.
+                        let hhdm = mm::hhdm_offset();
+                        unsafe {
+                            core::ptr::write_bytes((f.addr() + hhdm) as *mut u8, 0, 4096);
+                        }
+                        match cap::insert(CapObject::Memory { base: f.addr(), size: 4096 }, Rights::ALL, None) {
+                            Some(cap_id) => frame.rax = cap_id.raw() as u64,
+                            None => {
+                                mm::free_frame(f);
+                                sched::track_mem_free();
+                                frame.rax = SysError::OutOfResources as i64 as u64;
+                            }
                         }
                     }
+                    None => {
+                        sched::track_mem_free();
+                        frame.rax = SysError::OutOfResources as i64 as u64;
+                    }
                 }
-                None => frame.rax = SysError::OutOfResources as i64 as u64,
             }
         }
 
@@ -369,7 +383,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
             match cap::validate(frame_cap, Rights::READ) {
                 Ok(CapObject::Memory { base: paddr, .. }) => {
                     if vaddr & 0xFFF != 0 || vaddr >= USER_ADDR_LIMIT {
-                        kprintln!("SYS_MAP: InvalidArg vaddr={:#x}", vaddr);
+                        kdebug!("SYS_MAP: InvalidArg vaddr={:#x}", vaddr);
                         frame.rax = SysError::InvalidArg as i64 as u64;
                     } else {
                         let mut flags = PAGE_PRESENT | PAGE_USER | (user_flags & USER_FLAG_MASK);
@@ -385,11 +399,11 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
                     }
                 }
                 Ok(_) => {
-                    kprintln!("SYS_MAP: cap {} is not Memory", frame_cap);
+                    kdebug!("SYS_MAP: cap {} is not Memory", frame_cap);
                     frame.rax = SysError::InvalidCap as i64 as u64;
                 }
                 Err(e) => {
-                    kprintln!("SYS_MAP: validate cap={} failed: {:?}", frame_cap, e);
+                    kdebug!("SYS_MAP: validate cap={} failed: {:?}", frame_cap, e);
                     frame.rax = e as i64 as u64;
                 }
             }
@@ -1184,6 +1198,41 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
                 Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
                 Err(e) => frame.rax = e as i64 as u64,
             }
+        }
+
+        // SYS_THREAD_INFO — get info about a thread by pool index
+        // rdi = thread pool index; returns rdi=tid, rsi=state, rdx=priority,
+        // r8=cpu_ticks, r9=mem_pages, r10=is_user
+        SYS_THREAD_INFO => {
+            let idx = frame.rdi as u32;
+            match sched::thread_info(idx) {
+                Some((tid, state, pri, ticks, mem, is_user)) => {
+                    frame.rax = 0;
+                    frame.rdi = tid as u64;
+                    frame.rsi = state as u64;
+                    frame.rdx = pri as u64;
+                    frame.r8 = ticks;
+                    frame.r9 = mem as u64;
+                    frame.r10 = if is_user { 1 } else { 0 };
+                }
+                None => frame.rax = SysError::NotFound as i64 as u64,
+            }
+        }
+
+        // SYS_RESOURCE_LIMIT — set resource limits on current thread
+        // rdi = cpu_tick_limit (0 = unlimited), rsi = mem_page_limit (0 = unlimited)
+        SYS_RESOURCE_LIMIT => {
+            if let Some(tid) = sched::current_tid() {
+                sched::set_resource_limits(tid, frame.rdi, frame.rsi as u32);
+                frame.rax = 0;
+            } else {
+                frame.rax = SysError::InvalidArg as i64 as u64;
+            }
+        }
+
+        // SYS_THREAD_COUNT — get total live thread count
+        SYS_THREAD_COUNT => {
+            frame.rax = sched::thread_count() as u64;
         }
 
         // SYS_DEBUG_PRINT — write a single byte to serial (temporary)

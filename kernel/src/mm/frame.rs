@@ -6,7 +6,7 @@
 //! The bitmap itself is placed in a usable memory region provided
 //! by the bootloader. No heap allocation required.
 
-use crate::kprintln;
+use crate::kdebug;
 use limine::memory_map::EntryType;
 use limine::response::MemoryMapResponse;
 use spin::Mutex;
@@ -191,7 +191,7 @@ pub fn init(memory_map: &MemoryMapResponse, hhdm_offset: u64) {
 
     alloc.free_frames = free_count;
 
-    kprintln!(
+    kdebug!(
         "  frames: {} total, {} free ({} MiB usable)",
         total_frames,
         free_count,
