@@ -823,9 +823,10 @@ fn load_net_process(net_data: &[u8]) {
     let hhdm = mm::hhdm_offset();
 
     // Stack for net with ASLR jitter + guard page.
+    // 16 pages (64 KiB) — VirtioNet::init + DHCP + main loop need significant stack in debug mode.
     let stack_rand = (mm::random_u64() % 16) * 0x1000;
     let stack_base: u64 = 0x900000 + stack_rand;
-    let stack_pages: u64 = 4;
+    let stack_pages: u64 = 16;
     let guard_frame = mm::alloc_frame().expect("no frame for net stack guard");
     net_as.map_page(stack_base - 0x1000, guard_frame.addr(), PAGE_PRESENT);
     for i in 0..stack_pages {

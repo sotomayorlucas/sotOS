@@ -62,6 +62,50 @@ impl UdpTable {
     pub fn is_bound(&self, port: u16) -> bool {
         self.sockets.iter().any(|s| s.active && s.local_port == port)
     }
+
+    /// Store an incoming datagram for later retrieval by `recv()`.
+    pub fn handle_rx(&mut self, dst_port: u16, src_ip: u32, src_port: u16, payload: &[u8]) {
+        if !self.is_bound(dst_port) {
+            return;
+        }
+        // Find a free slot in rx_queue
+        for slot in self.rx_queue.iter_mut() {
+            if slot.is_none() {
+                let data_len = payload.len().min(self.rx_data.len() - self.rx_data_used);
+                if data_len == 0 {
+                    return; // rx_data full
+                }
+                let offset = self.rx_data_used;
+                self.rx_data[offset..offset + data_len].copy_from_slice(&payload[..data_len]);
+                self.rx_data_used += data_len;
+                *slot = Some(UdpDatagram {
+                    src_ip,
+                    src_port,
+                    data_offset: offset,
+                    data_len,
+                });
+                return;
+            }
+        }
+        // No free slot — drop the datagram
+    }
+
+    /// Receive a pending datagram for `port`. Copies up to `buf.len()` bytes into `buf`.
+    /// Returns number of bytes copied (0 if nothing pending).
+    pub fn recv(&mut self, port: u16, buf: &mut [u8]) -> usize {
+        // We don't store dst_port in the datagram, so we accept any queued datagram
+        // if the port is bound. This works because handle_rx only queues for bound ports.
+        let _ = port;
+        for slot in self.rx_queue.iter_mut() {
+            if let Some(ref dg) = slot {
+                let copy_len = dg.data_len.min(buf.len());
+                buf[..copy_len].copy_from_slice(&self.rx_data[dg.data_offset..dg.data_offset + copy_len]);
+                *slot = None;
+                return copy_len;
+            }
+        }
+        0
+    }
 }
 
 /// Parse a UDP datagram. Returns header and payload slice.

@@ -173,7 +173,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
     // entry will overwrite percpu.user_rsp_save. This local survives the
     // context switch because it lives on the per-thread kernel stack.
     use crate::arch::x86_64::percpu;
-    let saved_user_rsp = percpu::current_percpu().user_rsp_save;
+    let mut saved_user_rsp = percpu::current_percpu().user_rsp_save;
 
     // --- LUCAS syscall redirect ---
     // If the current thread has a redirect endpoint set, forward the syscall
@@ -200,25 +200,99 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
             return;
         }
 
+        // Intercept rt_sigreturn (Linux syscall 15) — restore pre-signal context.
+        // The user stack contains a SignalFrame that was pushed during signal delivery.
+        if frame.rax == 15 {
+            // Read SignalFrame from user stack. The restorer did `ret` to reach
+            // rt_sigreturn, so RSP now points past the restorer's return address.
+            // Actually, musl's restorer is: mov $15, %eax; syscall
+            // So the user RSP is still where it was when the handler returned.
+            // The signal frame starts at saved_user_rsp (the handler's RSP on entry
+            // pointed at the SignalFrame with restorer as first field).
+            let frame_ptr = saved_user_rsp as *const u64;
+            if saved_user_rsp != 0 && saved_user_rsp < USER_ADDR_LIMIT {
+                unsafe {
+                    // SignalFrame layout: [restorer, signo, rax..r15, rip, rsp, rflags, fs_base, old_sigmask]
+                    let _restorer = core::ptr::read_volatile(frame_ptr);
+                    let _signo    = core::ptr::read_volatile(frame_ptr.add(1));
+                    frame.rax     = core::ptr::read_volatile(frame_ptr.add(2));
+                    frame.rbx     = core::ptr::read_volatile(frame_ptr.add(3));
+                    frame.rcx     = core::ptr::read_volatile(frame_ptr.add(4));  // user RIP
+                    frame.rdx     = core::ptr::read_volatile(frame_ptr.add(5));
+                    frame.rsi     = core::ptr::read_volatile(frame_ptr.add(6));
+                    frame.rdi     = core::ptr::read_volatile(frame_ptr.add(7));
+                    frame.rbp     = core::ptr::read_volatile(frame_ptr.add(8));
+                    frame.r8      = core::ptr::read_volatile(frame_ptr.add(9));
+                    frame.r9      = core::ptr::read_volatile(frame_ptr.add(10));
+                    frame.r10     = core::ptr::read_volatile(frame_ptr.add(11));
+                    frame.r11     = core::ptr::read_volatile(frame_ptr.add(12)); // user RFLAGS
+                    frame.r12     = core::ptr::read_volatile(frame_ptr.add(13));
+                    frame.r13     = core::ptr::read_volatile(frame_ptr.add(14));
+                    frame.r14     = core::ptr::read_volatile(frame_ptr.add(15));
+                    frame.r15     = core::ptr::read_volatile(frame_ptr.add(16));
+                    let rip       = core::ptr::read_volatile(frame_ptr.add(17));
+                    let rsp       = core::ptr::read_volatile(frame_ptr.add(18));
+                    let rflags    = core::ptr::read_volatile(frame_ptr.add(19));
+                    let fs_base   = core::ptr::read_volatile(frame_ptr.add(20));
+                    // let old_mask = core::ptr::read_volatile(frame_ptr.add(21));
+
+                    // Restore user RIP and RSP
+                    frame.rcx = rip;      // sysretq uses rcx as return RIP
+                    frame.r11 = rflags;   // sysretq uses r11 as return RFLAGS
+                    saved_user_rsp = rsp;
+
+                    // Restore FS_BASE (TLS)
+                    if fs_base != 0 {
+                        sched::set_current_fs_base(fs_base);
+                    }
+
+                    // Clear async signal context flag
+                    if let Some(tid) = sched::current_tid() {
+                        sched::clear_signal_ctx(tid);
+                    }
+                }
+                kdebug!("rt_sigreturn: restored context, rip={:#x} rsp={:#x}", frame.rcx, saved_user_rsp);
+            } else {
+                frame.rax = (-22i64) as u64; // -EINVAL
+            }
+            percpu::current_percpu().user_rsp_save = saved_user_rsp;
+            return;
+        }
+
+        // Save full register state before blocking in IPC redirect.
+        // LUCAS can read this via SYS_GET_THREAD_REGS for signal frame construction.
+        sched::save_current_redirect_regs(frame, saved_user_rsp);
+
         let tid = sched::current_tid().map(|t| t.0 as u64).unwrap_or(0);
         let msg = Message {
             tag: frame.rax, // Linux syscall number
-            regs: [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9, tid, 0],
+            regs: [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9, tid, saved_user_rsp],
             cap_transfer: None,
         };
         match endpoint::call(PoolHandle::from_raw(ep_raw), msg) {
             Ok(reply) => {
-                frame.rax = reply.regs[0]; // return value
-                // For SYS_read: handler returns byte data in regs[1].
-                // Write it to the user's buffer from kernel context.
-                // For SYS_read (tag=0): if handler returned inline byte
-                // data in regs[1], write it to the user buffer from kernel
-                // context as insurance (redundant with handler's write).
-                if msg.tag == 0 && reply.regs[0] > 0 {
-                    let buf_ptr = frame.rsi;
-                    let byte_count = reply.regs[0] as usize;
-                    if buf_ptr != 0 && buf_ptr < USER_ADDR_LIMIT && byte_count == 1 {
-                        unsafe { core::ptr::write_volatile(buf_ptr as *mut u8, reply.regs[1] as u8); }
+                if reply.tag == sotos_common::SIG_REDIRECT_TAG {
+                    // Signal delivery: LUCAS built a signal frame on the child's
+                    // stack and wants to redirect execution to the signal handler.
+                    frame.rcx = reply.regs[0]; // new user RIP = handler address
+                    frame.rdi = reply.regs[1] as u64; // arg0 = signal number
+                    frame.rsi = reply.regs[2]; // arg1 = &siginfo (or 0)
+                    frame.rdx = reply.regs[3]; // arg2 = &ucontext (or 0)
+                    saved_user_rsp = reply.regs[4]; // new user RSP (below signal frame)
+                    frame.rax = 0;
+                    frame.r11 = 0x202; // RFLAGS with IF=1
+                    kdebug!("SIG_REDIRECT: handler={:#x} signo={} rsp={:#x}", reply.regs[0], reply.regs[1], reply.regs[4]);
+                } else {
+                    frame.rax = reply.regs[0]; // return value
+                    // For SYS_read (tag=0): if handler returned inline byte
+                    // data in regs[1], write it to the user buffer from kernel
+                    // context as insurance (redundant with handler's write).
+                    if msg.tag == 0 && reply.regs[0] > 0 {
+                        let buf_ptr = frame.rsi;
+                        let byte_count = reply.regs[0] as usize;
+                        if buf_ptr != 0 && buf_ptr < USER_ADDR_LIMIT && byte_count == 1 {
+                            unsafe { core::ptr::write_volatile(buf_ptr as *mut u8, reply.regs[1] as u8); }
+                        }
                     }
                 }
             }
@@ -1372,6 +1446,60 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
             let hhdm = mm::hhdm_offset();
             let virt = (phys_addr + hhdm) as *const u64;
             frame.rax = unsafe { core::ptr::read_volatile(virt) };
+        }
+
+        // SYS_GET_THREAD_REGS (172) — read saved user registers of a blocked thread.
+        // Used by LUCAS for signal frame construction.
+        // rdi = thread_id, rsi = output buffer pointer (18 u64s in caller's space).
+        sotos_common::SYS_GET_THREAD_REGS => {
+            let target_tid = frame.rdi as u32;
+            let buf_ptr = frame.rsi;
+            if buf_ptr == 0 || buf_ptr >= USER_ADDR_LIMIT {
+                frame.rax = SysError::InvalidArg as i64 as u64;
+            } else {
+                match sched::get_thread_signal_regs(ThreadId(target_tid)) {
+                    Some(regs) => {
+                        let out = buf_ptr as *mut u64;
+                        unsafe {
+                            for i in 0..18 {
+                                core::ptr::write_volatile(out.add(i), regs[i]);
+                            }
+                        }
+                        frame.rax = 0;
+                    }
+                    None => {
+                        frame.rax = SysError::NotFound as i64 as u64;
+                    }
+                }
+            }
+        }
+
+        // SYS_SIGNAL_ENTRY (173) — set the async signal trampoline address for a thread.
+        // rdi = thread_cap (WRITE), rsi = trampoline address in child's address space.
+        sotos_common::SYS_SIGNAL_ENTRY => {
+            match cap::validate(frame.rdi as u32, Rights::WRITE) {
+                Ok(CapObject::Thread { id: tid }) => {
+                    sched::set_signal_trampoline(ThreadId(tid), frame.rsi);
+                    frame.rax = 0;
+                }
+                Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
+                Err(e) => frame.rax = e as i64 as u64,
+            }
+        }
+
+        // SYS_SIGNAL_INJECT (174) — inject an async signal into a thread.
+        // rdi = thread_id (raw), rsi = signal number (1..31).
+        // Sets the pending_signals bit. The timer handler will deliver it on
+        // the next return-to-user.
+        sotos_common::SYS_SIGNAL_INJECT => {
+            let target_tid = frame.rdi as u32;
+            let sig = frame.rsi;
+            if sig == 0 || sig >= 32 {
+                frame.rax = SysError::InvalidArg as i64 as u64;
+            } else {
+                sched::set_pending_signal(ThreadId(target_tid), sig);
+                frame.rax = 0;
+            }
         }
 
         // Unknown syscall

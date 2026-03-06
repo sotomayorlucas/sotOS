@@ -3,7 +3,7 @@
 //! Registers CPU exception handlers, hardware IRQ handlers (PIC),
 //! and LAPIC timer/spurious handlers.
 
-use crate::kprintln;
+use crate::{kprintln, kdebug};
 use spin::Lazy;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
@@ -136,8 +136,13 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[46].set_handler_fn(irq14_handler);
     idt[47].set_handler_fn(irq15_handler);
 
-    // LAPIC timer (vector 48)
-    idt[LAPIC_TIMER_VECTOR].set_handler_fn(lapic_timer_handler);
+    // LAPIC timer (vector 48) — custom assembly handler for async signal delivery.
+    // Uses raw handler address instead of set_handler_fn because we need full
+    // GPR access (x86-interrupt ABI doesn't expose general-purpose registers).
+    unsafe {
+        idt[LAPIC_TIMER_VECTOR]
+            .set_handler_addr(x86_64::VirtAddr::new(lapic_timer_handler_asm as *const () as u64));
+    }
 
     // Reschedule IPI (vector 49)
     idt[RESCHEDULE_VECTOR].set_handler_fn(reschedule_ipi_handler);
@@ -191,10 +196,6 @@ extern "x86-interrupt" fn page_fault_handler(
     let addr = Cr2::read_raw();
 
     if code.contains(PageFaultErrorCode::USER_MODE) {
-        kprintln!(
-            "PF: addr={:#x} code={:?} rip={:#x}",
-            addr, code, frame.instruction_pointer.as_u64()
-        );
         let tid = crate::sched::current_tid().map(|t| t.0).unwrap_or(0);
         let cr3 = crate::mm::paging::read_cr3();
         if crate::fault::push_fault(tid, addr, code.bits(), cr3) {
@@ -263,8 +264,153 @@ extern "x86-interrupt" fn pit_timer_handler(_frame: InterruptStackFrame) {
     crate::sched::tick();
 }
 
-/// LAPIC timer handler (vector 48). Per-CPU preemption timer.
-extern "x86-interrupt" fn lapic_timer_handler(_frame: InterruptStackFrame) {
+// ---------------------------------------------------------------------------
+// Custom LAPIC timer handler — assembly entry + Rust handlers
+// ---------------------------------------------------------------------------
+//
+// The default x86-interrupt ABI doesn't expose general-purpose registers.
+// For async signal delivery, the kernel needs to save ALL user GPRs when
+// interrupting a user-mode thread, so we use a custom assembly entry point.
+//
+// Stack layout after CPU pushes interrupt frame:
+//   [rsp+0]  = RIP       (return address)
+//   [rsp+8]  = CS        (code segment, & 3 = CPL)
+//   [rsp+16] = RFLAGS
+//   [rsp+24] = RSP       (user stack pointer)
+//   [rsp+32] = SS        (stack segment)
+
+extern "C" {
+    fn lapic_timer_handler_asm();
+}
+
+core::arch::global_asm!(
+    ".global lapic_timer_handler_asm",
+    "lapic_timer_handler_asm:",
+    // Check if interrupted from user mode (CS & 3)
+    "    test qword ptr [rsp + 8], 3",
+    "    jz 2f",
+
+    // === User mode interrupt: save all 15 GPRs ===
+    "    push r15",
+    "    push r14",
+    "    push r13",
+    "    push r12",
+    "    push r11",
+    "    push r10",
+    "    push r9",
+    "    push r8",
+    "    push rbp",
+    "    push rdi",
+    "    push rsi",
+    "    push rdx",
+    "    push rcx",
+    "    push rbx",
+    "    push rax",
+
+    // Call Rust handler:
+    //   rdi = pointer to saved GPRs (15 u64s at rsp)
+    //   rsi = pointer to interrupt frame (15*8 = 120 bytes above rsp)
+    "    mov rdi, rsp",
+    "    lea rsi, [rsp + 120]",
+    "    call lapic_timer_user_handler",
+
+    // Restore all GPRs (Rust handler may have modified the interrupt frame)
+    "    pop rax",
+    "    pop rbx",
+    "    pop rcx",
+    "    pop rdx",
+    "    pop rsi",
+    "    pop rdi",
+    "    pop rbp",
+    "    pop r8",
+    "    pop r9",
+    "    pop r10",
+    "    pop r11",
+    "    pop r12",
+    "    pop r13",
+    "    pop r14",
+    "    pop r15",
+    "    iretq",
+
+    // === Kernel mode interrupt: save caller-saved regs, call tick ===
+    "2:",
+    "    push rax",
+    "    push rcx",
+    "    push rdx",
+    "    push rdi",
+    "    push rsi",
+    "    push r8",
+    "    push r9",
+    "    push r10",
+    "    push r11",
+    "    call lapic_timer_kernel_handler",
+    "    pop r11",
+    "    pop r10",
+    "    pop r9",
+    "    pop r8",
+    "    pop rsi",
+    "    pop rdi",
+    "    pop rdx",
+    "    pop rcx",
+    "    pop rax",
+    "    iretq",
+);
+
+/// Rust handler for user-mode LAPIC timer interrupts.
+/// Called from assembly with full GPR access.
+///
+/// `gprs`: pointer to 15 saved GPRs [rax,rbx,rcx,rdx,rsi,rdi,rbp,r8..r15]
+/// `iframe`: pointer to interrupt frame [rip,cs,rflags,rsp,ss]
+#[no_mangle]
+extern "C" fn lapic_timer_user_handler(gprs: *mut u64, iframe: *mut u64) {
+    lapic::eoi();
+
+    // Check if current thread has pending async signals
+    let percpu = super::percpu::current_percpu();
+    let idx = percpu.current_thread;
+
+    if idx != usize::MAX {
+        let pending = crate::sched::get_pending_signals_by_idx(idx as u32);
+        let tramp = crate::sched::get_signal_trampoline_by_idx(idx as u32);
+
+        if pending != 0 && tramp != 0 {
+            let sig = pending.trailing_zeros() as u64;
+
+            unsafe {
+                // Read original user state from the interrupt frame
+                let original_rip    = *iframe;
+                let original_rsp    = *iframe.add(3);
+                let original_rflags = *iframe.add(2);
+
+                // Build the full saved GPR array
+                let mut saved_gprs = [0u64; 15];
+                for i in 0..15 {
+                    saved_gprs[i] = *gprs.add(i);
+                }
+
+                // Save complete pre-interrupt context into the thread struct
+                crate::sched::save_signal_context_current(
+                    &saved_gprs, original_rip, original_rsp, original_rflags,
+                );
+
+                // Clear the pending signal bit
+                crate::sched::clear_pending_signal_by_idx(idx as u32, sig);
+
+                // Redirect to signal trampoline by modifying the interrupt frame.
+                // GPRs stay the same — trampoline runs with user's original registers.
+                *iframe = tramp;  // RIP = trampoline address
+                // RSP, RFLAGS, CS, SS unchanged
+            }
+        }
+    }
+
+    crate::sched::tick();
+}
+
+/// Rust handler for kernel-mode LAPIC timer interrupts.
+/// Simple: EOI + scheduler tick.
+#[no_mangle]
+extern "C" fn lapic_timer_kernel_handler() {
     lapic::eoi();
     crate::sched::tick();
 }

@@ -135,6 +135,31 @@ pub struct Thread {
     /// FS segment base (IA32_FS_BASE MSR) for TLS support.
     /// Set by arch_prctl(ARCH_SET_FS) or SYS_SET_FSBASE syscall.
     pub fs_base: u64,
+
+    // --- Signal delivery support ---
+
+    /// Saved user-mode register state from the last syscall redirect.
+    /// Layout: [rax, rbx, rcx, rdx, rsi, rdi, rbp, r8, r9, r10, r11, r12, r13, r14, r15, rsp, rip_placeholder, rflags_placeholder]
+    /// rcx = user RIP (saved by SYSCALL), r11 = user RFLAGS (saved by SYSCALL),
+    /// rsp = user RSP (from percpu). 16 TrapFrame regs + user_rsp + fs_base.
+    pub redirect_saved_regs: [u64; 18],
+
+    /// Saved user-mode context for async signal delivery (from timer interrupt).
+    /// Same layout as redirect_saved_regs but set by the timer handler.
+    /// Only valid when `signal_ctx_valid` is true.
+    pub signal_saved_regs: [u64; 18],
+
+    /// Whether signal_saved_regs contains valid pre-interrupt context.
+    pub signal_ctx_valid: bool,
+
+    /// Async signal trampoline address in the child's user address space.
+    /// Set by LUCAS via SYS_SIGNAL_ENTRY. The kernel redirects to this
+    /// address when delivering an async signal from a timer interrupt.
+    pub signal_trampoline: u64,
+
+    /// Pending async signals bitmask (set by SYS_SIGNAL_INJECT).
+    /// Checked by the timer interrupt handler on return-to-user.
+    pub pending_signals: u64,
 }
 
 impl Thread {
@@ -191,6 +216,11 @@ impl Thread {
             ipc_timeout: 0,
             ipc_timed_out: false,
             fs_base: 0,
+            redirect_saved_regs: [0; 18],
+            signal_saved_regs: [0; 18],
+            signal_ctx_valid: false,
+            signal_trampoline: 0,
+            pending_signals: 0,
         }
     }
 
@@ -251,6 +281,11 @@ impl Thread {
             ipc_timeout: 0,
             ipc_timed_out: false,
             fs_base: 0,
+            redirect_saved_regs: [0; 18],
+            signal_saved_regs: [0; 18],
+            signal_ctx_valid: false,
+            signal_trampoline: 0,
+            pending_signals: 0,
         }
     }
 }

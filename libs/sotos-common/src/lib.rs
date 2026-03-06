@@ -7,6 +7,7 @@
 #![no_std]
 
 pub mod elf;
+pub mod linux_abi;
 pub mod spsc;
 pub mod typed_channel;
 
@@ -273,6 +274,73 @@ pub struct FaultInfo {
     /// CR3 of the faulting address space (0 if not provided).
     pub cr3: u64,
 }
+
+// ---------------------------------------------------------------
+// Signal delivery (true async signals)
+// ---------------------------------------------------------------
+
+/// Magic tag in IPC reply that tells the kernel to redirect the child
+/// thread to a signal handler instead of returning normally from the syscall.
+pub const SIG_REDIRECT_TAG: u64 = 0x5349_4700; // "SIG\0"
+
+/// Signal frame pushed onto the user stack during signal delivery.
+/// Both the kernel (rt_sigreturn) and LUCAS (frame construction) use
+/// this layout. 22 × 8 = 176 bytes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SignalFrame {
+    /// Return address: sa_restorer (which calls rt_sigreturn).
+    pub restorer: u64,
+    /// Signal number being delivered.
+    pub signo: u64,
+    /// Saved general-purpose registers (for rt_sigreturn restoration).
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    /// Saved user RIP (instruction pointer before signal).
+    pub rip: u64,
+    /// Saved user RSP (stack pointer before signal).
+    pub rsp: u64,
+    /// Saved RFLAGS.
+    pub rflags: u64,
+    /// Saved FS_BASE (TLS pointer).
+    pub fs_base: u64,
+    /// Signal mask to restore on rt_sigreturn.
+    pub old_sigmask: u64,
+}
+
+/// Size of SignalFrame in bytes.
+pub const SIGNAL_FRAME_SIZE: usize = core::mem::size_of::<SignalFrame>();
+
+/// Syscall number for reading a blocked thread's saved registers.
+/// Called by LUCAS: rdi = thread_id → writes 18 u64s to rsi buffer.
+pub const SYS_GET_THREAD_REGS: u64 = 172;
+
+/// Syscall number for setting a thread's async signal trampoline address.
+/// Called by LUCAS: rdi = thread_id, rsi = trampoline_addr.
+pub const SYS_SIGNAL_ENTRY: u64 = 173;
+
+/// Syscall number for injecting an async signal into a thread.
+/// Called by LUCAS: rdi = thread_id, rsi = signal_number.
+pub const SYS_SIGNAL_INJECT: u64 = 174;
+
+/// Special syscall number used by the async signal trampoline.
+/// When the kernel redirects a user thread to the signal trampoline (from
+/// timer interrupt), the trampoline calls this syscall which gets redirected
+/// to LUCAS for signal frame construction.
+pub const SYS_SIGNAL_TRAMPOLINE: u64 = 0x7F00;
 
 /// Raw syscall wrappers for userspace programs.
 ///
@@ -1038,5 +1106,31 @@ pub mod sys {
     #[inline(always)]
     pub fn debug_phys_read(phys_addr: u64) -> u64 {
         syscall1(254, phys_addr)
+    }
+
+    // ---------------------------------------------------------------
+    // Signal delivery support
+    // ---------------------------------------------------------------
+
+    /// Read saved user-mode registers of a blocked thread (for signal frame construction).
+    /// Writes 18 u64s to `out_buf`: [rax,rbx,rcx,rdx,rsi,rdi,rbp,r8..r15,rsp,fs_base,rflags].
+    #[inline(always)]
+    pub fn get_thread_regs(tid: u64, out_buf: &mut [u64; 18]) -> Result<(), i64> {
+        let ret = syscall2(super::SYS_GET_THREAD_REGS, tid, out_buf.as_mut_ptr() as u64);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
+    /// Set the async signal trampoline address for a thread.
+    #[inline(always)]
+    pub fn signal_entry(tid: u64, trampoline_addr: u64) -> Result<(), i64> {
+        let ret = syscall2(super::SYS_SIGNAL_ENTRY, tid, trampoline_addr);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
+    /// Inject an async signal into a thread (sets pending bit).
+    #[inline(always)]
+    pub fn signal_inject(tid: u64, sig: u64) -> Result<(), i64> {
+        let ret = syscall2(super::SYS_SIGNAL_INJECT, tid, sig);
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
     }
 }

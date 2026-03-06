@@ -396,6 +396,11 @@ pub fn init() {
         ipc_timeout: 0,
         ipc_timed_out: false,
         fs_base: 0,
+        redirect_saved_regs: [0; 18],
+        signal_saved_regs: [0; 18],
+        signal_ctx_valid: false,
+        signal_trampoline: 0,
+        pending_signals: 0,
     };
     let tid = ThreadId(sched.next_id);
     let handle = sched.threads.alloc(idle);
@@ -442,6 +447,11 @@ pub fn create_idle_thread() -> usize {
         ipc_timeout: 0,
         ipc_timed_out: false,
         fs_base: 0,
+        redirect_saved_regs: [0; 18],
+        signal_saved_regs: [0; 18],
+        signal_ctx_valid: false,
+        signal_trampoline: 0,
+        pending_signals: 0,
     };
     let handle = sched.threads.alloc(idle);
     let slot = handle.index();
@@ -849,6 +859,152 @@ pub fn get_current_fs_base() -> u64 {
         }
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// Signal delivery support
+// ---------------------------------------------------------------------------
+
+use crate::arch::x86_64::syscall::TrapFrame;
+
+/// Save the current thread's full register state during a syscall redirect.
+/// Called in syscall_dispatch before endpoint::call() so LUCAS can later
+/// read the registers via SYS_GET_THREAD_REGS.
+pub fn save_current_redirect_regs(frame: &TrapFrame, user_rsp: u64) {
+    let percpu = percpu::current_percpu();
+    let idx = percpu.current_thread;
+    if idx == usize::MAX { return; }
+    let mut sched = SCHEDULER.lock();
+    if let Some(t) = sched.threads.get_mut_by_index(idx as u32) {
+        t.redirect_saved_regs = [
+            frame.rax, frame.rbx, frame.rcx, frame.rdx,
+            frame.rsi, frame.rdi, frame.rbp, frame.r8,
+            frame.r9,  frame.r10, frame.r11, frame.r12,
+            frame.r13, frame.r14, frame.r15, user_rsp,
+            t.fs_base, 0,
+        ];
+    }
+}
+
+/// Read the saved redirect registers for a given thread (by tid).
+/// Returns [rax,rbx,rcx,rdx,rsi,rdi,rbp,r8..r15,rsp,fs_base,0] or None.
+pub fn get_thread_redirect_regs(tid: ThreadId) -> Option<[u64; 18]> {
+    let sched = SCHEDULER.lock();
+    if let Some(slot) = sched.slot_of(tid) {
+        if let Some(t) = sched.threads.get_by_index(slot) {
+            return Some(t.redirect_saved_regs);
+        }
+    }
+    None
+}
+
+/// Read the saved async signal context for a given thread (by tid).
+/// Falls back to redirect_saved_regs if no async context is available.
+pub fn get_thread_signal_regs(tid: ThreadId) -> Option<[u64; 18]> {
+    let sched = SCHEDULER.lock();
+    if let Some(slot) = sched.slot_of(tid) {
+        if let Some(t) = sched.threads.get_by_index(slot) {
+            if t.signal_ctx_valid {
+                return Some(t.signal_saved_regs);
+            }
+            return Some(t.redirect_saved_regs);
+        }
+    }
+    None
+}
+
+/// Clear the signal_ctx_valid flag after LUCAS has consumed the async context.
+pub fn clear_signal_ctx(tid: ThreadId) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(slot) = sched.slot_of(tid) {
+        if let Some(t) = sched.threads.get_mut_by_index(slot) {
+            t.signal_ctx_valid = false;
+        }
+    }
+}
+
+/// Set the signal trampoline address for a thread.
+pub fn set_signal_trampoline(tid: ThreadId, addr: u64) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(slot) = sched.slot_of(tid) {
+        if let Some(t) = sched.threads.get_mut_by_index(slot) {
+            t.signal_trampoline = addr;
+        }
+    }
+}
+
+/// Get the signal trampoline address for a thread.
+pub fn get_signal_trampoline_by_idx(idx: u32) -> u64 {
+    let sched = SCHEDULER.lock();
+    if let Some(t) = sched.threads.get_by_index(idx) {
+        t.signal_trampoline
+    } else {
+        0
+    }
+}
+
+/// Set a pending signal bit on a thread.
+pub fn set_pending_signal(tid: ThreadId, sig: u64) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(slot) = sched.slot_of(tid) {
+        if let Some(t) = sched.threads.get_mut_by_index(slot) {
+            t.pending_signals |= 1 << sig;
+        }
+    }
+}
+
+/// Get pending signals for a thread (by pool index).
+pub fn get_pending_signals_by_idx(idx: u32) -> u64 {
+    let sched = SCHEDULER.lock();
+    if let Some(t) = sched.threads.get_by_index(idx) {
+        t.pending_signals
+    } else {
+        0
+    }
+}
+
+/// Clear a pending signal bit for a thread (by pool index).
+pub fn clear_pending_signal_by_idx(idx: u32, sig: u64) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(t) = sched.threads.get_mut_by_index(idx) {
+        t.pending_signals &= !(1 << sig);
+    }
+}
+
+/// Save the async signal context (from timer interrupt) for the current thread.
+/// Called from the custom timer handler when redirecting a user thread.
+pub fn save_signal_context_current(gprs: &[u64; 15], rip: u64, rsp: u64, rflags: u64) {
+    let percpu = percpu::current_percpu();
+    let idx = percpu.current_thread;
+    if idx == usize::MAX { return; }
+    let mut sched = SCHEDULER.lock();
+    if let Some(t) = sched.threads.get_mut_by_index(idx as u32) {
+        t.signal_saved_regs = [
+            gprs[0],  gprs[1],  gprs[2],  gprs[3],   // rax, rbx, rcx, rdx
+            gprs[4],  gprs[5],  gprs[6],  gprs[7],   // rsi, rdi, rbp, r8
+            gprs[8],  gprs[9],  gprs[10], gprs[11],  // r9, r10, r11, r12
+            gprs[12], gprs[13], gprs[14], rsp,        // r13, r14, r15, rsp
+            t.fs_base, rflags,
+        ];
+        // Overwrite rcx/r11 with the actual user RIP/RFLAGS from interrupt frame
+        // (for interrupts, RCX and R11 are NOT set by the CPU like they are for SYSCALL)
+        t.signal_saved_regs[2] = rip;    // store real user RIP in rcx slot
+        t.signal_saved_regs[10] = rflags; // store real RFLAGS in r11 slot
+        t.signal_ctx_valid = true;
+    }
+}
+
+/// Check if current thread is a user thread (for timer handler).
+pub fn is_current_user_thread() -> bool {
+    let percpu = percpu::current_percpu();
+    let idx = percpu.current_thread;
+    if idx == usize::MAX { return false; }
+    let sched = SCHEDULER.lock();
+    if let Some(t) = sched.threads.get_by_index(idx as u32) {
+        t.is_user
+    } else {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
