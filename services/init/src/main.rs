@@ -199,6 +199,9 @@ pub extern "C" fn _start() -> ! {
     // --- Phase 7.7: dynamically-linked binary test ---
     run_dynamic_test();
 
+    // --- Phase 7.8: Busybox auto-test (argv validation) ---
+    run_busybox_test();
+
     // --- Phase 8: LUCAS shell (LAST — interactive, takes over serial+framebuffer) ---
     start_lucas(blk);
 
@@ -1443,6 +1446,518 @@ fn run_dynamic_test() {
     }
 
     print(b"DYNAMIC-TEST: complete\n");
+}
+
+/// Run busybox with argv to validate argv passing and discover needed syscalls.
+fn run_busybox_test() {
+    print(b"BUSYBOX-TEST: loading...\n");
+
+    while EXEC_LOCK.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        sys::yield_now();
+    }
+
+    // argv = ["wget", "http://example.com", "-O", "-"] — HTTP GET to stdout
+    let mut argv = [[0u8; MAX_EXEC_ARG_LEN]; 4];
+    argv[0][..4].copy_from_slice(b"wget");
+    argv[1][..18].copy_from_slice(b"http://example.com");
+    argv[2][..2].copy_from_slice(b"-O");
+    argv[3][..1].copy_from_slice(b"-");
+    print(b"BUSYBOX-TEST: argv built, calling exec_from_initrd_argv\n");
+
+    let ep_cap = match exec_from_initrd_argv(b"busybox", &argv) {
+        Ok((ep, _tc)) => {
+            EXEC_LOCK.store(0, Ordering::Release);
+            ep
+        }
+        Err(e) => {
+            EXEC_LOCK.store(0, Ordering::Release);
+            print(b"BUSYBOX-TEST: failed to load (errno=");
+            print_u64((-e) as u64);
+            print(b")\n");
+            return;
+        }
+    };
+
+    print(b"BUSYBOX-TEST: running...\n");
+
+    let mut current_brk: u64 = BRK_BASE;
+    let mut mmap_next: u64 = MMAP_BASE;
+    // FD tracking: kind 0=free, 1=TCP, 2=UDP, 3=resolv.conf, 10=stdio
+    let mut bb_fd_kind = [0u8; 16];
+    let mut bb_fd_conn = [0u64; 16];
+    let mut bb_fd_pos = [0usize; 16];
+    let mut bb_fd_port = [0u16; 16]; // bound port for UDP sockets
+    bb_fd_kind[0] = 10; bb_fd_kind[1] = 10; bb_fd_kind[2] = 10;
+
+    loop {
+        let msg = match sys::recv(ep_cap) {
+            Ok(m) => m,
+            Err(_) => break,
+        };
+
+        let nr = msg.tag;
+        match nr {
+            // write(fd, buf, len)
+            1 => {
+                let fd = msg.regs[0] as usize;
+                let buf_ptr = msg.regs[1];
+                let len = msg.regs[2] as usize;
+                if fd < 16 && bb_fd_kind[fd] == 1 {
+                    // TCP socket write
+                    // Net CMD_TCP_SEND: regs[0]=conn_id, regs[1]=unused, regs[2]=data_len, regs[3..]=data
+                    let net_cap = NET_EP_CAP.load(Ordering::Acquire);
+                    if net_cap == 0 { reply_val(ep_cap, -111); continue; }
+                    let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
+                    let mut sent = 0;
+                    while sent < len {
+                        let chunk = (len - sent).min(40);
+                        let mut dregs = [0u64; 5];
+                        for k in 0..chunk { dregs[k / 8] |= (data[sent + k] as u64) << ((k % 8) * 8); }
+                        let send_msg = sotos_common::IpcMsg {
+                            tag: NET_CMD_TCP_SEND,
+                            regs: [bb_fd_conn[fd], 0, chunk as u64, dregs[0], dregs[1], dregs[2], dregs[3], dregs[4]],
+                        };
+                        let _ = sys::call(net_cap, &send_msg);
+                        sent += chunk;
+                    }
+                    reply_val(ep_cap, len as i64);
+                } else {
+                    // stdout/stderr — print to serial
+                    let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
+                    for &b in data { sys::debug_print(b); }
+                    reply_val(ep_cap, len as i64);
+                }
+            }
+            20 => {
+                // writev
+                let fd = msg.regs[0] as usize;
+                let iov_ptr = msg.regs[1];
+                let iovcnt = msg.regs[2] as usize;
+                let mut total = 0usize;
+                let is_tcp = fd < 16 && bb_fd_kind[fd] == 1;
+                for i in 0..iovcnt.min(16) {
+                    let iov = unsafe { &*((iov_ptr + i as u64 * 16) as *const [u64; 2]) };
+                    let base = iov[0];
+                    let len = (iov[1] as usize).min(4096);
+                    if base != 0 && len > 0 {
+                        if is_tcp {
+                            // Send via TCP
+                            let net_cap = NET_EP_CAP.load(Ordering::Acquire);
+                            if net_cap != 0 {
+                                let data = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
+                                let mut sent = 0;
+                                while sent < len {
+                                    let chunk = (len - sent).min(40);
+                                    let mut dregs = [0u64; 5];
+                                    for k in 0..chunk { dregs[k / 8] |= (data[sent + k] as u64) << ((k % 8) * 8); }
+                                    let send_msg = sotos_common::IpcMsg {
+                                        tag: NET_CMD_TCP_SEND,
+                                        regs: [bb_fd_conn[fd], 0, chunk as u64, dregs[0], dregs[1], dregs[2], dregs[3], dregs[4]],
+                                    };
+                                    let _ = sys::call(net_cap, &send_msg);
+                                    sent += chunk;
+                                }
+                            }
+                        } else if fd == 1 || fd == 2 {
+                            let data = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
+                            for &b in data { sys::debug_print(b); }
+                        }
+                        total += len;
+                    }
+                }
+                reply_val(ep_cap, total as i64);
+            }
+            // arch_prctl
+            158 => reply_val(ep_cap, 0),
+            // set_tid_address
+            218 => reply_val(ep_cap, 999),
+            // brk
+            12 => {
+                let addr = msg.regs[0];
+                if addr == 0 || addr <= current_brk {
+                    reply_val(ep_cap, current_brk as i64);
+                } else {
+                    let new_brk = (addr + 0xFFF) & !0xFFF;
+                    let mut pg = (current_brk + 0xFFF) & !0xFFF;
+                    while pg < new_brk {
+                        if let Ok(f) = sys::frame_alloc() {
+                            let _ = sys::map(pg, f, MAP_WRITABLE);
+                        }
+                        pg += 0x1000;
+                    }
+                    current_brk = new_brk;
+                    reply_val(ep_cap, current_brk as i64);
+                }
+            }
+            // mmap
+            9 => {
+                let len = msg.regs[1];
+                let pages = ((len + 0xFFF) & !0xFFF) / 0x1000;
+                let base = mmap_next;
+                for p in 0..pages {
+                    if let Ok(f) = sys::frame_alloc() {
+                        let _ = sys::map(base + p * 0x1000, f, MAP_WRITABLE);
+                    }
+                }
+                mmap_next += pages * 0x1000;
+                reply_val(ep_cap, base as i64);
+            }
+            // munmap / mprotect / madvise
+            11 | 10 | 28 => reply_val(ep_cap, 0),
+            // read(fd, buf, len)
+            0 => {
+                let fd = msg.regs[0] as usize;
+                let buf = msg.regs[1];
+                let len = msg.regs[2] as usize;
+                if fd < 16 && bb_fd_kind[fd] == 1 {
+                    // TCP socket read — assemble multiple 64-byte IPC chunks
+                    let net_cap = NET_EP_CAP.load(Ordering::Acquire);
+                    if net_cap == 0 { reply_val(ep_cap, -11); continue; }
+                    let mut total_got = 0usize;
+                    let mut empty_retries = 0usize;
+                    while total_got < len && empty_retries < 500 {
+                        let want = (len - total_got).min(64);
+                        let recv_msg = sotos_common::IpcMsg { tag: NET_CMD_TCP_RECV, regs: [bb_fd_conn[fd], want as u64, 0, 0, 0, 0, 0, 0] };
+                        if let Ok(resp) = sys::call(net_cap, &recv_msg) {
+                            let rlen = resp.tag as usize;
+                            if rlen > 0 {
+                                let copy_len = rlen.min(want);
+                                unsafe {
+                                    let dst = (buf + total_got as u64) as *mut u8;
+                                    for k in 0..copy_len { *dst.add(k) = resp.regs[k / 8].to_le_bytes()[k % 8]; }
+                                }
+                                total_got += copy_len;
+                                empty_retries = 0;
+                                // If we got less than requested, the buffer is drained for now
+                                if copy_len < want { break; }
+                            } else {
+                                if total_got > 0 { break; } // return what we have
+                                empty_retries += 1;
+                                sys::yield_now();
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    reply_val(ep_cap, total_got as i64);
+                } else if fd < 16 && bb_fd_kind[fd] == 3 {
+                    // resolv.conf virtual file
+                    let content = b"nameserver 10.0.2.3\n";
+                    let pos = bb_fd_pos[fd];
+                    if pos >= content.len() {
+                        reply_val(ep_cap, 0); // EOF
+                    } else {
+                        let avail = content.len() - pos;
+                        let copy_len = avail.min(len);
+                        unsafe { core::ptr::copy_nonoverlapping(content.as_ptr().add(pos), buf as *mut u8, copy_len); }
+                        bb_fd_pos[fd] += copy_len;
+                        reply_val(ep_cap, copy_len as i64);
+                    }
+                } else {
+                    reply_val(ep_cap, 0); // EOF for non-socket reads
+                }
+            }
+            // getpid / gettid / getuid / getgid / geteuid / getegid / setuid / setgid / setgroups
+            39 | 186 | 102 | 104 | 107 | 108 | 105 | 106 | 116 => reply_val(ep_cap, 0),
+            // rt_sigaction / rt_sigprocmask / sigaltstack
+            13 | 14 | 131 => reply_val(ep_cap, 0),
+            // ioctl
+            16 => reply_val(ep_cap, -25), // -ENOTTY
+            // stat(path, buf) / lstat
+            4 | 6 => reply_val(ep_cap, -2), // -ENOENT
+            // fstat(fd, buf)
+            5 => {
+                let stat_ptr = msg.regs[1];
+                // Minimal stat: zero everything
+                unsafe { core::ptr::write_bytes(stat_ptr as *mut u8, 0, 144); }
+                reply_val(ep_cap, 0);
+            }
+            // fcntl
+            72 => reply_val(ep_cap, 0),
+            // dup2
+            33 => {
+                let oldfd = msg.regs[0] as usize;
+                let newfd = msg.regs[1] as usize;
+                if newfd < 16 {
+                    bb_fd_kind[newfd] = bb_fd_kind.get(oldfd).copied().unwrap_or(0);
+                    bb_fd_conn[newfd] = bb_fd_conn.get(oldfd).copied().unwrap_or(0);
+                }
+                reply_val(ep_cap, newfd as i64);
+            }
+            // open(path, flags) / openat(dirfd, path, flags, mode)
+            2 | 257 => {
+                let path_ptr = if nr == 257 { msg.regs[1] } else { msg.regs[0] };
+                let mut path = [0u8; 48];
+                let plen = copy_guest_path(path_ptr, &mut path);
+                let name = &path[..plen];
+                if name == b"/etc/resolv.conf" {
+                    // Return a fake FD with resolv.conf content
+                    let mut slot = 0;
+                    for i in 3..16 { if bb_fd_kind[i] == 0 { slot = i; break; } }
+                    if slot > 0 {
+                        bb_fd_kind[slot] = 3; // resolv.conf virtual FD
+                        bb_fd_pos[slot] = 0;
+                        reply_val(ep_cap, slot as i64);
+                    } else {
+                        reply_val(ep_cap, -24);
+                    }
+                } else {
+                    reply_val(ep_cap, -2); // -ENOENT
+                }
+            }
+            // close
+            3 => {
+                let fd = msg.regs[0] as usize;
+                if fd < 16 {
+                    if bb_fd_kind[fd] == 1 {
+                        // TCP close
+                        let net_cap = NET_EP_CAP.load(Ordering::Acquire);
+                        if net_cap != 0 {
+                            let close_msg = sotos_common::IpcMsg { tag: NET_CMD_TCP_CLOSE, regs: [bb_fd_conn[fd], 0, 0, 0, 0, 0, 0, 0] };
+                            let _ = sys::call(net_cap, &close_msg);
+                        }
+                    }
+                    bb_fd_kind[fd] = 0;
+                    bb_fd_conn[fd] = 0;
+                }
+                reply_val(ep_cap, 0);
+            }
+            // socket(domain, type, protocol)
+            41 => {
+                let sock_type = msg.regs[1];
+                let mut slot = 0;
+                for i in 3..16 { if bb_fd_kind[i] == 0 { slot = i; break; } }
+                if slot > 0 {
+                    bb_fd_kind[slot] = if sock_type & 0xFF == 1 { 1 } else { 2 }; // 1=TCP, 2=UDP
+                    reply_val(ep_cap, slot as i64);
+                } else {
+                    reply_val(ep_cap, -24);
+                }
+            }
+            // connect(fd, addr, addrlen)
+            42 => {
+                let fd = msg.regs[0] as usize;
+                let addr_ptr = msg.regs[1];
+                // Parse sockaddr_in: family(2), port(2), ip(4)
+                let (port, ip) = unsafe {
+                    let sa = addr_ptr as *const u8;
+                    let port = (*sa.add(2) as u16) << 8 | *sa.add(3) as u16;
+                    let ip = (*sa.add(4) as u32) << 24 | (*sa.add(5) as u32) << 16
+                           | (*sa.add(6) as u32) << 8 | *sa.add(7) as u32;
+                    (port, ip)
+                };
+                if fd < 16 && bb_fd_kind[fd] == 1 {
+                    // TCP connect
+                    let net_cap = NET_EP_CAP.load(Ordering::Acquire);
+                    if net_cap == 0 { reply_val(ep_cap, -111); continue; }
+                    let conn_msg = sotos_common::IpcMsg { tag: NET_CMD_TCP_CONNECT, regs: [ip as u64, port as u64, 0, 0, 0, 0, 0, 0] };
+                    if let Ok(resp) = sys::call(net_cap, &conn_msg) {
+                        let conn_id = resp.regs[0];
+                        if conn_id != 0 && conn_id != u64::MAX {
+                            bb_fd_conn[fd] = conn_id;
+                            reply_val(ep_cap, 0);
+                        } else {
+                            reply_val(ep_cap, -111); // -ECONNREFUSED
+                        }
+                    } else {
+                        reply_val(ep_cap, -111);
+                    }
+                } else if fd < 16 && bb_fd_kind[fd] == 2 {
+                    // UDP "connect" — store remote addr
+                    bb_fd_conn[fd] = ((ip as u64) << 16) | port as u64;
+                    reply_val(ep_cap, 0);
+                } else {
+                    reply_val(ep_cap, -9);
+                }
+            }
+            // sendto(fd, buf, len, flags, dest_addr, addrlen)
+            44 => {
+                let fd = msg.regs[0] as usize;
+                let buf_ptr = msg.regs[1];
+                let len = msg.regs[2] as usize;
+                let dest_ptr = msg.regs[4];
+                if fd < 16 && bb_fd_kind[fd] == 2 {
+                    let (dst_port, dst_ip) = if dest_ptr != 0 {
+                        unsafe {
+                            let sa = dest_ptr as *const u8;
+                            let port = (*sa.add(2) as u16) << 8 | *sa.add(3) as u16;
+                            let ip = (*sa.add(4) as u32) << 24 | (*sa.add(5) as u32) << 16
+                                   | (*sa.add(6) as u32) << 8 | *sa.add(7) as u32;
+                            (port, ip)
+                        }
+                    } else {
+                        let stored = bb_fd_conn[fd];
+                        ((stored & 0xFFFF) as u16, (stored >> 16) as u32)
+                    };
+                    let src_port = bb_fd_port[fd];
+                    let net_cap = NET_EP_CAP.load(Ordering::Acquire);
+                    if net_cap == 0 { reply_val(ep_cap, -111); continue; }
+                    // Net service CMD_UDP_SENDTO layout:
+                    // regs[0]=dst_ip, regs[1]=dst_port, regs[2]=src_port, regs[3]=data_len, regs[4..]=data
+                    // IPC handler copies from regs[4..] into IPC_DATA_BUF, length from regs[3]
+                    let copy_len = len.min(32); // max 32 bytes inline (4 regs)
+                    let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, copy_len) };
+                    let mut dregs = [0u64; 4];
+                    for k in 0..copy_len { dregs[k / 8] |= (data[k] as u64) << ((k % 8) * 8); }
+                    let send_msg = sotos_common::IpcMsg {
+                        tag: NET_CMD_UDP_SENDTO,
+                        regs: [dst_ip as u64, dst_port as u64, src_port as u64, copy_len as u64, dregs[0], dregs[1], dregs[2], dregs[3]],
+                    };
+                    let _ = sys::call(net_cap, &send_msg);
+                    reply_val(ep_cap, len as i64);
+                } else {
+                    reply_val(ep_cap, -9);
+                }
+            }
+            // recvfrom(fd, buf, len, flags, src_addr, addrlen)
+            45 => {
+                let fd = msg.regs[0] as usize;
+                let buf_ptr = msg.regs[1];
+                let len = msg.regs[2] as usize;
+                if fd < 16 && bb_fd_kind[fd] == 2 {
+                    let port = bb_fd_port[fd];
+                    let net_cap = NET_EP_CAP.load(Ordering::Acquire);
+                    if net_cap == 0 { reply_val(ep_cap, -11); continue; }
+                    let max_recv = len.min(512);
+                    let src_addr_ptr = msg.regs[4];
+                    let addrlen_ptr = msg.regs[5];
+                    let mut got = 0i64;
+                    for _retry in 0..500 {
+                        let recv_msg = sotos_common::IpcMsg { tag: NET_CMD_UDP_RECV, regs: [port as u64, max_recv as u64, 0, 0, 0, 0, 0, 0] };
+                        if let Ok(resp) = sys::call(net_cap, &recv_msg) {
+                            let rlen = resp.tag as i64; // byte count in tag, data in regs[0..7]
+                            if rlen > 0 {
+                                let copy_len = (rlen as usize).min(len).min(64); // 8 regs * 8 = 64
+                                unsafe {
+                                    let dst = buf_ptr as *mut u8;
+                                    for k in 0..copy_len { *dst.add(k) = resp.regs[k / 8].to_le_bytes()[k % 8]; }
+                                }
+                                // Fill in src_addr (sockaddr_in for DNS server 10.0.2.3:53)
+                                if src_addr_ptr != 0 {
+                                    unsafe {
+                                        let sa = src_addr_ptr as *mut u8;
+                                        core::ptr::write_bytes(sa, 0, 16);
+                                        *sa.add(0) = 2; // AF_INET (little-endian u16)
+                                        *sa.add(1) = 0;
+                                        *sa.add(2) = 0; // port 53 big-endian
+                                        *sa.add(3) = 53;
+                                        *sa.add(4) = 10; // 10.0.2.3
+                                        *sa.add(5) = 0;
+                                        *sa.add(6) = 2;
+                                        *sa.add(7) = 3;
+                                    }
+                                }
+                                if addrlen_ptr != 0 {
+                                    unsafe { *(addrlen_ptr as *mut u32) = 16; }
+                                }
+                                got = copy_len as i64;
+                                break;
+                            }
+                        }
+                        sys::yield_now();
+                    }
+                    reply_val(ep_cap, got);
+                } else {
+                    reply_val(ep_cap, 0);
+                }
+            }
+            // bind(fd, addr, addrlen)
+            49 => {
+                let fd = msg.regs[0] as usize;
+                let addr_ptr = msg.regs[1];
+                if fd < 16 && bb_fd_kind[fd] == 2 {
+                    // UDP bind — parse port from sockaddr_in
+                    let port = unsafe {
+                        let sa = addr_ptr as *const u8;
+                        (*sa.add(2) as u16) << 8 | *sa.add(3) as u16
+                    };
+                    // If port=0, assign an ephemeral port
+                    let actual_port = if port == 0 { 32768 + (rdtsc() % 10000) as u16 } else { port };
+                    bb_fd_port[fd] = actual_port;
+                    let net_cap = NET_EP_CAP.load(Ordering::Acquire);
+                    if net_cap != 0 {
+                        let bind_msg = sotos_common::IpcMsg { tag: NET_CMD_UDP_BIND, regs: [actual_port as u64, 0, 0, 0, 0, 0, 0, 0] };
+                        let _ = sys::call(net_cap, &bind_msg);
+                    }
+                    reply_val(ep_cap, 0);
+                } else {
+                    reply_val(ep_cap, 0);
+                }
+            }
+            // listen / getsockname / getpeername / shutdown / rename / unlink / lseek
+            50 | 51 | 52 | 48 | 38 | 87 | 8 => reply_val(ep_cap, 0),
+            // poll(fds, nfds, timeout) / ppoll
+            7 | 271 => {
+                let fds_ptr = msg.regs[0];
+                let nfds = msg.regs[1] as usize;
+                // Yield several times to let network process DNS replies
+                for _ in 0..100 { sys::yield_now(); }
+                let mut ready = 0i64;
+                for i in 0..nfds.min(16) {
+                    let pfd = (fds_ptr + i as u64 * 8) as *mut u8;
+                    let fd = unsafe { *(pfd as *const i32) } as usize;
+                    let events = unsafe { *((pfd as *const u8).add(4) as *const i16) };
+                    // Report any socket as ready (POLLIN) after the yield delay
+                    if fd < 16 && (bb_fd_kind[fd] == 1 || bb_fd_kind[fd] == 2) && (events & 1) != 0 {
+                        unsafe { *((pfd).add(6) as *mut i16) = 1; } // POLLIN
+                        ready += 1;
+                    }
+                }
+                if ready == 0 { ready = 1; } // Always unblock (timeout)
+                reply_val(ep_cap, ready);
+            }
+            // getsockopt / setsockopt
+            54 | 55 => reply_val(ep_cap, 0),
+            // clock_gettime
+            228 => reply_val(ep_cap, 0),
+            // getrandom
+            318 => {
+                let buf = msg.regs[0];
+                let len = msg.regs[1] as usize;
+                unsafe {
+                    let dst = buf as *mut u8;
+                    let mut seed = rdtsc();
+                    for i in 0..len {
+                        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                        *dst.add(i) = seed as u8;
+                    }
+                }
+                reply_val(ep_cap, len as i64);
+            }
+            // uname
+            63 => {
+                let buf = msg.regs[0] as *mut u8;
+                unsafe {
+                    core::ptr::write_bytes(buf, 0, 390);
+                    core::ptr::copy_nonoverlapping(b"sotOS".as_ptr(), buf, 5);
+                    core::ptr::copy_nonoverlapping(b"lucas".as_ptr(), buf.add(65), 5);
+                    core::ptr::copy_nonoverlapping(b"0.1.0".as_ptr(), buf.add(130), 5);
+                    core::ptr::copy_nonoverlapping(b"x86_64".as_ptr(), buf.add(260), 6);
+                }
+                reply_val(ep_cap, 0);
+            }
+            // exit / exit_group
+            60 | 231 => {
+                let status = msg.regs[0] as i64;
+                print(b"BUSYBOX-TEST: exited with status ");
+                print_u64(status as u64);
+                print(b"\n");
+                if status == 0 {
+                    print(b"BUSYBOX-TEST: SUCCESS\n");
+                }
+                break;
+            }
+            // Catch-all: log unhandled syscalls
+            _ => {
+                print(b"BUSYBOX: unhandled syscall ");
+                print_u64(nr);
+                print(b"\n");
+                reply_val(ep_cap, -38); // -ENOSYS
+            }
+        }
+    }
+
+    print(b"BUSYBOX-TEST: complete\n");
 }
 
 /// Producer entry point — runs in a separate thread, same address space.
@@ -3012,8 +3527,8 @@ fn futex_wake(addr: u64, count: u32) -> i64 {
 static EXEC_LOCK: AtomicU64 = AtomicU64::new(0);
 /// Temp buffer for execve ELF loading (separate from SPAWN/DL buffers).
 const EXEC_BUF_BASE: u64 = 0x5400000;
-const EXEC_BUF_PAGES: u64 = 128; // 512 KiB
-const EXEC_TEMP_MAP: u64 = 0x5480000; // past EXEC_BUF_BASE + 128*4K
+const EXEC_BUF_PAGES: u64 = 320; // 1.25 MiB (busybox is ~1.1 MiB)
+const EXEC_TEMP_MAP: u64 = 0x5540000; // past EXEC_BUF_BASE + 320*4K
 /// Temp buffer for loading the interpreter ELF (for dynamic binaries).
 const INTERP_BUF_BASE: u64 = 0xA000000; // Far from other regions
 const INTERP_BUF_PAGES: u64 = 220; // ~900 KiB, enough for ld-musl (~845 KiB)
@@ -3158,7 +3673,17 @@ fn unmap_temp_buf(base: u64, pages: u64) {
 /// with syscall redirect, and return the new endpoint cap.
 /// Supports both static (ET_EXEC) and dynamic (ET_DYN with PT_INTERP) binaries.
 /// Caller must hold EXEC_LOCK.
+/// Max args for execve (including argv[0]).
+const MAX_EXEC_ARGS: usize = 16;
+/// Max length of a single argv string.
+const MAX_EXEC_ARG_LEN: usize = 128;
+
 fn exec_from_initrd(bin_name: &[u8]) -> Result<(u64, u64), i64> {
+    let empty: [[u8; MAX_EXEC_ARG_LEN]; 0] = [];
+    exec_from_initrd_argv(bin_name, &empty)
+}
+
+fn exec_from_initrd_argv(bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_LEN]]) -> Result<(u64, u64), i64> {
     use sotos_common::elf;
 
     // Step 1: Map temp buffer and read main ELF
@@ -3281,18 +3806,43 @@ fn exec_from_initrd(bin_name: &[u8]) -> Result<(u64, u64), i64> {
 
     // Step 7: Set up Linux-style initial stack
     let stack_top = stack_addr + 0x4000;
+    // --- Build Linux-style initial stack with argv support ---
+    // String area at top of stack (2 KB for argv/env/random strings)
+    let str_area = stack_top - 2048;
+    let mut spos: usize = 0;
 
-    // Write program name string and AT_RANDOM data at top of stack
-    let name_len = bin_name.len();
-    let name_start = stack_top - 256;
-    unsafe {
-        let dst = name_start as *mut u8;
-        core::ptr::copy_nonoverlapping(bin_name.as_ptr(), dst, name_len);
-        *dst.add(name_len) = 0;
+    // Write argv strings. If caller provided argv, use it; otherwise default to [bin_name].
+    let argc: usize = if argv.is_empty() { 1 } else { argv.len() };
+    let mut argv_addrs = [0u64; MAX_EXEC_ARGS];
+    if argv.is_empty() {
+        // Default: argv[0] = bin_name
+        argv_addrs[0] = str_area + spos as u64;
+        unsafe {
+            let dst = (str_area + spos as u64) as *mut u8;
+            core::ptr::copy_nonoverlapping(bin_name.as_ptr(), dst, bin_name.len());
+            *dst.add(bin_name.len()) = 0;
+        }
+        spos += bin_name.len() + 1;
+    } else {
+        for a in 0..argv.len() {
+            argv_addrs[a] = str_area + spos as u64;
+            // Find NUL in argv buf
+            let mut alen = 0;
+            while alen < MAX_EXEC_ARG_LEN && argv[a][alen] != 0 { alen += 1; }
+            unsafe {
+                let dst = (str_area + spos as u64) as *mut u8;
+                core::ptr::copy_nonoverlapping(argv[a].as_ptr(), dst, alen);
+                *dst.add(alen) = 0;
+            }
+            spos += alen + 1;
+        }
     }
 
+    // Align spos to 8 for u64 writes (debug-mode Rust checks alignment via ud2)
+    spos = (spos + 7) & !7;
+
     // Write 16 bytes of pseudo-random data for AT_RANDOM
-    let random_addr = name_start + 128;
+    let random_addr = str_area + spos as u64;
     unsafe {
         let rp = random_addr as *mut u64;
         let mut seed = rdtsc();
@@ -3301,47 +3851,44 @@ fn exec_from_initrd(bin_name: &[u8]) -> Result<(u64, u64), i64> {
         seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
         *rp.add(1) = seed;
     }
+    spos += 16;
 
     // Find phdr vaddr for main binary
     let elf_base = main_base + if seg_count > 0 { segments[0].vaddr & !0xFFF } else { 0 };
     let phdr_vaddr = elf_base + elf_info.phoff as u64;
 
-    // Write environment strings just below the program name
+    // Write environment strings
     let env_term = b"TERM=xterm\0";
     let env_home = b"HOME=/\0";
     let env_terminfo = b"TERMINFO=/usr/share/terminfo\0";
-    let env_term_addr = random_addr + 16;
-    let env_home_addr = env_term_addr + env_term.len() as u64;
-    let env_terminfo_addr = env_home_addr + env_home.len() as u64;
-    unsafe {
-        core::ptr::copy_nonoverlapping(env_term.as_ptr(), env_term_addr as *mut u8, env_term.len());
-        core::ptr::copy_nonoverlapping(env_home.as_ptr(), env_home_addr as *mut u8, env_home.len());
-        core::ptr::copy_nonoverlapping(env_terminfo.as_ptr(), env_terminfo_addr as *mut u8, env_terminfo.len());
-    }
+    let env_term_addr = str_area + spos as u64;
+    unsafe { core::ptr::copy_nonoverlapping(env_term.as_ptr(), env_term_addr as *mut u8, env_term.len()); }
+    spos += env_term.len();
+    let env_home_addr = str_area + spos as u64;
+    unsafe { core::ptr::copy_nonoverlapping(env_home.as_ptr(), env_home_addr as *mut u8, env_home.len()); }
+    spos += env_home.len();
+    let env_terminfo_addr = str_area + spos as u64;
+    unsafe { core::ptr::copy_nonoverlapping(env_terminfo.as_ptr(), env_terminfo_addr as *mut u8, env_terminfo.len()); }
 
-    // Build auxv — AT_SYSINFO_EHDR for vDSO, AT_BASE for dynamic binaries
-    // auxv pairs: PHDR, PHENT, PHNUM, PAGESZ, RANDOM, ENTRY, SYSINFO_EHDR, [BASE], NULL
+    // Build pointer table: argc + argv[0..n] + NULL + envp[0..n] + NULL + auxv
     let auxv_pairs: u64 = if is_dynamic { 9 } else { 8 };
-    let env_count: u64 = 3; // TERM, HOME, TERMINFO
-    let entries: u64 = 4 + env_count + auxv_pairs * 2; // argc + argv[0] + NULL + env[0..n] + NULL + auxv
-    let rsp = (name_start - entries * 8) & !0xF;
+    let env_count: u64 = 3;
+    let entries: u64 = 1 + argc as u64 + 1 + env_count + 1 + auxv_pairs * 2;
+    let rsp = (str_area - entries as u64 * 8) & !0xF;
 
     unsafe {
         let sp = rsp as *mut u64;
         let mut i: usize = 0;
         // argc
-        *sp.add(i) = 1; i += 1;
-        // argv[0]
-        *sp.add(i) = name_start; i += 1;
+        *sp.add(i) = argc as u64; i += 1;
+        // argv[0..argc]
+        for a in 0..argc { *sp.add(i) = argv_addrs[a]; i += 1; }
         // argv terminator
         *sp.add(i) = 0; i += 1;
-        // envp[0] = TERM=xterm
+        // envp
         *sp.add(i) = env_term_addr; i += 1;
-        // envp[1] = HOME=/
         *sp.add(i) = env_home_addr; i += 1;
-        // envp[2] = TERMINFO=/usr/share/terminfo
         *sp.add(i) = env_terminfo_addr; i += 1;
-        // envp terminator
         *sp.add(i) = 0; i += 1;
         // AT_PHDR(3)
         *sp.add(i) = 3; i += 1;
@@ -3358,13 +3905,13 @@ fn exec_from_initrd(bin_name: &[u8]) -> Result<(u64, u64), i64> {
         // AT_RANDOM(25)
         *sp.add(i) = 25; i += 1;
         *sp.add(i) = random_addr; i += 1;
-        // AT_ENTRY(9) = main binary's entry (not interpreter's)
+        // AT_ENTRY(9)
         *sp.add(i) = 9; i += 1;
         *sp.add(i) = main_base + elf_info.entry; i += 1;
-        // AT_SYSINFO_EHDR(33) = vDSO page address
+        // AT_SYSINFO_EHDR(33)
         *sp.add(i) = 33; i += 1;
         *sp.add(i) = vdso::VDSO_BASE; i += 1;
-        // AT_BASE(7) = interpreter load address (only for dynamic binaries)
+        // AT_BASE(7) for dynamic binaries
         if is_dynamic {
             *sp.add(i) = 7; i += 1;
             *sp.add(i) = interp_base; i += 1;
@@ -4838,9 +5385,10 @@ pub extern "C" fn child_handler() -> ! {
                 }
             }
 
-            // SYS_execve(path) — generic: loads any ELF from initrd
+            // SYS_execve(path, argv, envp) — generic: loads any ELF from initrd
             59 => {
                 let path_ptr = msg.regs[0];
+                let argv_ptr = msg.regs[1];
                 let mut path = [0u8; 48];
                 let path_len = copy_guest_path(path_ptr, &mut path);
                 let name = &path[..path_len];
@@ -4861,8 +5409,27 @@ pub extern "C" fn child_handler() -> ! {
                     continue;
                 }
 
+                // Read argv from guest memory (shared address space)
+                let mut exec_argv = [[0u8; MAX_EXEC_ARG_LEN]; MAX_EXEC_ARGS];
+                let mut exec_argc: usize = 0;
+                if argv_ptr != 0 {
+                    let mut ap = argv_ptr;
+                    while exec_argc < MAX_EXEC_ARGS {
+                        let str_ptr = unsafe { *(ap as *const u64) };
+                        if str_ptr == 0 { break; }
+                        copy_guest_path(str_ptr, &mut exec_argv[exec_argc]);
+                        exec_argc += 1;
+                        ap += 8;
+                    }
+                }
+
                 while EXEC_LOCK.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed).is_err() { sys::yield_now(); }
-                match exec_from_initrd(bin_name) {
+                let result = if exec_argc > 0 {
+                    exec_from_initrd_argv(bin_name, &exec_argv[..exec_argc])
+                } else {
+                    exec_from_initrd(bin_name)
+                };
+                match result {
                     Ok((new_ep, _tc)) => { EXEC_LOCK.store(0, Ordering::Release); ep_cap = new_ep; continue; }
                     Err(errno) => { EXEC_LOCK.store(0, Ordering::Release); reply_val(ep_cap, errno); continue; }
                 }
@@ -8593,7 +9160,14 @@ fn panic_halt() -> ! {
 }
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    print(b"!!!PANIC-RUST!!!\n");
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    print(b"!!!PANIC-RUST!!!");
+    if let Some(loc) = info.location() {
+        print(b" at ");
+        print(loc.file().as_bytes());
+        print(b":");
+        print_u64(loc.line() as u64);
+    }
+    print(b"\n");
     loop {}
 }

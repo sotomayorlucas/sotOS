@@ -949,10 +949,13 @@ pub extern "C" fn ipc_handler_thread() -> ! {
         reply.regs[0] = result;
 
         // For TCP_RECV / UDP_RECV, copy data back into reply regs.
+        // Put byte count in tag, use all 8 regs for data (64 bytes max).
         if (cmd == CMD_TCP_RECV || cmd == CMD_UDP_RECV) && result > 0 {
-            let n = (result as usize).min(56); // 7 regs * 8 bytes
+            reply.tag = result; // byte count in tag
+            reply.regs[0] = result; // also in regs[0] for backward compat
+            let n = (result as usize).min(64); // 8 regs * 8 bytes
             unsafe {
-                let dst = &mut reply.regs[1] as *mut u64 as *mut u8;
+                let dst = &mut reply.regs[0] as *mut u64 as *mut u8;
                 core::ptr::copy_nonoverlapping(core::ptr::addr_of!(IPC_DATA_BUF) as *const u8, dst, n);
             }
         }

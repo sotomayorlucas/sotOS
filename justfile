@@ -20,6 +20,7 @@ USER_HELLO_DYNAMIC := "hello_dynamic"
 USER_NET_TEST := "services/net-test/target/x86_64-unknown-none/debug/sotos-net-test"
 MUSL_LD := "ld-musl-x86_64.so.1"
 USER_NANO := "nano"
+USER_BUSYBOX := "busybox"
 LIBNCURSESW := "libncursesw.so.6"
 TERMINFO_XTERM := "xterm"
 TESTLIB := "target/libtest.so"
@@ -86,7 +87,7 @@ release:
 
 # Create CPIO initrd from userspace binaries
 initrd: build-user build-shell build-kbd build-net build-nvme build-xhci build-vmm build-hello build-hello-linux build-net-test build-testlib
-    python scripts/mkinitrd.py --output {{INITRD}} --file init={{USER_INIT}} --file shell={{USER_SHELL}} --file kbd={{USER_KBD}} --file net={{USER_NET}} --file nvme={{USER_NVME}} --file xhci={{USER_XHCI}} --file vmm={{USER_VMM}} --file hello={{USER_HELLO}} --file hello-linux={{USER_HELLO_LINUX}} --file hello-musl={{USER_HELLO_MUSL}} --file hello_dynamic={{USER_HELLO_DYNAMIC}} --file ld-musl-x86_64.so.1={{MUSL_LD}} --file nano={{USER_NANO}} --file libncursesw.so.6={{LIBNCURSESW}} --file xterm={{TERMINFO_XTERM}} --file libtest.so={{TESTLIB}} --file net-test={{USER_NET_TEST}}
+    python scripts/mkinitrd.py --output {{INITRD}} --file init={{USER_INIT}} --file shell={{USER_SHELL}} --file kbd={{USER_KBD}} --file net={{USER_NET}} --file nvme={{USER_NVME}} --file xhci={{USER_XHCI}} --file vmm={{USER_VMM}} --file hello={{USER_HELLO}} --file hello-linux={{USER_HELLO_LINUX}} --file hello-musl={{USER_HELLO_MUSL}} --file hello_dynamic={{USER_HELLO_DYNAMIC}} --file ld-musl-x86_64.so.1={{MUSL_LD}} --file nano={{USER_NANO}} --file libncursesw.so.6={{LIBNCURSESW}} --file xterm={{TERMINFO_XTERM}} --file libtest.so={{TESTLIB}} --file net-test={{USER_NET_TEST}} --file busybox={{USER_BUSYBOX}}
 
 # Create the bootable disk image (BIOS + Limine)
 image: build initrd

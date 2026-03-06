@@ -267,14 +267,14 @@ fn linux_getppid() -> i64 {
     ret
 }
 
-fn linux_execve(path: *const u8) -> i64 {
+fn linux_execve(path: *const u8, argv: *const u64) -> i64 {
     let ret: i64;
     unsafe {
         core::arch::asm!(
             "syscall",
             inlateout("rax") 59u64 => ret,
             in("rdi") path as u64,
-            in("rsi") 0u64,
+            in("rsi") argv as u64,
             in("rdx") 0u64,
             lateout("rcx") _,
             lateout("r11") _,
@@ -3580,14 +3580,19 @@ fn cmd_fork() {
     print(b"\n");
 }
 
-/// Buffer for passing exec name to child_exec_main.
+/// Buffer for passing exec path to child_exec_main.
 static mut EXEC_NAME_BUF: [u8; 64] = [0u8; 64];
 static mut EXEC_NAME_LEN: usize = 0;
+/// Argv string storage (null-separated).
+static mut EXEC_ARGV_STRS: [u8; 512] = [0u8; 512];
+/// Argv pointer array (u64 pointers + NULL terminator).
+static mut EXEC_ARGV_PTRS: [u64; 17] = [0u64; 17];
 
 /// Child function that immediately calls execve with the name in EXEC_NAME_BUF.
 extern "C" fn child_exec_main() -> ! {
     let name = unsafe { &EXEC_NAME_BUF[..EXEC_NAME_LEN + 1] }; // includes NUL
-    let ret = linux_execve(name.as_ptr());
+    let argv = unsafe { EXEC_ARGV_PTRS.as_ptr() };
+    let ret = linux_execve(name.as_ptr(), argv);
     // execve failed — print error and exit
     print(b"exec: failed (errno=");
     print_u64((-ret) as u64);
@@ -3595,19 +3600,60 @@ extern "C" fn child_exec_main() -> ! {
     linux_exit(1);
 }
 
-fn cmd_exec(name: &[u8]) {
-    // Build /bin/<name>\0 into EXEC_NAME_BUF
+fn cmd_exec(line: &[u8]) {
+    // Parse: first word = program name, remaining words = arguments
+    // e.g., "busybox wget http://example.com" -> prog="busybox", argv=["busybox","wget","http://..."]
+    let mut prog_end = line.len();
+    for i in 0..line.len() {
+        if line[i] == b' ' { prog_end = i; break; }
+    }
+    let prog_name = &line[..prog_end];
+
+    // Build /bin/<prog_name>\0 into EXEC_NAME_BUF
     let prefix = b"/bin/";
-    let total = prefix.len() + name.len();
+    let total = prefix.len() + prog_name.len();
     if total >= 63 {
         print(b"exec: name too long\n");
         return;
     }
     unsafe {
         EXEC_NAME_BUF[..prefix.len()].copy_from_slice(prefix);
-        EXEC_NAME_BUF[prefix.len()..prefix.len() + name.len()].copy_from_slice(name);
-        EXEC_NAME_BUF[total] = 0; // NUL terminate
+        EXEC_NAME_BUF[prefix.len()..total].copy_from_slice(prog_name);
+        EXEC_NAME_BUF[total] = 0;
         EXEC_NAME_LEN = total;
+
+        // Build argv: split line on spaces
+        let mut spos: usize = 0;
+        let mut argc: usize = 0;
+
+        // argv[0] = program name (what the binary sees as its own name)
+        EXEC_ARGV_PTRS[argc] = EXEC_ARGV_STRS.as_ptr().add(spos) as u64;
+        EXEC_ARGV_STRS[spos..spos + prog_name.len()].copy_from_slice(prog_name);
+        spos += prog_name.len();
+        EXEC_ARGV_STRS[spos] = 0;
+        spos += 1;
+        argc += 1;
+
+        // Remaining arguments
+        if prog_end < line.len() {
+            let args = &line[prog_end + 1..];
+            let mut i = 0;
+            while i < args.len() && argc < 16 {
+                while i < args.len() && args[i] == b' ' { i += 1; }
+                if i >= args.len() { break; }
+                let word_start = i;
+                while i < args.len() && args[i] != b' ' { i += 1; }
+                let wlen = i - word_start;
+                if spos + wlen + 1 > 512 { break; }
+                EXEC_ARGV_PTRS[argc] = EXEC_ARGV_STRS.as_ptr().add(spos) as u64;
+                EXEC_ARGV_STRS[spos..spos + wlen].copy_from_slice(&args[word_start..i]);
+                spos += wlen;
+                EXEC_ARGV_STRS[spos] = 0;
+                spos += 1;
+                argc += 1;
+            }
+        }
+        EXEC_ARGV_PTRS[argc] = 0; // NULL terminator
     }
 
     // Fork child, which immediately does execve
