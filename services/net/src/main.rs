@@ -5,10 +5,12 @@
 
 #![no_std]
 #![no_main]
+#![feature(impl_trait_in_assoc_type)]
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use sotos_common::sys;
 use sotos_common::{BootInfo, IpcMsg, BOOT_INFO_ADDR};
@@ -58,6 +60,17 @@ unsafe impl core::alloc::GlobalAlloc for BumpAlloc {
 
 #[global_allocator]
 static ALLOCATOR: BumpAlloc = BumpAlloc;
+
+// =============================================================================
+// Critical section (no-op for single-threaded userspace)
+// =============================================================================
+
+struct CsImpl;
+critical_section::set_impl!(CsImpl);
+unsafe impl critical_section::Impl for CsImpl {
+    unsafe fn acquire() -> critical_section::RawRestoreState {}
+    unsafe fn release(_: critical_section::RawRestoreState) {}
+}
 
 // =============================================================================
 // Constants
@@ -479,6 +492,45 @@ fn build_echo_request(id: u16, seq: u16) -> [u8; 8] {
 }
 
 // =============================================================================
+// Global network state for embassy async tasks
+// =============================================================================
+
+struct NetState {
+    device: VirtioDevice,
+    iface: Interface,
+    sockets: SocketSet<'static>,
+    dhcp_handle: SocketHandle,
+    icmp_handle: SocketHandle,
+    echo_handle: SocketHandle,
+}
+
+static mut G_NET: MaybeUninit<NetState> = MaybeUninit::uninit();
+static mut G_EXECUTOR: MaybeUninit<embassy_executor::Executor> = MaybeUninit::uninit();
+static BOOT_PING_PHASE: AtomicU8 = AtomicU8::new(0);
+
+/// Yield to both the OS scheduler and the embassy executor.
+async fn async_yield() {
+    struct YieldOnce(bool);
+    impl core::future::Future for YieldOnce {
+        type Output = ();
+        fn poll(
+            mut self: core::pin::Pin<&mut Self>,
+            cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<()> {
+            if self.0 {
+                core::task::Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
+        }
+    }
+    sys::yield_now();
+    YieldOnce(false).await;
+}
+
+// =============================================================================
 // Main entry point
 // =============================================================================
 
@@ -587,18 +639,57 @@ pub extern "C" fn _start() -> ! {
 
     print(b"NET: smoltcp interface ready, DHCP starting...\n");
 
+    // Store network state in global for async tasks
+    unsafe {
+        G_NET.write(NetState {
+            device,
+            iface,
+            sockets,
+            dhcp_handle,
+            icmp_handle,
+            echo_handle,
+        });
+
+        // Create embassy executor and spawn async tasks
+        print(b"NET: starting embassy async executor\n");
+        let executor = G_EXECUTOR.write(embassy_executor::Executor::new());
+        executor.run(|spawner| {
+            spawner.spawn(net_poll_task()).unwrap();
+            spawner.spawn(boot_ping_task()).unwrap();
+        });
+    }
+}
+
+// =============================================================================
+// Embassy async tasks
+// =============================================================================
+
+#[embassy_executor::task]
+async fn net_poll_task() {
+    let s = unsafe { G_NET.assume_init_mut() };
+    let dhcp_handle = s.dhcp_handle;
+    let icmp_handle = s.icmp_handle;
+    let echo_handle = s.echo_handle;
+
     let mut dns_server = DEFAULT_DNS;
     let mut ping_sent = false;
     let mut ping_replied = false;
 
-    // Main event loop
     loop {
         let ts = now();
-        iface.poll(ts, &mut device, &mut sockets);
+        {
+            let NetState {
+                ref mut device,
+                ref mut iface,
+                ref mut sockets,
+                ..
+            } = *s;
+            iface.poll(ts, device, sockets);
+        }
 
         // Handle DHCP events
         {
-            let dhcp = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
+            let dhcp = s.sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
             if let Some(event) = dhcp.poll() {
                 match event {
                     dhcpv4::Event::Configured(cfg) => {
@@ -608,7 +699,7 @@ pub extern "C" fn _start() -> ! {
                         print(b"/");
                         print_u32(cidr.prefix_len() as u32);
 
-                        iface.update_ip_addrs(|addrs| {
+                        s.iface.update_ip_addrs(|addrs| {
                             if !addrs.is_empty() {
                                 addrs[0] = IpCidr::Ipv4(cidr);
                             } else {
@@ -617,7 +708,7 @@ pub extern "C" fn _start() -> ! {
                         });
 
                         if let Some(router) = cfg.router {
-                            iface
+                            s.iface
                                 .routes_mut()
                                 .add_default_ipv4_route(router)
                                 .ok();
@@ -634,7 +725,7 @@ pub extern "C" fn _start() -> ! {
                     dhcpv4::Event::Deconfigured => {
                         print(b"NET: DHCP deconfigured\n");
                         dns_server = DEFAULT_DNS;
-                        iface.update_ip_addrs(|addrs| {
+                        s.iface.update_ip_addrs(|addrs| {
                             if !addrs.is_empty() {
                                 addrs[0] =
                                     IpCidr::Ipv4(Ipv4Cidr::new(ip_from_u32(DEFAULT_IP), 24));
@@ -645,9 +736,10 @@ pub extern "C" fn _start() -> ! {
             }
         }
 
-        // Boot ping to 8.8.8.8
-        if !ping_sent {
-            let icmp = sockets.get_mut::<icmp::Socket>(icmp_handle);
+        // Boot ping (coordinated by boot_ping_task via atomic)
+        let phase = BOOT_PING_PHASE.load(Ordering::Acquire);
+        if phase >= 1 && !ping_sent {
+            let icmp = s.sockets.get_mut::<icmp::Socket>(icmp_handle);
             if icmp.can_send() {
                 let echo = build_echo_request(PING_ID, 1);
                 if icmp
@@ -660,14 +752,12 @@ pub extern "C" fn _start() -> ! {
             }
         }
 
-        // Check for ping reply
         if ping_sent && !ping_replied {
-            let icmp = sockets.get_mut::<icmp::Socket>(icmp_handle);
+            let icmp = s.sockets.get_mut::<icmp::Socket>(icmp_handle);
             while icmp.can_recv() {
                 let mut buf = [0u8; 128];
                 if let Ok((n, addr)) = icmp.recv_slice(&mut buf) {
                     if n >= 8 && buf[0] == 0 {
-                        // Echo Reply
                         let id = u16::from_be_bytes([buf[4], buf[5]]);
                         if id == PING_ID {
                             let seq = u16::from_be_bytes([buf[6], buf[7]]);
@@ -679,6 +769,7 @@ pub extern "C" fn _start() -> ! {
                             print_u32(seq as u32);
                             print(b" -- google is alive!\n");
                             ping_replied = true;
+                            BOOT_PING_PHASE.store(2, Ordering::Release);
                         }
                     }
                 } else {
@@ -689,7 +780,7 @@ pub extern "C" fn _start() -> ! {
 
         // TCP echo server
         {
-            let echo = sockets.get_mut::<tcp::Socket>(echo_handle);
+            let echo = s.sockets.get_mut::<tcp::Socket>(echo_handle);
             if echo.may_recv() {
                 let mut buf = [0u8; 2048];
                 if let Ok(n) = echo.recv_slice(&mut buf) {
@@ -706,11 +797,17 @@ pub extern "C" fn _start() -> ! {
         // Process IPC commands (non-blocking)
         let cmd = IPC_CMD.load(Ordering::Acquire);
         if cmd != 0 {
+            let NetState {
+                ref mut device,
+                ref mut iface,
+                ref mut sockets,
+                ..
+            } = *s;
             let result = process_ipc_cmd(
                 cmd,
-                &mut iface,
-                &mut device,
-                &mut sockets,
+                iface,
+                device,
+                sockets,
                 dns_server,
                 icmp_handle,
             );
@@ -718,9 +815,27 @@ pub extern "C" fn _start() -> ! {
             IPC_CMD.store(0, Ordering::Release);
         }
 
-        sys::yield_now();
-        device.net.ack_irq();
+        async_yield().await;
+        s.device.net.ack_irq();
     }
+}
+
+#[embassy_executor::task]
+async fn boot_ping_task() {
+    // Wait for network stack to initialize (DHCP, ARP, etc.)
+    for _ in 0..50 {
+        async_yield().await;
+    }
+
+    // Signal main poll task to send boot ping
+    BOOT_PING_PHASE.store(1, Ordering::Release);
+    print(b"NET: [async] boot ping requested\n");
+
+    // Wait for ping reply
+    while BOOT_PING_PHASE.load(Ordering::Acquire) != 2 {
+        async_yield().await;
+    }
+    print(b"NET: [async] boot ping completed!\n");
 }
 
 // =============================================================================

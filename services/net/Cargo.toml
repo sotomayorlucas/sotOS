@@ -7,6 +7,8 @@ edition = "2021"
 sotos-common = { path = "../../libs/sotos-common" }
 sotos-pci = { path = "../../libs/sotos-pci" }
 sotos-virtio = { path = "../../libs/sotos-virtio" }
+embassy-executor = { version = "0.9", default-features = false, features = ["arch-spin", "executor-thread", "nightly"] }
+critical-section = { version = "1.2", default-features = false }
 smoltcp = { version = "0.11", default-features = false, features = [
     "alloc",
     "medium-ethernet",
