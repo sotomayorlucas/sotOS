@@ -466,15 +466,18 @@ unsafe fn fb_draw_text_at(x: u32, y: u32, text: &[u8], color: u32) {
 /// Draw an 8x16 glyph at pixel position (x, y) with foreground color, background 0 = transparent.
 unsafe fn fb_draw_glyph_at(px: u32, py: u32, ch: u8, fg: u32, bg: u32) {
     let glyph = &VGA_FONT[(ch as usize) * 16..(ch as usize) * 16 + 16];
-    let fb = FB_PTR as *mut u32;
-    let stride = FB_PITCH / 4;
+    let (fb, stride, w, h) = if COMPOSITOR_ACTIVE && !TERM_FB.is_null() {
+        (TERM_FB, TERM_STRIDE, TERM_W, TERM_H)
+    } else {
+        (FB_PTR as *mut u32, FB_PITCH / 4, FB_WIDTH, FB_HEIGHT)
+    };
     for gy in 0..16u32 {
         let row_byte = glyph[gy as usize];
         let y = py + gy;
-        if y >= FB_HEIGHT { break; }
+        if y >= h { break; }
         for gx in 0..8u32 {
             let x = px + gx;
-            if x >= FB_WIDTH { break; }
+            if x >= w { break; }
             let is_fg = row_byte & (0x80 >> gx) != 0;
             if is_fg {
                 *fb.add((y * stride + x) as usize) = fg;
@@ -494,8 +497,11 @@ unsafe fn fb_draw_char(col: u32, row: u32, ch: u8) {
 
 /// Scroll the terminal text area up by one text row (16 pixels).
 unsafe fn fb_scroll() {
-    let fb = FB_PTR as *mut u8;
-    let pitch = FB_PITCH as usize;
+    let (fb_u8, pitch, fb32, stride) = if COMPOSITOR_ACTIVE && !TERM_FB.is_null() {
+        (TERM_FB as *mut u8, (TERM_STRIDE * 4) as usize, TERM_FB, TERM_STRIDE)
+    } else {
+        (FB_PTR as *mut u8, FB_PITCH as usize, FB_PTR as *mut u32, FB_PITCH / 4)
+    };
     let text_width_bytes = (CON_COLS * 8 * 4) as usize;
     let text_x_bytes = (TEXT_X * 4) as usize;
 
@@ -503,8 +509,8 @@ unsafe fn fb_scroll() {
         for py in 0..16u32 {
             let src_y = (TEXT_Y + (row + 1) * 16 + py) as usize;
             let dst_y = (TEXT_Y + row * 16 + py) as usize;
-            let src = fb.add(src_y * pitch + text_x_bytes);
-            let dst = fb.add(dst_y * pitch + text_x_bytes);
+            let src = fb_u8.add(src_y * pitch + text_x_bytes);
+            let dst = fb_u8.add(dst_y * pitch + text_x_bytes);
             core::ptr::copy(src, dst, text_width_bytes);
         }
     }
@@ -514,8 +520,6 @@ unsafe fn fb_scroll() {
         let y = (TEXT_Y + last_row * 16 + py) as usize;
         for col in 0..CON_COLS * 8 {
             let x = TEXT_X as usize + col as usize;
-            let fb32 = FB_PTR as *mut u32;
-            let stride = FB_PITCH / 4;
             *fb32.add(y * stride as usize + x) = COL_WIN_BG;
         }
     }
@@ -530,8 +534,11 @@ static mut ANSI_SAVED_ROW: u32 = 0;
 
 /// Clear a rectangular region of the framebuffer console with background color.
 unsafe fn fb_clear_region(col_start: u32, col_end: u32, row_start: u32, row_end: u32) {
-    let fb32 = FB_PTR as *mut u32;
-    let stride = FB_PITCH / 4;
+    let (fb32, stride) = if COMPOSITOR_ACTIVE && !TERM_FB.is_null() {
+        (TERM_FB, TERM_STRIDE)
+    } else {
+        (FB_PTR as *mut u32, FB_PITCH / 4)
+    };
     for row in row_start..row_end {
         for py in 0..16u32 {
             let y = TEXT_Y + row * 16 + py;
@@ -678,12 +685,19 @@ impl vte::Perform for FbPerformer {
 
 /// Write a single character to the framebuffer console (inside terminal window).
 /// Uses vte crate for ANSI escape sequence parsing.
+/// When compositor is active, writes to the terminal window buffer instead of screen.
 pub(crate) unsafe fn fb_putchar(ch: u8) {
-    if FB_PTR == 0 || COMPOSITOR_ACTIVE { return; }
+    if FB_PTR == 0 { return; }
+    if COMPOSITOR_ACTIVE && TERM_FB.is_null() { return; }
     if VTE_PARSER.is_none() {
         VTE_PARSER = Some(vte::Parser::new());
     }
     VTE_PARSER.as_mut().unwrap().advance(&mut FbPerformer, ch);
+    if COMPOSITOR_ACTIVE {
+        if let Some(wm) = WM.as_mut() {
+            wm.dirty = true;
+        }
+    }
 }
 
 /// Draw the mouse cursor at the current position.
@@ -809,12 +823,21 @@ static mut WM: Option<sotos_gui::WindowManager> = None;
 /// Virtual addresses for GUI window pixel buffers (mapped via frame_alloc).
 const GUI_WIN1_ADDR: u64 = 0x7000000;
 const GUI_WIN2_ADDR: u64 = 0x7100000;
+const GUI_TERM_ADDR: u64 = 0x7200000;
 
 /// Demo window dimensions.
 const GUI_WIN1_W: u32 = 400;
 const GUI_WIN1_H: u32 = 250;
 const GUI_WIN2_W: u32 = 320;
 const GUI_WIN2_H: u32 = 200;
+const GUI_TERM_W: u32 = 640;
+const GUI_TERM_H: u32 = 384;
+
+/// Terminal buffer target for console writes when compositor is active.
+static mut TERM_FB: *mut u32 = core::ptr::null_mut();
+static mut TERM_STRIDE: u32 = 0;
+static mut TERM_W: u32 = 0;
+static mut TERM_H: u32 = 0;
 
 /// Allocate physical frames and map them at a fixed virtual address range.
 unsafe fn map_gui_buffer(base: u64, pages: u64) {
@@ -828,7 +851,7 @@ unsafe fn map_gui_buffer(base: u64, pages: u64) {
     }
 }
 
-/// Initialize the GUI compositor: create demo windows with gradient content.
+/// Initialize the GUI compositor: create demo windows + terminal window.
 /// Call after fb_init() and after boot messages have been printed.
 pub(crate) unsafe fn gui_compositor_init() {
     if FB_PTR == 0 || FB_WIDTH == 0 || FB_HEIGHT == 0 { return; }
@@ -842,6 +865,11 @@ pub(crate) unsafe fn gui_compositor_init() {
     let win2_pages = (win2_bytes + 0xFFF) / 0x1000;
     map_gui_buffer(GUI_WIN2_ADDR, win2_pages);
 
+    // Allocate terminal window buffer.
+    let term_bytes = (GUI_TERM_W * GUI_TERM_H * 4) as u64;
+    let term_pages = (term_bytes + 0xFFF) / 0x1000;
+    map_gui_buffer(GUI_TERM_ADDR, term_pages);
+
     // Fill window buffers with gradient content.
     sotos_gui::draw_gradient_into(
         GUI_WIN1_ADDR as *mut u32, GUI_WIN1_W, GUI_WIN1_H,
@@ -853,6 +881,12 @@ pub(crate) unsafe fn gui_compositor_init() {
         20, 100, 60,    // forest green top
         60, 200, 180,   // teal bottom
     );
+
+    // Fill terminal buffer with dark background.
+    let term_buf = GUI_TERM_ADDR as *mut u32;
+    for i in 0..(GUI_TERM_W * GUI_TERM_H) as usize {
+        *term_buf.add(i) = COL_WIN_BG;
+    }
 
     // Draw text labels into window buffers using the built-in 8x8 font.
     sotos_gui::draw_string_fb(
@@ -873,13 +907,19 @@ pub(crate) unsafe fn gui_compositor_init() {
     let stride = FB_PITCH / 4;
     let mut wm = sotos_gui::WindowManager::new(fb, FB_WIDTH, FB_HEIGHT, stride);
 
-    // Create two demo windows at different positions.
-    let w1_x = (FB_WIDTH / 6) as i32;
+    // Create terminal window (prominent, front and center).
+    let term_x = 20i32;
+    let term_y = 30i32;
+    wm.create_window(term_x, term_y, GUI_TERM_W, GUI_TERM_H,
+        b"Terminal", GUI_TERM_ADDR as *mut u32);
+
+    // Create two demo windows at offset positions (behind terminal).
+    let w1_x = (FB_WIDTH / 3 + 40) as i32;
     let w1_y = (FB_HEIGHT / 6) as i32;
     wm.create_window(w1_x, w1_y, GUI_WIN1_W, GUI_WIN1_H,
         b"Hello World", GUI_WIN1_ADDR as *mut u32);
 
-    let w2_x = (FB_WIDTH / 3 + 50) as i32;
+    let w2_x = (FB_WIDTH / 2 + 20) as i32;
     let w2_y = (FB_HEIGHT / 3 + 30) as i32;
     wm.create_window(w2_x, w2_y, GUI_WIN2_W, GUI_WIN2_H,
         b"Demo Window", GUI_WIN2_ADDR as *mut u32);
@@ -889,9 +929,24 @@ pub(crate) unsafe fn gui_compositor_init() {
 
     WM = Some(wm);
     COMPOSITOR_ACTIVE = true;
+
+    // Set up terminal buffer target so fb_putchar writes into the terminal window.
+    TERM_FB = term_buf;
+    TERM_STRIDE = GUI_TERM_W;
+    TERM_W = GUI_TERM_W;
+    TERM_H = GUI_TERM_H;
+
+    // Reset console to terminal window dimensions.
+    TEXT_X = 0;
+    TEXT_Y = 0;
+    CON_COLS = GUI_TERM_W / 8;   // 80 columns
+    CON_ROWS = GUI_TERM_H / 16;  // 24 rows
+    CON_CUR_COL = 0;
+    CON_CUR_ROW = 0;
 }
 
 /// Poll mouse when compositor is active — routes events through the WindowManager.
+/// Also re-composites when dirty (e.g. after keyboard-driven terminal writes).
 unsafe fn poll_mouse_compositor() {
     let mring = MOUSE_RING_ADDR as *mut u32;
 
@@ -899,8 +954,6 @@ unsafe fn poll_mouse_compositor() {
         Some(w) => w,
         None => return,
     };
-
-    let mut any_input = false;
 
     loop {
         let write_idx = core::ptr::read_volatile(mring);
@@ -914,10 +967,9 @@ unsafe fn poll_mouse_compositor() {
 
         wm.on_mouse_input(dx, dy, buttons);
         MOUSE_READ_IDX = (MOUSE_READ_IDX.wrapping_add(1)) & 63;
-        any_input = true;
     }
 
-    if any_input && wm.dirty {
+    if wm.dirty {
         wm.composite();
     }
 }
