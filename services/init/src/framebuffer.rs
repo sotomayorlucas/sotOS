@@ -694,6 +694,7 @@ pub(crate) unsafe fn fb_putchar(ch: u8) {
     }
     VTE_PARSER.as_mut().unwrap().advance(&mut FbPerformer, ch);
     if COMPOSITOR_ACTIVE {
+        WM_SCENE_DIRTY = true;
         if let Some(wm) = WM.as_mut() {
             wm.dirty = true;
         }
@@ -949,9 +950,13 @@ pub(crate) unsafe fn gui_compositor_init() {
     wm.create_window(w2_x, w2_y, GUI_WIN2_W, GUI_WIN2_H,
         b"Demo Window", GUI_WIN2_ADDR as *mut u32);
 
+    // Disable cursor in compositor (we draw it directly on screen for speed).
+    wm.cursor_visible = false;
+
     // Initial composite render + blit to screen.
     wm.composite();
     blit_backbuf_to_screen();
+    comp_cursor_save_and_draw(wm.cursor_x, wm.cursor_y);
 
     WM = Some(wm);
     COMPOSITOR_ACTIVE = true;
@@ -971,8 +976,15 @@ pub(crate) unsafe fn gui_compositor_init() {
     CON_CUR_ROW = 0;
 }
 
+/// Saved pixels under the cursor on the MMIO screen (16x16).
+static mut COMP_CURSOR_SAVE: [u32; 256] = [0; 256];
+/// Last drawn cursor position on screen (-1 = not drawn yet).
+static mut COMP_CURSOR_X: i32 = -1;
+static mut COMP_CURSOR_Y: i32 = -1;
+
 /// Poll mouse when compositor is active — routes events through the WindowManager.
-/// Also re-composites when dirty (e.g. after keyboard-driven terminal writes).
+/// Scene compositing (full redraw) only when windows/text change.
+/// Mouse cursor is drawn directly to MMIO screen (16x16 pixels) for speed.
 unsafe fn poll_mouse_compositor() {
     let mring = MOUSE_RING_ADDR as *mut u32;
 
@@ -980,6 +992,9 @@ unsafe fn poll_mouse_compositor() {
         Some(w) => w,
         None => return,
     };
+
+    let mut cursor_moved = false;
+    let mut click_or_drag = false;
 
     loop {
         let write_idx = core::ptr::read_volatile(mring);
@@ -991,19 +1006,96 @@ unsafe fn poll_mouse_compositor() {
         let dy = -(*((base + 1) as *const i8) as i32); // PS/2 Y inverted
         let buttons = *((base + 2) as *const u8);
 
+        // Detect button changes before WM processes them.
+        if buttons != wm.prev_buttons || wm.drag_idx != usize::MAX {
+            click_or_drag = true;
+        }
+
         wm.on_mouse_input(dx, dy, buttons);
         MOUSE_READ_IDX = (MOUSE_READ_IDX.wrapping_add(1)) & 63;
+        cursor_moved = true;
     }
 
-    if wm.dirty {
+    // Scene changes: text output, window click/drag, button press/release.
+    let scene_dirty = WM_SCENE_DIRTY || click_or_drag;
+    WM_SCENE_DIRTY = false;
+
+    if scene_dirty && wm.dirty {
+        // Full scene recomposite + blit (text typed, window moved, focus changed).
         wm.composite();
-        // Blit back buffer to MMIO screen in one fast sequential copy.
         blit_backbuf_to_screen();
+        comp_cursor_save_and_draw(wm.cursor_x, wm.cursor_y);
+    } else if cursor_moved {
+        // Cursor-only move: restore old 16x16, draw new 16x16 on screen.
+        // ~768 MMIO writes instead of 786K — dramatically faster.
+        wm.dirty = false;
+        comp_cursor_restore();
+        comp_cursor_save_and_draw(wm.cursor_x, wm.cursor_y);
+    }
+}
+
+/// Track whether scene (not just cursor) has changed (text typed, etc.).
+static mut WM_SCENE_DIRTY: bool = false;
+
+/// Save 16x16 pixels under cursor from BACK BUFFER, then draw cursor on screen.
+unsafe fn comp_cursor_save_and_draw(cx: i32, cy: i32) {
+    if SCREEN_FB.is_null() || BACK_BUF.is_null() { return; }
+    let stride = SCREEN_STRIDE;
+    // Save clean pixels from back buffer (which never has cursor drawn on it).
+    for row in 0..16usize {
+        for col in 0..16usize {
+            let px = cx + col as i32;
+            let py = cy + row as i32;
+            if px >= 0 && py >= 0 && (px as u32) < FB_WIDTH && (py as u32) < FB_HEIGHT {
+                COMP_CURSOR_SAVE[row * 16 + col] =
+                    *BACK_BUF.add((py as u32 * stride + px as u32) as usize);
+            } else {
+                COMP_CURSOR_SAVE[row * 16 + col] = 0;
+            }
+        }
+    }
+    // Draw cursor on MMIO screen.
+    for row in 0..16usize {
+        for col in 0..16usize {
+            let px = cx + col as i32;
+            let py = cy + row as i32;
+            if px >= 0 && py >= 0 && (px as u32) < FB_WIDTH && (py as u32) < FB_HEIGHT {
+                let bit = 1u16 << (15 - col);
+                let offset = (py as u32 * stride + px as u32) as usize;
+                if CURSOR_BITMAP[row] & bit != 0 {
+                    *SCREEN_FB.add(offset) = COL_CURSOR_FG;
+                } else if CURSOR_MASK[row] & bit != 0 {
+                    *SCREEN_FB.add(offset) = COL_CURSOR_BG;
+                }
+            }
+        }
+    }
+    COMP_CURSOR_X = cx;
+    COMP_CURSOR_Y = cy;
+}
+
+/// Restore the pixels that were under the cursor on the MMIO screen.
+unsafe fn comp_cursor_restore() {
+    if SCREEN_FB.is_null() || COMP_CURSOR_X < 0 { return; }
+    let stride = SCREEN_STRIDE;
+    let cx = COMP_CURSOR_X;
+    let cy = COMP_CURSOR_Y;
+    for row in 0..16usize {
+        for col in 0..16usize {
+            let px = cx + col as i32;
+            let py = cy + row as i32;
+            if px >= 0 && py >= 0 && (px as u32) < FB_WIDTH && (py as u32) < FB_HEIGHT {
+                let bit = 1u16 << (15 - col);
+                if CURSOR_MASK[row] & bit != 0 {
+                    *SCREEN_FB.add((py as u32 * stride + px as u32) as usize) =
+                        COMP_CURSOR_SAVE[row * 16 + col];
+                }
+            }
+        }
     }
 }
 
 /// Fast blit: copy the RAM back buffer to the MMIO screen framebuffer.
-/// Sequential write is much faster than random pixel writes to UC memory.
 unsafe fn blit_backbuf_to_screen() {
     if BACK_BUF.is_null() || SCREEN_FB.is_null() { return; }
     core::ptr::copy_nonoverlapping(BACK_BUF, SCREEN_FB, SCREEN_PIXELS);
