@@ -154,6 +154,7 @@ version = "0.1.0"
 name = "sotos-common"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "linux-raw-sys",
 ]
 

@@ -89,17 +89,9 @@ pub(crate) static CHILD_SETUP_FLAGS: AtomicU64 = AtomicU64::new(0);
 // Phase 4: Thread groups, shared FD tables, and futex
 // ---------------------------------------------------------------------------
 
-// Clone flag constants (Linux ABI)
-pub(crate) const CLONE_VM: u64 = 0x00000100;
-pub(crate) const _CLONE_FS: u64 = 0x00000200;
-pub(crate) const CLONE_FILES: u64 = 0x00000400;
-pub(crate) const CLONE_SIGHAND: u64 = 0x00000800;
-pub(crate) const CLONE_THREAD: u64 = 0x00010000;
-pub(crate) const CLONE_SETTLS: u64 = 0x00080000;
-pub(crate) const CLONE_PARENT_SETTID: u64 = 0x00100000;
-pub(crate) const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
-pub(crate) const _CLONE_DETACHED: u64 = 0x00400000;
-pub(crate) const _CLONE_SYSVSEM: u64 = 0x00040000;
+// Clone flag constants — sourced from linux_abi (linux-raw-sys)
+pub(crate) use linux_abi::{CLONE_VM, CLONE_FILES, CLONE_SIGHAND, CLONE_THREAD,
+                           CLONE_SETTLS, CLONE_PARENT_SETTID, CLONE_CHILD_CLEARTID};
 
 /// Thread group ID per process slot. tgid = pid for leaders, tgid = leader's pid for threads.
 pub(crate) static PROC_TGID: [AtomicU64; MAX_PROCS] = {

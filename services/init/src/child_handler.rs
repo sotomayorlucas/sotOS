@@ -800,8 +800,9 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 let fd = msg.regs[4] as i64;
                 let offset = msg.regs[5];
 
-                let map_fixed = (flags & 0x10) != 0; // MAP_FIXED
-                let map_anon = (flags & 0x20) != 0; // MAP_ANONYMOUS
+                let mflags = MFlags::from_bits_truncate(flags);
+                let map_fixed = mflags.contains(MFlags::FIXED);
+                let map_anon = mflags.contains(MFlags::ANONYMOUS);
                 let pages = ((len + 0xFFF) & !0xFFF) / 0x1000;
 
                 // Determine base address
@@ -2050,10 +2051,10 @@ pub(crate) extern "C" fn child_handler() -> ! {
 
                     // Fall through to VFS if initrd didn't handle it
                     if !opened_initrd {
-                        let has_creat = (flags & 0o100) != 0; // O_CREAT
-                        let has_trunc = (flags & 0o1000) != 0; // O_TRUNC
-
-                        let has_dir = (flags & 0o200000) != 0; // O_DIRECTORY
+                        let oflags = OFlags::from_bits_truncate(flags as u32);
+                        let has_creat = oflags.contains(OFlags::CREAT);
+                        let has_trunc = oflags.contains(OFlags::TRUNC);
+                        let has_dir = oflags.contains(OFlags::DIRECTORY);
 
                         vfs_lock();
                         // Returns (oid, size, is_dir)
@@ -2181,8 +2182,8 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 let path_len = copy_guest_path(path_ptr, &mut path);
                 let name = &path[..path_len];
 
-                // AT_EMPTY_PATH (0x1000): use dirfd as the file descriptor
-                if (flags & 0x1000) != 0 && path_len == 0 {
+                // AT_EMPTY_PATH: use dirfd as the file descriptor
+                if (flags & AT_EMPTY_PATH) != 0 && path_len == 0 {
                     let fd = dirfd as usize;
                     if fd < CHILD_MAX_FDS && child_fds[fd] != 0 {
                         if child_fds[fd] == 12 {

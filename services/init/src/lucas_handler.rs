@@ -734,8 +734,9 @@ pub(crate) extern "C" fn lucas_handler() -> ! {
                         // Sync cwd before path resolution
                         vfs.cwd = cwd_oid;
 
-                        let linux_access = flags & 0x3;
-                        let has_creat = flags & 0x40 != 0;
+                        let oflags = OFlags::from_bits_truncate(flags as u32);
+                        let linux_access = flags & 0x3; // O_ACCMODE
+                        let has_creat = oflags.contains(OFlags::CREAT);
                         let vfs_flags = match linux_access {
                             0 => 1u32,
                             1 => 2u32,
@@ -956,7 +957,8 @@ pub(crate) extern "C" fn lucas_handler() -> ! {
                 let flags = msg.regs[3]; // r10 in kernel
                 let mmap_fd = msg.regs[4] as usize; // r8
                 let mmap_offset = msg.regs[5]; // r9
-                let is_anon = flags & 0x20 != 0; // MAP_ANONYMOUS
+                let mflags = MFlags::from_bits_truncate(flags as u32);
+                let is_anon = mflags.contains(MFlags::ANONYMOUS);
 
                 // Validate: file-backed mmap needs a valid VfsFile fd
                 if !is_anon {
@@ -1754,7 +1756,7 @@ pub(crate) extern "C" fn lucas_handler() -> ! {
                                 }
                             }
                             Err(_) => {
-                                if flags & 0x40 != 0 { // O_CREAT
+                                if OFlags::from_bits_truncate(flags as u32).contains(OFlags::CREAT) {
                                     match vfs.create(name) {
                                         Ok(fd) => {
                                             let oid = vfs.file_oid(fd).unwrap_or(0);

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 linux-raw-sys = { version = "0.4", default-features = false, features = ["general", "errno", "ioctl", "no_std"] }
+bitflags = { version = "2", default-features = false }
 
 [features]
 default = []

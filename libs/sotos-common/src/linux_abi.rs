@@ -285,6 +285,56 @@ pub const F_GETFL: u32   = k::F_GETFL;
 pub const F_SETFL: u32   = k::F_SETFL;
 
 // ---------------------------------------------------------------
+// clone(2) flags — sourced from linux-raw-sys
+// ---------------------------------------------------------------
+
+pub const CLONE_VM: u64             = k::CLONE_VM as u64;
+pub const CLONE_FILES: u64          = k::CLONE_FILES as u64;
+pub const CLONE_SIGHAND: u64        = k::CLONE_SIGHAND as u64;
+pub const CLONE_THREAD: u64         = k::CLONE_THREAD as u64;
+pub const CLONE_SETTLS: u64         = k::CLONE_SETTLS as u64;
+pub const CLONE_PARENT_SETTID: u64  = k::CLONE_PARENT_SETTID as u64;
+pub const CLONE_CHILD_CLEARTID: u64 = k::CLONE_CHILD_CLEARTID as u64;
+
+// ---------------------------------------------------------------
+// Strongly-typed flag sets via `bitflags`
+// ---------------------------------------------------------------
+
+bitflags::bitflags! {
+    /// open(2)/openat(2) flags (typed wrapper).
+    #[derive(Clone, Copy, Debug)]
+    pub struct OFlags: u32 {
+        const CREAT     = O_CREAT;
+        const TRUNC     = O_TRUNC;
+        const APPEND    = O_APPEND;
+        const NONBLOCK  = O_NONBLOCK;
+        const DIRECTORY = O_DIRECTORY;
+        const CLOEXEC   = O_CLOEXEC;
+    }
+
+    /// mmap(2) flags (typed wrapper).
+    #[derive(Clone, Copy, Debug)]
+    pub struct MFlags: u32 {
+        const SHARED    = MAP_SHARED;
+        const PRIVATE   = MAP_PRIVATE;
+        const FIXED     = MAP_FIXED;
+        const ANONYMOUS = MAP_ANONYMOUS;
+    }
+
+    /// clone(2) flags (typed wrapper).
+    #[derive(Clone, Copy, Debug)]
+    pub struct CFlags: u64 {
+        const VM             = CLONE_VM;
+        const FILES          = CLONE_FILES;
+        const SIGHAND        = CLONE_SIGHAND;
+        const THREAD         = CLONE_THREAD;
+        const SETTLS         = CLONE_SETTLS;
+        const PARENT_SETTID  = CLONE_PARENT_SETTID;
+        const CHILD_CLEARTID = CLONE_CHILD_CLEARTID;
+    }
+}
+
+// ---------------------------------------------------------------
 // Linux syscall numbers (x86_64) — sourced from linux-raw-sys
 // ---------------------------------------------------------------
 

@@ -471,7 +471,7 @@ pub(crate) fn run_musl_test() {
             9 => {
                 let len = msg.regs[1];
                 let flags = msg.regs[3];
-                if flags & 0x20 == 0 {
+                if !MFlags::from_bits_truncate(flags as u32).contains(MFlags::ANONYMOUS) {
                     reply_val(ep_cap, -22); // No file-backed mmap in test handler
                     continue;
                 }
@@ -898,7 +898,7 @@ pub(crate) fn run_dynamic_test() {
                 let fd = msg.regs[4] as i64;
                 let offset = msg.regs[5];
 
-                let map_fixed = (flags & 0x10) != 0;
+                let map_fixed = MFlags::from_bits_truncate(flags).contains(MFlags::FIXED);
                 let pages = ((len + 0xFFF) & !0xFFF) / 0x1000;
 
                 let base = if map_fixed && req_addr != 0 {
@@ -1545,8 +1545,9 @@ pub(crate) fn run_busybox_test() {
                 } else {
                     // Try VFS
                     let fname = if name.starts_with(b"/") { &name[1..] } else { name };
-                    let is_dir = flags & 0x10000 != 0; // O_DIRECTORY
-                    let o_creat = flags & 0x40 != 0;
+                    let oflags = OFlags::from_bits_truncate(flags as u32);
+                    let is_dir = oflags.contains(OFlags::DIRECTORY);
+                    let o_creat = oflags.contains(OFlags::CREAT);
                     // Opening root "/" (fname is empty) — always works, even without VFS
                     if fname.is_empty() || (is_dir && name == b"/") {
                         let mut slot = 0;
@@ -1588,7 +1589,7 @@ pub(crate) fn run_busybox_test() {
                                         bb_fd_conn[slot] = oid;
                                         bb_fd_pos[slot] = 0;
                                         bb_fd_size[slot] = size;
-                                        if flags & 0x200 != 0 {
+                                        if oflags.contains(OFlags::TRUNC) {
                                             let _ = store.write_obj(oid, &[]);
                                             bb_fd_size[slot] = 0;
                                         }
