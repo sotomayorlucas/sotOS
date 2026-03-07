@@ -5,6 +5,7 @@ use crate::framebuffer::{print, print_hex64};
 use crate::process::NEXT_CHILD_STACK;
 use crate::vdso;
 use crate::{vfs_lock, vfs_unlock, shared_store};
+use ufmt::uwrite;
 
 /// Parse an ELF binary using goblin, returning our existing types.
 /// Resets the bump allocator after extracting all needed data.
@@ -114,6 +115,64 @@ pub(crate) fn format_u64_into(buf: &mut [u8], mut n: u64) -> usize {
         buf[j] = tmp[i - 1 - j];
     }
     len
+}
+
+/// A no-alloc buffer writer implementing `ufmt::uWrite`.
+/// Writes directly into a `&mut [u8]` slice, tracking position.
+/// Silently truncates if the buffer is full.
+pub(crate) struct BufWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> BufWriter<'a> {
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+}
+
+impl ufmt::uWrite for BufWriter<'_> {
+    type Error = ();
+    fn write_str(&mut self, s: &str) -> Result<(), ()> {
+        let bytes = s.as_bytes();
+        let avail = self.buf.len() - self.pos;
+        let n = bytes.len().min(avail);
+        self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
+        self.pos += n;
+        Ok(())
+    }
+}
+
+/// Format "/proc/uptime" content: "secs.00 0.00\n"
+pub(crate) fn format_uptime_into(buf: &mut [u8], secs: u64) -> usize {
+    let mut w = BufWriter::new(buf);
+    let _ = uwrite!(w, "{}.00 0.00\n", secs);
+    w.pos()
+}
+
+/// Format minimal "/proc/self/stat": "pid (program) R 0 1 1 ...\n"
+pub(crate) fn format_proc_self_stat(buf: &mut [u8], pid: usize) -> usize {
+    let mut w = BufWriter::new(buf);
+    let _ = uwrite!(w, "{} (program) R 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", pid);
+    w.pos()
+}
+
+/// Format a PID listing row: "pid  S      ppid\n"
+pub(crate) fn format_pid_row(buf: &mut [u8], pid: usize, state: u64, ppid: u64) -> usize {
+    let mut w = BufWriter::new(buf);
+    let sc = if state == 1 { "R" } else { "Z" };
+    let _ = uwrite!(w, "{}  {}      {}\n", pid, sc, ppid);
+    w.pos()
+}
+
+/// Format wc-style output: "lines words bytes\n"
+pub(crate) fn format_wc_output(buf: &mut [u8], lines: u64, words: u64, bytes: u64) -> usize {
+    let mut w = BufWriter::new(buf);
+    let _ = uwrite!(w, "{} {} {}\n", lines, words, bytes);
+    w.pos()
 }
 
 /// Copy a NUL-terminated path from guest memory into a local buffer.

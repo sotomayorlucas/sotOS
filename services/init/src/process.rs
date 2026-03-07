@@ -6,7 +6,8 @@ use sotos_common::sys;
 use sotos_common::{IpcMsg, SIG_REDIRECT_TAG, SIGNAL_FRAME_SIZE};
 use sotos_common::linux_abi;
 use core::sync::atomic::{AtomicU64, Ordering};
-use crate::exec::format_u64_into;
+use crate::exec::BufWriter;
+use ufmt::uwrite;
 use crate::fd::fd_grp_init;
 
 // ---------------------------------------------------------------------------
@@ -488,43 +489,14 @@ pub(crate) fn parse_u64_from(s: &[u8]) -> (u64, usize) {
 
 /// Format /proc/N/status content into buf. Returns bytes written.
 pub(crate) fn format_proc_status(buf: &mut [u8], pid: usize) -> usize {
-    let mut pos: usize = 0;
-    // Name:\tprocess_N
-    let prefix = b"Name:\tprocess_";
-    buf[pos..pos + prefix.len()].copy_from_slice(prefix);
-    pos += prefix.len();
-    pos += format_u64_into(&mut buf[pos..], pid as u64);
-    buf[pos] = b'\n';
-    pos += 1;
-    // State:\tR or Z
-    let sp = b"State:\t";
-    buf[pos..pos + sp.len()].copy_from_slice(sp);
-    pos += sp.len();
-    let state = PROC_STATE[pid - 1].load(Ordering::Acquire);
-    buf[pos] = match state {
-        1 => b'R',
-        2 => b'Z',
-        _ => b'?',
+    let mut w = BufWriter::new(buf);
+    let state_str = match PROC_STATE[pid - 1].load(Ordering::Acquire) {
+        1 => "R", 2 => "Z", _ => "?",
     };
-    pos += 1;
-    buf[pos] = b'\n';
-    pos += 1;
-    // Pid:\tN
-    let pp = b"Pid:\t";
-    buf[pos..pos + pp.len()].copy_from_slice(pp);
-    pos += pp.len();
-    pos += format_u64_into(&mut buf[pos..], pid as u64);
-    buf[pos] = b'\n';
-    pos += 1;
-    // PPid:\tP
-    let ppp = b"PPid:\t";
-    buf[pos..pos + ppp.len()].copy_from_slice(ppp);
-    pos += ppp.len();
     let ppid = PROC_PARENT[pid - 1].load(Ordering::Acquire);
-    pos += format_u64_into(&mut buf[pos..], ppid);
-    buf[pos] = b'\n';
-    pos += 1;
-    pos
+    let _ = uwrite!(w, "Name:\tprocess_{}\nState:\t{}\nPid:\t{}\nPPid:\t{}\n",
+                    pid, state_str, pid, ppid);
+    w.pos()
 }
 
 // clone_child_trampoline is defined in child_handler.rs

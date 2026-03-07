@@ -10,7 +10,8 @@ use sotos_virtio::blk::VirtioBlk;
 use core::sync::atomic::{AtomicU64, Ordering};
 use crate::child_handler::child_handler;
 use crate::framebuffer::{print, print_u64, fb_putchar, kb_has_char, kb_read_char, poll_mouse};
-use crate::exec::{reply_val, rdtsc, format_u64_into, copy_guest_path, starts_with};
+use crate::exec::{reply_val, rdtsc, format_u64_into, copy_guest_path, starts_with,
+                  format_uptime_into, format_pid_row};
 use crate::process::*;
 use crate::fd::*;
 use crate::net::{NET_CMD_DNS_QUERY, NET_CMD_TCP_CONNECT, NET_CMD_TCP_SEND, NET_CMD_TCP_RECV,
@@ -515,30 +516,14 @@ pub(crate) extern "C" fn lucas_handler() -> ! {
                         for i in 0..MAX_PROCS {
                             let st = PROC_STATE[i].load(Ordering::Acquire);
                             if st == 0 { continue; }
-                            let n = format_u64_into(&mut dir_buf[dir_len..], (i + 1) as u64);
-                            dir_len += n;
-                            dir_buf[dir_len..dir_len + 2].copy_from_slice(b"  ");
-                            dir_len += 2;
-                            dir_buf[dir_len] = if st == 1 { b'R' } else { b'Z' };
-                            dir_len += 1;
-                            dir_buf[dir_len..dir_len + 6].copy_from_slice(b"      ");
-                            dir_len += 6;
                             let ppid = PROC_PARENT[i].load(Ordering::Acquire);
-                            let n = format_u64_into(&mut dir_buf[dir_len..], ppid);
-                            dir_len += n;
-                            dir_buf[dir_len] = b'\n';
-                            dir_len += 1;
+                            dir_len += format_pid_row(&mut dir_buf[dir_len..], i + 1, st, ppid);
                         }
                     } else if path_len == 12 && &path[..12] == b"/proc/uptime" {
-                        // "/proc/uptime" → "secs.frac idle_secs.frac\n"
                         let boot = BOOT_TSC.load(Ordering::Acquire);
                         let now = rdtsc();
                         let secs = now.saturating_sub(boot) / 2_000_000_000 + UPTIME_OFFSET_SECS;
-                        let n = format_u64_into(&mut dir_buf[dir_len..], secs);
-                        dir_len += n;
-                        let tail = b".00 0.00\n";
-                        dir_buf[dir_len..dir_len + tail.len()].copy_from_slice(tail);
-                        dir_len += tail.len();
+                        dir_len += format_uptime_into(&mut dir_buf[dir_len..], secs);
                     } else if name == b"/proc/version" {
                         let info = b"Linux version 5.15.0-sotOS (root@sotOS) (gcc 12.0) #1 SMP PREEMPT\n";
                         let n = info.len().min(dir_buf.len());

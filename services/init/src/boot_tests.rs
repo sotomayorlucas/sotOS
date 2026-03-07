@@ -9,7 +9,8 @@ use sotos_common::linux_abi::*;
 use core::sync::atomic::Ordering;
 use crate::framebuffer::{print, print_u64, print_hex64, fb_putchar};
 use crate::exec::{reply_val, exec_from_initrd, exec_from_initrd_argv, rdtsc,
-                  EXEC_LOCK, MAX_EXEC_ARG_LEN, format_u64_into, copy_guest_path};
+                  EXEC_LOCK, MAX_EXEC_ARG_LEN, format_u64_into, copy_guest_path,
+                  format_wc_output};
 use crate::process::*;
 use crate::fd::*;
 use crate::syscall_log::{syscall_log_record, syscall_log_dump, SYSCALL_LOG_COUNT};
@@ -2252,13 +2253,7 @@ pub(crate) fn run_busybox_test() {
                             } else if !in_word { words += 1; in_word = true; }
                         }
                         let mut out = [0u8; 64];
-                        let mut pos = 0;
-                        pos += format_u64_into(&mut out[pos..], lines);
-                        out[pos] = b' '; pos += 1;
-                        pos += format_u64_into(&mut out[pos..], words);
-                        out[pos] = b' '; pos += 1;
-                        pos += format_u64_into(&mut out[pos..], n as u64);
-                        out[pos] = b'\n'; pos += 1;
+                        let pos = format_wc_output(&mut out, lines, words, n as u64);
                         if bb_fd_kind[1] == 7 {
                             let out_slot = bb_fd_conn[1] as usize;
                             let avail = 4096 - pipe_len[out_slot];

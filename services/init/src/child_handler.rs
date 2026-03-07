@@ -10,7 +10,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::framebuffer::{print, print_u64, fb_putchar, kb_has_char, kb_read_char, poll_mouse};
 use crate::exec::{reply_val, rdtsc, exec_from_initrd, exec_from_initrd_argv,
                   EXEC_LOCK, MAX_EXEC_ARG_LEN, MAX_EXEC_ARGS,
-                  format_u64_into, copy_guest_path, starts_with};
+                  format_u64_into, copy_guest_path, starts_with,
+                  format_uptime_into, format_proc_self_stat};
 use crate::process::*;
 use crate::fd::*;
 use crate::net::{NET_CMD_TCP_CONNECT, NET_CMD_TCP_SEND, NET_CMD_TCP_RECV, NET_CMD_TCP_CLOSE,
@@ -1886,13 +1887,7 @@ pub(crate) extern "C" fn child_handler() -> ! {
                     } else if name == b"/proc/self/status" {
                         gen_len = format_proc_status(dir_buf, pid);
                     } else if name == b"/proc/self/stat" {
-                        // Minimal: "pid (name) R ppid pgid sid ..."
-                        let mut pos = 0usize;
-                        pos += format_u64_into(&mut dir_buf[pos..], pid as u64);
-                        let tail = b" (program) R 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
-                        let n = tail.len().min(dir_buf.len() - pos);
-                        dir_buf[pos..pos + n].copy_from_slice(&tail[..n]);
-                        gen_len = pos + n;
+                        gen_len = format_proc_self_stat(dir_buf, pid);
                     } else if name == b"/proc/cpuinfo" {
                         let info = b"processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel name\t: QEMU Virtual CPU\ncache size\t: 4096 KB\nflags\t\t: fpu sse sse2 ssse3 sse4_1 sse4_2 rdtsc\n\n";
                         let n = info.len().min(dir_buf.len());
@@ -1904,16 +1899,10 @@ pub(crate) extern "C" fn child_handler() -> ! {
                         dir_buf[..n].copy_from_slice(&info[..n]);
                         gen_len = n;
                     } else if name == b"/proc/uptime" {
-                        // Generate uptime: "secs.frac idle_secs.frac\n"
                         let tsc = rdtsc();
                         let boot_tsc = BOOT_TSC.load(Ordering::Acquire);
                         let secs = if tsc > boot_tsc { (tsc - boot_tsc) / 2_000_000_000 } else { 0 } + UPTIME_OFFSET_SECS;
-                        let mut pos = 0usize;
-                        pos += format_u64_into(&mut dir_buf[pos..], secs);
-                        dir_buf[pos..pos + 7].copy_from_slice(b".00 0.00");
-                        pos += 8;
-                        dir_buf[pos] = b'\n';
-                        gen_len = pos + 1;
+                        gen_len = format_uptime_into(dir_buf, secs);
                     } else if name == b"/proc/version" {
                         let info = b"Linux version 5.15.0-sotOS (root@sotOS) (gcc 12.0) #1 SMP PREEMPT\n";
                         let n = info.len().min(dir_buf.len());
