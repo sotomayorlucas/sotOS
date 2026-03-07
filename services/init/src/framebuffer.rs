@@ -679,7 +679,7 @@ impl vte::Perform for FbPerformer {
 /// Write a single character to the framebuffer console (inside terminal window).
 /// Uses vte crate for ANSI escape sequence parsing.
 pub(crate) unsafe fn fb_putchar(ch: u8) {
-    if FB_PTR == 0 { return; }
+    if FB_PTR == 0 || COMPOSITOR_ACTIVE { return; }
     if VTE_PARSER.is_none() {
         VTE_PARSER = Some(vte::Parser::new());
     }
