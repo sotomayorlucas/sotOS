@@ -522,12 +522,9 @@ unsafe fn fb_scroll() {
 }
 
 // ---------------------------------------------------------------------------
-// ANSI escape sequence parser state
+// ANSI escape sequence parser (vte crate)
 // ---------------------------------------------------------------------------
-static mut ANSI_STATE: u8 = 0;           // 0=Normal, 1=EscSeen, 2=CSI, 3=OSC
-static mut ANSI_PARAMS: [u16; 8] = [0; 8];
-static mut ANSI_PARAM_COUNT: u8 = 0;
-static mut ANSI_PRIVATE: bool = false;    // '?' prefix in CSI
+static mut VTE_PARSER: Option<vte::Parser> = None;
 static mut ANSI_SAVED_COL: u32 = 0;
 static mut ANSI_SAVED_ROW: u32 = 0;
 
@@ -548,161 +545,29 @@ unsafe fn fb_clear_region(col_start: u32, col_end: u32, row_start: u32, row_end:
     }
 }
 
-/// Execute a CSI (Control Sequence Introducer) command.
-unsafe fn ansi_csi_dispatch(final_ch: u8) {
-    let p0 = ANSI_PARAMS[0] as u32;
-    let p1 = ANSI_PARAMS[1] as u32;
-    let nparams = ANSI_PARAM_COUNT as usize;
+/// vte Perform implementation for framebuffer console.
+struct FbPerformer;
 
-    match final_ch {
-        // CUU -- Cursor Up
-        b'A' => {
-            let n = if p0 == 0 { 1 } else { p0 };
-            CON_CUR_ROW = CON_CUR_ROW.saturating_sub(n);
-        }
-        // CUD -- Cursor Down
-        b'B' => {
-            let n = if p0 == 0 { 1 } else { p0 };
-            CON_CUR_ROW = (CON_CUR_ROW + n).min(CON_ROWS - 1);
-        }
-        // CUF -- Cursor Forward (Right)
-        b'C' => {
-            let n = if p0 == 0 { 1 } else { p0 };
-            CON_CUR_COL = (CON_CUR_COL + n).min(CON_COLS - 1);
-        }
-        // CUB -- Cursor Back (Left)
-        b'D' => {
-            let n = if p0 == 0 { 1 } else { p0 };
-            CON_CUR_COL = CON_CUR_COL.saturating_sub(n);
-        }
-        // CUP / HVP -- Cursor Position (row;col, 1-based)
-        b'H' | b'f' => {
-            let row = if p0 == 0 { 1 } else { p0 };
-            let col = if nparams >= 2 && p1 > 0 { p1 } else { 1 };
-            CON_CUR_ROW = (row - 1).min(CON_ROWS - 1);
-            CON_CUR_COL = (col - 1).min(CON_COLS - 1);
-        }
-        // ED -- Erase in Display
-        b'J' => {
-            match p0 {
-                0 => {
-                    // Clear from cursor to end of screen
-                    fb_clear_region(CON_CUR_COL, CON_COLS, CON_CUR_ROW, CON_CUR_ROW + 1);
-                    if CON_CUR_ROW + 1 < CON_ROWS {
-                        fb_clear_region(0, CON_COLS, CON_CUR_ROW + 1, CON_ROWS);
-                    }
+impl vte::Perform for FbPerformer {
+    fn print(&mut self, c: char) {
+        unsafe {
+            let ch = if (c as u32) <= 0xFF { c as u8 } else { b'?' };
+            fb_draw_char(CON_CUR_COL, CON_CUR_ROW, ch);
+            CON_CUR_COL += 1;
+            if CON_CUR_COL >= CON_COLS {
+                CON_CUR_COL = 0;
+                CON_CUR_ROW += 1;
+                if CON_CUR_ROW >= CON_ROWS {
+                    CON_CUR_ROW = CON_ROWS - 1;
+                    fb_scroll();
                 }
-                1 => {
-                    // Clear from start to cursor
-                    if CON_CUR_ROW > 0 {
-                        fb_clear_region(0, CON_COLS, 0, CON_CUR_ROW);
-                    }
-                    fb_clear_region(0, CON_CUR_COL + 1, CON_CUR_ROW, CON_CUR_ROW + 1);
-                }
-                2 | 3 => {
-                    // Clear entire screen
-                    fb_clear_region(0, CON_COLS, 0, CON_ROWS);
-                    CON_CUR_COL = 0;
-                    CON_CUR_ROW = 0;
-                }
-                _ => {}
             }
         }
-        // EL -- Erase in Line
-        b'K' => {
-            match p0 {
-                0 => {
-                    // Clear from cursor to end of line
-                    fb_clear_region(CON_CUR_COL, CON_COLS, CON_CUR_ROW, CON_CUR_ROW + 1);
-                }
-                1 => {
-                    // Clear from start of line to cursor
-                    fb_clear_region(0, CON_CUR_COL + 1, CON_CUR_ROW, CON_CUR_ROW + 1);
-                }
-                2 => {
-                    // Clear entire line
-                    fb_clear_region(0, CON_COLS, CON_CUR_ROW, CON_CUR_ROW + 1);
-                }
-                _ => {}
-            }
-        }
-        // SGR -- Select Graphic Rendition (colors/attributes)
-        // We ignore color/bold/etc but don't render the sequence as text
-        b'm' => {}
-        // DECSET/DECRST -- DEC Private Mode Set/Reset (cursor visibility, alt screen, etc.)
-        b'h' | b'l' => {}
-        // SU -- Scroll Up
-        b'S' => {
-            let n = if p0 == 0 { 1 } else { p0 };
-            for _ in 0..n { fb_scroll(); }
-        }
-        // SD -- Scroll Down (not commonly needed, ignore)
-        b'T' => {}
-        // DSR -- Device Status Report (cursor position query)
-        b'n' => {}
-        // DECSC/DECRC via CSI -- Save/Restore cursor
-        b's' => { ANSI_SAVED_COL = CON_CUR_COL; ANSI_SAVED_ROW = CON_CUR_ROW; }
-        b'u' => { CON_CUR_COL = ANSI_SAVED_COL; CON_CUR_ROW = ANSI_SAVED_ROW; }
-        // ICH -- Insert Character (fill with spaces)
-        b'@' => {
-            let n = if p0 == 0 { 1 } else { p0 };
-            // Just clear n chars at cursor
-            let end = (CON_CUR_COL + n).min(CON_COLS);
-            fb_clear_region(CON_CUR_COL, end, CON_CUR_ROW, CON_CUR_ROW + 1);
-        }
-        // DCH -- Delete Character
-        b'P' => {}
-        // IL -- Insert Lines
-        b'L' => {}
-        // DL -- Delete Lines
-        b'M' => {}
-        // ECH -- Erase Character
-        b'X' => {
-            let n = if p0 == 0 { 1 } else { p0 };
-            let end = (CON_CUR_COL + n).min(CON_COLS);
-            fb_clear_region(CON_CUR_COL, end, CON_CUR_ROW, CON_CUR_ROW + 1);
-        }
-        // DECSTBM -- Set Top and Bottom Margins (scrolling region)
-        b'r' => {}
-        // CHA -- Cursor Horizontal Absolute (column, 1-based)
-        b'G' => {
-            let col = if p0 == 0 { 1 } else { p0 };
-            CON_CUR_COL = (col - 1).min(CON_COLS - 1);
-        }
-        // VPA -- Vertical Position Absolute (row, 1-based)
-        b'd' => {
-            let row = if p0 == 0 { 1 } else { p0 };
-            CON_CUR_ROW = (row - 1).min(CON_ROWS - 1);
-        }
-        // CNL -- Cursor Next Line
-        b'E' => {
-            let n = if p0 == 0 { 1 } else { p0 };
-            CON_CUR_COL = 0;
-            CON_CUR_ROW = (CON_CUR_ROW + n).min(CON_ROWS - 1);
-        }
-        // CPL -- Cursor Previous Line
-        b'F' => {
-            let n = if p0 == 0 { 1 } else { p0 };
-            CON_CUR_COL = 0;
-            CON_CUR_ROW = CON_CUR_ROW.saturating_sub(n);
-        }
-        _ => {} // Unknown CSI -- silently ignore
     }
-}
 
-/// Write a single character to the framebuffer console (inside terminal window).
-/// Includes ANSI escape sequence parser for cursor positioning, screen clearing, etc.
-pub(crate) unsafe fn fb_putchar(ch: u8) {
-    if FB_PTR == 0 { return; }
-
-    match ANSI_STATE {
-        // Normal mode
-        0 => {
-            match ch {
-                0x1B => {
-                    // ESC -- start escape sequence
-                    ANSI_STATE = 1;
-                }
+    fn execute(&mut self, byte: u8) {
+        unsafe {
+            match byte {
                 b'\n' => {
                     CON_CUR_COL = 0;
                     CON_CUR_ROW += 1;
@@ -711,148 +576,114 @@ pub(crate) unsafe fn fb_putchar(ch: u8) {
                         fb_scroll();
                     }
                 }
-                b'\r' => {
-                    CON_CUR_COL = 0;
-                }
-                0x08 | 0x7F => {
-                    // Backspace / DEL
+                b'\r' => { CON_CUR_COL = 0; }
+                0x08 => {
                     if CON_CUR_COL > 0 {
                         CON_CUR_COL -= 1;
                         fb_draw_char(CON_CUR_COL, CON_CUR_ROW, b' ');
                     }
                 }
                 b'\t' => {
-                    // Tab -- advance to next 8-column boundary
-                    let next = (CON_CUR_COL + 8) & !7;
-                    CON_CUR_COL = next.min(CON_COLS - 1);
+                    CON_CUR_COL = ((CON_CUR_COL + 8) & !7).min(CON_COLS - 1);
                 }
-                _ => {
-                    if ch >= 0x20 {
-                        fb_draw_char(CON_CUR_COL, CON_CUR_ROW, ch);
-                        CON_CUR_COL += 1;
-                        if CON_CUR_COL >= CON_COLS {
-                            CON_CUR_COL = 0;
-                            CON_CUR_ROW += 1;
-                            if CON_CUR_ROW >= CON_ROWS {
-                                CON_CUR_ROW = CON_ROWS - 1;
-                                fb_scroll();
-                            }
-                        }
-                    }
-                    // Control chars < 0x20 (except handled ones) are silently ignored
-                }
+                _ => {}
             }
-        }
-        // ESC seen -- waiting for second byte
-        1 => {
-            match ch {
-                b'[' => {
-                    // CSI -- Control Sequence Introducer
-                    ANSI_STATE = 2;
-                    ANSI_PARAMS = [0; 8];
-                    ANSI_PARAM_COUNT = 0;
-                    ANSI_PRIVATE = false;
-                }
-                b']' => {
-                    // OSC -- Operating System Command
-                    ANSI_STATE = 3;
-                }
-                b'c' => {
-                    // RIS -- Reset to Initial State
-                    CON_CUR_COL = 0;
-                    CON_CUR_ROW = 0;
-                    fb_clear_region(0, CON_COLS, 0, CON_ROWS);
-                    ANSI_STATE = 0;
-                }
-                b'7' => {
-                    // DECSC -- Save Cursor
-                    ANSI_SAVED_COL = CON_CUR_COL;
-                    ANSI_SAVED_ROW = CON_CUR_ROW;
-                    ANSI_STATE = 0;
-                }
-                b'8' => {
-                    // DECRC -- Restore Cursor
-                    CON_CUR_COL = ANSI_SAVED_COL;
-                    CON_CUR_ROW = ANSI_SAVED_ROW;
-                    ANSI_STATE = 0;
-                }
-                b'M' => {
-                    // RI -- Reverse Index (scroll down one line)
-                    if CON_CUR_ROW > 0 { CON_CUR_ROW -= 1; }
-                    ANSI_STATE = 0;
-                }
-                b'D' => {
-                    // IND -- Index (move cursor down, scroll if at bottom)
-                    CON_CUR_ROW += 1;
-                    if CON_CUR_ROW >= CON_ROWS {
-                        CON_CUR_ROW = CON_ROWS - 1;
-                        fb_scroll();
-                    }
-                    ANSI_STATE = 0;
-                }
-                b'(' | b')' => {
-                    // Designate character set -- skip next byte
-                    ANSI_STATE = 4; // consume one more byte then reset
-                }
-                _ => {
-                    // Unknown ESC sequence -- return to normal
-                    ANSI_STATE = 0;
-                }
-            }
-        }
-        // CSI parameter accumulation
-        2 => {
-            match ch {
-                b'0'..=b'9' => {
-                    let idx = ANSI_PARAM_COUNT as usize;
-                    if idx < 8 {
-                        ANSI_PARAMS[idx] = ANSI_PARAMS[idx].saturating_mul(10)
-                            .saturating_add((ch - b'0') as u16);
-                    }
-                }
-                b';' => {
-                    if (ANSI_PARAM_COUNT as usize) < 7 {
-                        ANSI_PARAM_COUNT += 1;
-                    }
-                }
-                b'?' => {
-                    ANSI_PRIVATE = true;
-                }
-                // Intermediate bytes (space, !, ", #, etc.) -- ignore but stay in CSI
-                0x20..=0x2F => {}
-                // Final byte -- dispatch the command
-                0x40..=0x7E => {
-                    // Count includes the current parameter being accumulated
-                    ANSI_PARAM_COUNT += 1;
-                    ansi_csi_dispatch(ch);
-                    ANSI_STATE = 0;
-                }
-                _ => {
-                    // Invalid -- bail out
-                    ANSI_STATE = 0;
-                }
-            }
-        }
-        // OSC string -- consume until BEL (0x07) or ST (ESC \)
-        3 => {
-            match ch {
-                0x07 => { ANSI_STATE = 0; } // BEL terminates OSC
-                0x1B => { ANSI_STATE = 5; } // might be ST (ESC \)
-                _ => {} // consume
-            }
-        }
-        // Skip one byte after ESC ( or ESC ) -- character set designation
-        4 => {
-            ANSI_STATE = 0;
-        }
-        // Inside OSC, got ESC -- check for backslash (ST)
-        5 => {
-            ANSI_STATE = if ch == b'\\' { 0 } else { 3 };
-        }
-        _ => {
-            ANSI_STATE = 0;
         }
     }
+
+    fn csi_dispatch(&mut self, params: &vte::Params, _intermediates: &[u8], _ignore: bool, action: char) {
+        unsafe {
+            let mut iter = params.iter();
+            let p0 = iter.next().map(|s| s[0] as u32).unwrap_or(0);
+            let p1 = iter.next().map(|s| s[0] as u32).unwrap_or(0);
+            let nparams = params.len();
+
+            match action as u8 {
+                b'A' => { let n = if p0 == 0 { 1 } else { p0 }; CON_CUR_ROW = CON_CUR_ROW.saturating_sub(n); }
+                b'B' => { let n = if p0 == 0 { 1 } else { p0 }; CON_CUR_ROW = (CON_CUR_ROW + n).min(CON_ROWS - 1); }
+                b'C' => { let n = if p0 == 0 { 1 } else { p0 }; CON_CUR_COL = (CON_CUR_COL + n).min(CON_COLS - 1); }
+                b'D' => { let n = if p0 == 0 { 1 } else { p0 }; CON_CUR_COL = CON_CUR_COL.saturating_sub(n); }
+                b'H' | b'f' => {
+                    let row = if p0 == 0 { 1 } else { p0 };
+                    let col = if nparams >= 2 && p1 > 0 { p1 } else { 1 };
+                    CON_CUR_ROW = (row - 1).min(CON_ROWS - 1);
+                    CON_CUR_COL = (col - 1).min(CON_COLS - 1);
+                }
+                b'J' => match p0 {
+                    0 => {
+                        fb_clear_region(CON_CUR_COL, CON_COLS, CON_CUR_ROW, CON_CUR_ROW + 1);
+                        if CON_CUR_ROW + 1 < CON_ROWS {
+                            fb_clear_region(0, CON_COLS, CON_CUR_ROW + 1, CON_ROWS);
+                        }
+                    }
+                    1 => {
+                        if CON_CUR_ROW > 0 { fb_clear_region(0, CON_COLS, 0, CON_CUR_ROW); }
+                        fb_clear_region(0, CON_CUR_COL + 1, CON_CUR_ROW, CON_CUR_ROW + 1);
+                    }
+                    2 | 3 => {
+                        fb_clear_region(0, CON_COLS, 0, CON_ROWS);
+                        CON_CUR_COL = 0; CON_CUR_ROW = 0;
+                    }
+                    _ => {}
+                }
+                b'K' => match p0 {
+                    0 => fb_clear_region(CON_CUR_COL, CON_COLS, CON_CUR_ROW, CON_CUR_ROW + 1),
+                    1 => fb_clear_region(0, CON_CUR_COL + 1, CON_CUR_ROW, CON_CUR_ROW + 1),
+                    2 => fb_clear_region(0, CON_COLS, CON_CUR_ROW, CON_CUR_ROW + 1),
+                    _ => {}
+                }
+                b'm' | b'h' | b'l' | b'T' | b'n' | b'P' | b'L' | b'M' | b'r' => {}
+                b'S' => { let n = if p0 == 0 { 1 } else { p0 }; for _ in 0..n { fb_scroll(); } }
+                b's' => { ANSI_SAVED_COL = CON_CUR_COL; ANSI_SAVED_ROW = CON_CUR_ROW; }
+                b'u' => { CON_CUR_COL = ANSI_SAVED_COL; CON_CUR_ROW = ANSI_SAVED_ROW; }
+                b'@' | b'X' => {
+                    let n = if p0 == 0 { 1 } else { p0 };
+                    let end = (CON_CUR_COL + n).min(CON_COLS);
+                    fb_clear_region(CON_CUR_COL, end, CON_CUR_ROW, CON_CUR_ROW + 1);
+                }
+                b'G' => { let col = if p0 == 0 { 1 } else { p0 }; CON_CUR_COL = (col - 1).min(CON_COLS - 1); }
+                b'd' => { let row = if p0 == 0 { 1 } else { p0 }; CON_CUR_ROW = (row - 1).min(CON_ROWS - 1); }
+                b'E' => {
+                    let n = if p0 == 0 { 1 } else { p0 };
+                    CON_CUR_COL = 0;
+                    CON_CUR_ROW = (CON_CUR_ROW + n).min(CON_ROWS - 1);
+                }
+                b'F' => {
+                    let n = if p0 == 0 { 1 } else { p0 };
+                    CON_CUR_COL = 0;
+                    CON_CUR_ROW = CON_CUR_ROW.saturating_sub(n);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        unsafe {
+            if !intermediates.is_empty() { return; }
+            match byte {
+                b'c' => { CON_CUR_COL = 0; CON_CUR_ROW = 0; fb_clear_region(0, CON_COLS, 0, CON_ROWS); }
+                b'7' => { ANSI_SAVED_COL = CON_CUR_COL; ANSI_SAVED_ROW = CON_CUR_ROW; }
+                b'8' => { CON_CUR_COL = ANSI_SAVED_COL; CON_CUR_ROW = ANSI_SAVED_ROW; }
+                b'M' => { if CON_CUR_ROW > 0 { CON_CUR_ROW -= 1; } }
+                b'D' => {
+                    CON_CUR_ROW += 1;
+                    if CON_CUR_ROW >= CON_ROWS { CON_CUR_ROW = CON_ROWS - 1; fb_scroll(); }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Write a single character to the framebuffer console (inside terminal window).
+/// Uses vte crate for ANSI escape sequence parsing.
+pub(crate) unsafe fn fb_putchar(ch: u8) {
+    if FB_PTR == 0 { return; }
+    if VTE_PARSER.is_none() {
+        VTE_PARSER = Some(vte::Parser::new());
+    }
+    VTE_PARSER.as_mut().unwrap().advance(&mut FbPerformer, ch);
 }
 
 /// Draw the mouse cursor at the current position.
