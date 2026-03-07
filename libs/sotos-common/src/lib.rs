@@ -66,6 +66,8 @@ pub enum Syscall {
     Map = 22,
     /// Unmap a virtual page.
     Unmap = 23,
+    /// Unmap a virtual page and free the underlying physical frame.
+    UnmapFree = 24,
     /// Delegate a capability (with optional rights restriction).
     CapGrant = 30,
     /// Revoke a capability and all its derivatives.
@@ -432,10 +434,28 @@ pub mod sys {
         ret
     }
 
+    /// Check a raw syscall return: negative → Err, otherwise Ok(value).
+    #[inline(always)]
+    fn check_val(ret: u64) -> Result<u64, i64> {
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+    }
+
+    /// Check a raw syscall return: negative → Err, otherwise Ok(()).
+    #[inline(always)]
+    fn check_unit(ret: u64) -> Result<(), i64> {
+        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+    }
+
     /// Write a single byte to the kernel debug serial port.
     #[inline(always)]
     pub fn debug_print(byte: u8) {
         syscall1(super::Syscall::DebugPrint as u64, byte as u64);
+    }
+
+    /// Query the number of free physical frames (debug).
+    #[inline(always)]
+    pub fn debug_free_frames() -> u64 {
+        syscall0(252)
     }
 
     /// Non-blocking read one byte from serial. Returns Some(byte) or None.
@@ -448,23 +468,20 @@ pub mod sys {
     /// Allocate a physical frame. Returns the frame capability ID.
     #[inline(always)]
     pub fn frame_alloc() -> Result<u64, i64> {
-        let ret = syscall0(super::Syscall::FrameAlloc as u64);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+        check_val(syscall0(super::Syscall::FrameAlloc as u64))
     }
 
     /// Map a frame into the caller's address space.
     /// `flags`: bit 1 = WRITABLE, bit 63 = NO_EXECUTE.
     #[inline(always)]
     pub fn map(vaddr: u64, frame_cap: u64, flags: u64) -> Result<(), i64> {
-        let ret = syscall3(super::Syscall::Map as u64, vaddr, frame_cap, flags);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall3(super::Syscall::Map as u64, vaddr, frame_cap, flags))
     }
 
     /// Create a notification object. Returns the notification capability ID.
     #[inline(always)]
     pub fn notify_create() -> Result<u64, i64> {
-        let ret = syscall0(super::Syscall::NotifyCreate as u64);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+        check_val(syscall0(super::Syscall::NotifyCreate as u64))
     }
 
     /// Wait on a notification (blocks if not pending).
@@ -482,16 +499,14 @@ pub mod sys {
     /// Create a new thread. Returns the thread capability ID.
     #[inline(always)]
     pub fn thread_create(rip: u64, rsp: u64) -> Result<u64, i64> {
-        let ret = syscall3(super::Syscall::ThreadCreate as u64, rip, rsp, 0);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+        check_val(syscall3(super::Syscall::ThreadCreate as u64, rip, rsp, 0))
     }
 
     /// Create a new thread with a pre-set syscall redirect endpoint (for LUCAS).
     /// The redirect is set atomically before the thread is scheduled.
     #[inline(always)]
     pub fn thread_create_redirected(rip: u64, rsp: u64, ep_cap: u64) -> Result<u64, i64> {
-        let ret = syscall3(super::Syscall::ThreadCreate as u64, rip, rsp, ep_cap);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+        check_val(syscall3(super::Syscall::ThreadCreate as u64, rip, rsp, ep_cap))
     }
 
     /// Terminate the current thread (never returns).
@@ -508,47 +523,29 @@ pub mod sys {
         syscall0(super::Syscall::Yield as u64);
     }
 
-    /// Read a byte from an I/O port.
-    #[inline(always)]
-    pub fn port_in(cap: u64, port: u64) -> Result<u8, i64> {
-        let ret = syscall3(super::Syscall::PortIn as u64, cap, port, 1);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret as u8) }
+    macro_rules! port_in_fn {
+        ($name:ident, $width:expr, $ty:ty) => {
+            #[inline(always)]
+            pub fn $name(cap: u64, port: u64) -> Result<$ty, i64> {
+                check_val(syscall3(super::Syscall::PortIn as u64, cap, port, $width)).map(|v| v as $ty)
+            }
+        };
+    }
+    macro_rules! port_out_fn {
+        ($name:ident, $width:expr, $ty:ty) => {
+            #[inline(always)]
+            pub fn $name(cap: u64, port: u64, value: $ty) -> Result<(), i64> {
+                check_unit(syscall4(super::Syscall::PortOut as u64, cap, port, value as u64, $width))
+            }
+        };
     }
 
-    /// Write a byte to an I/O port.
-    #[inline(always)]
-    pub fn port_out(cap: u64, port: u64, value: u8) -> Result<(), i64> {
-        let ret = syscall4(super::Syscall::PortOut as u64, cap, port, value as u64, 1);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
-    }
-
-    /// Read a 16-bit word from an I/O port.
-    #[inline(always)]
-    pub fn port_in16(cap: u64, port: u64) -> Result<u16, i64> {
-        let ret = syscall3(super::Syscall::PortIn as u64, cap, port, 2);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret as u16) }
-    }
-
-    /// Read a 32-bit dword from an I/O port.
-    #[inline(always)]
-    pub fn port_in32(cap: u64, port: u64) -> Result<u32, i64> {
-        let ret = syscall3(super::Syscall::PortIn as u64, cap, port, 4);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret as u32) }
-    }
-
-    /// Write a 16-bit word to an I/O port.
-    #[inline(always)]
-    pub fn port_out16(cap: u64, port: u64, value: u16) -> Result<(), i64> {
-        let ret = syscall4(super::Syscall::PortOut as u64, cap, port, value as u64, 2);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
-    }
-
-    /// Write a 32-bit dword to an I/O port.
-    #[inline(always)]
-    pub fn port_out32(cap: u64, port: u64, value: u32) -> Result<(), i64> {
-        let ret = syscall4(super::Syscall::PortOut as u64, cap, port, value as u64, 4);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
-    }
+    port_in_fn!(port_in, 1, u8);
+    port_in_fn!(port_in16, 2, u16);
+    port_in_fn!(port_in32, 4, u32);
+    port_out_fn!(port_out, 1, u8);
+    port_out_fn!(port_out16, 2, u16);
+    port_out_fn!(port_out32, 4, u32);
 
     /// Read the CPU timestamp counter (rdtsc).
     #[inline(always)]
@@ -588,7 +585,7 @@ pub mod sys {
                 options(nostack),
             );
         }
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(ret)
     }
 
     /// Receive a message from a synchronous IPC endpoint.
@@ -617,11 +614,7 @@ pub mod sys {
                 options(nostack),
             );
         }
-        if (ret as i64) < 0 {
-            Err(ret as i64)
-        } else {
-            Ok(super::IpcMsg { tag, regs: [r0, r1, r2, r3, r4, r5, r6, r7] })
-        }
+        check_val(ret).map(|_| super::IpcMsg { tag, regs: [r0, r1, r2, r3, r4, r5, r6, r7] })
     }
 
     /// Combined send+receive (call semantics) on a synchronous IPC endpoint.
@@ -650,11 +643,7 @@ pub mod sys {
                 options(nostack),
             );
         }
-        if (ret as i64) < 0 {
-            Err(ret as i64)
-        } else {
-            Ok(super::IpcMsg { tag, regs: [r0, r1, r2, r3, r4, r5, r6, r7] })
-        }
+        check_val(ret).map(|_| super::IpcMsg { tag, regs: [r0, r1, r2, r3, r4, r5, r6, r7] })
     }
 
     /// Combined send+receive with timeout on a synchronous IPC endpoint.
@@ -687,11 +676,7 @@ pub mod sys {
                 options(nostack),
             );
         }
-        if (ret as i64) < 0 {
-            Err(ret as i64)
-        } else {
-            Ok(super::IpcMsg { tag, regs: [r0, r1, r2, r3, r4, r5, r6, r7] })
-        }
+        check_val(ret).map(|_| super::IpcMsg { tag, regs: [r0, r1, r2, r3, r4, r5, r6, r7] })
     }
 
     // ---------------------------------------------------------------
@@ -701,15 +686,13 @@ pub mod sys {
     /// Create a new async IPC channel. Returns the channel capability ID.
     #[inline(always)]
     pub fn channel_create() -> Result<u64, i64> {
-        let ret = syscall0(super::Syscall::ChannelCreate as u64);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+        check_val(syscall0(super::Syscall::ChannelCreate as u64))
     }
 
     /// Send a tag on an async channel.
     #[inline(always)]
     pub fn channel_send(cap: u64, tag: u64) -> Result<(), i64> {
-        let ret = syscall2(super::Syscall::ChannelSend as u64, cap, tag);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall2(super::Syscall::ChannelSend as u64, cap, tag))
     }
 
     /// Receive a tag from an async channel.
@@ -736,14 +719,13 @@ pub mod sys {
                 options(nostack),
             );
         }
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(tag) }
+        check_val(ret).map(|_| tag)
     }
 
     /// Close an async channel.
     #[inline(always)]
     pub fn channel_close(cap: u64) -> Result<(), i64> {
-        let ret = syscall1(super::Syscall::ChannelClose as u64, cap);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall1(super::Syscall::ChannelClose as u64, cap))
     }
 
     // ---------------------------------------------------------------
@@ -753,8 +735,7 @@ pub mod sys {
     /// Create a new IPC endpoint. Returns the endpoint capability ID.
     #[inline(always)]
     pub fn endpoint_create() -> Result<u64, i64> {
-        let ret = syscall0(super::Syscall::EndpointCreate as u64);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+        check_val(syscall0(super::Syscall::EndpointCreate as u64))
     }
 
     // ---------------------------------------------------------------
@@ -764,15 +745,13 @@ pub mod sys {
     /// Grant (delegate) a capability with restricted rights.
     #[inline(always)]
     pub fn cap_grant(source: u64, rights_mask: u64) -> Result<u64, i64> {
-        let ret = syscall2(super::Syscall::CapGrant as u64, source, rights_mask);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+        check_val(syscall2(super::Syscall::CapGrant as u64, source, rights_mask))
     }
 
     /// Revoke a capability and all its derivatives.
     #[inline(always)]
     pub fn cap_revoke(cap: u64) -> Result<(), i64> {
-        let ret = syscall1(super::Syscall::CapRevoke as u64, cap);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall1(super::Syscall::CapRevoke as u64, cap))
     }
 
     // ---------------------------------------------------------------
@@ -782,15 +761,19 @@ pub mod sys {
     /// Free a physical frame capability.
     #[inline(always)]
     pub fn frame_free(cap: u64) -> Result<(), i64> {
-        let ret = syscall1(super::Syscall::FrameFree as u64, cap);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall1(super::Syscall::FrameFree as u64, cap))
     }
 
     /// Unmap a virtual page.
     #[inline(always)]
     pub fn unmap(vaddr: u64) -> Result<(), i64> {
-        let ret = syscall1(super::Syscall::Unmap as u64, vaddr);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall1(super::Syscall::Unmap as u64, vaddr))
+    }
+
+    /// Unmap a virtual page and free the underlying physical frame.
+    #[inline(always)]
+    pub fn unmap_free(vaddr: u64) -> Result<(), i64> {
+        check_unit(syscall1(super::Syscall::UnmapFree as u64, vaddr))
     }
 
     // ---------------------------------------------------------------
@@ -800,8 +783,7 @@ pub mod sys {
     /// Resume a faulted thread.
     #[inline(always)]
     pub fn thread_resume(tid: u64) -> Result<(), i64> {
-        let ret = syscall1(super::Syscall::ThreadResume as u64, tid);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall1(super::Syscall::ThreadResume as u64, tid))
     }
 
     // ---------------------------------------------------------------
@@ -811,15 +793,13 @@ pub mod sys {
     /// Register an IRQ handler notification.
     #[inline(always)]
     pub fn irq_register(irq_cap: u64, notify_cap: u64) -> Result<(), i64> {
-        let ret = syscall2(super::Syscall::IrqRegister as u64, irq_cap, notify_cap);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall2(super::Syscall::IrqRegister as u64, irq_cap, notify_cap))
     }
 
     /// Acknowledge an IRQ (unmask the line).
     #[inline(always)]
     pub fn irq_ack(cap: u64) -> Result<(), i64> {
-        let ret = syscall1(super::Syscall::IrqAck as u64, cap);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall1(super::Syscall::IrqAck as u64, cap))
     }
 
     // ---------------------------------------------------------------
@@ -829,15 +809,13 @@ pub mod sys {
     /// Register a notification for page fault delivery (caller's own AS).
     #[inline(always)]
     pub fn fault_register(notify_cap: u64) -> Result<(), i64> {
-        let ret = syscall2(super::Syscall::FaultRegister as u64, notify_cap, 0);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall2(super::Syscall::FaultRegister as u64, notify_cap, 0))
     }
 
     /// Register a notification for page fault delivery in a specific address space.
     #[inline(always)]
     pub fn fault_register_as(notify_cap: u64, as_cap: u64) -> Result<(), i64> {
-        let ret = syscall2(super::Syscall::FaultRegister as u64, notify_cap, as_cap);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall2(super::Syscall::FaultRegister as u64, notify_cap, as_cap))
     }
 
     /// Receive the next pending page fault.
@@ -861,11 +839,7 @@ pub mod sys {
                 options(nostack),
             );
         }
-        if (ret as i64) < 0 {
-            Err(ret as i64)
-        } else {
-            Ok(super::FaultInfo { addr, code, tid: tid as u32, cr3 })
-        }
+        check_val(ret).map(|_| super::FaultInfo { addr, code, tid: tid as u32, cr3 })
     }
 
     // ---------------------------------------------------------------
@@ -876,29 +850,25 @@ pub mod sys {
     /// Returns the domain capability ID.
     #[inline(always)]
     pub fn domain_create(quantum_ms: u64, period_ms: u64) -> Result<u64, i64> {
-        let ret = syscall2(super::Syscall::DomainCreate as u64, quantum_ms, period_ms);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+        check_val(syscall2(super::Syscall::DomainCreate as u64, quantum_ms, period_ms))
     }
 
     /// Attach a thread to a scheduling domain.
     #[inline(always)]
     pub fn domain_attach(domain_cap: u64, thread_cap: u64) -> Result<(), i64> {
-        let ret = syscall2(super::Syscall::DomainAttach as u64, domain_cap, thread_cap);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall2(super::Syscall::DomainAttach as u64, domain_cap, thread_cap))
     }
 
     /// Detach a thread from a scheduling domain.
     #[inline(always)]
     pub fn domain_detach(domain_cap: u64, thread_cap: u64) -> Result<(), i64> {
-        let ret = syscall2(super::Syscall::DomainDetach as u64, domain_cap, thread_cap);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall2(super::Syscall::DomainDetach as u64, domain_cap, thread_cap))
     }
 
     /// Adjust a domain's quantum (in ms).
     #[inline(always)]
     pub fn domain_adjust(domain_cap: u64, new_quantum_ms: u64) -> Result<(), i64> {
-        let ret = syscall2(super::Syscall::DomainAdjust as u64, domain_cap, new_quantum_ms);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall2(super::Syscall::DomainAdjust as u64, domain_cap, new_quantum_ms))
     }
 
     /// Query domain info. Returns (quantum_ticks, consumed_ticks, period_ticks).
@@ -920,11 +890,7 @@ pub mod sys {
                 options(nostack),
             );
         }
-        if (ret as i64) < 0 {
-            Err(ret as i64)
-        } else {
-            Ok((quantum, consumed, period))
-        }
+        check_val(ret).map(|_| (quantum, consumed, period))
     }
 
     // ---------------------------------------------------------------
@@ -934,37 +900,32 @@ pub mod sys {
     /// Query the physical address of a frame capability.
     #[inline(always)]
     pub fn frame_phys(frame_cap: u64) -> Result<u64, i64> {
-        let ret = syscall1(super::Syscall::FramePhys as u64, frame_cap);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+        check_val(syscall1(super::Syscall::FramePhys as u64, frame_cap))
     }
 
     /// Create an I/O port capability dynamically. Returns cap_id.
     #[inline(always)]
     pub fn ioport_create(base: u16, count: u16) -> Result<u64, i64> {
-        let ret = syscall2(super::Syscall::IoPortCreate as u64, base as u64, count as u64);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+        check_val(syscall2(super::Syscall::IoPortCreate as u64, base as u64, count as u64))
     }
 
     /// Allocate N contiguous physical frames (1–16). Returns Memory cap_id.
     #[inline(always)]
     pub fn frame_alloc_contiguous(count: u64) -> Result<u64, i64> {
-        let ret = syscall1(super::Syscall::FrameAllocContig as u64, count);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+        check_val(syscall1(super::Syscall::FrameAllocContig as u64, count))
     }
 
     /// Create an IRQ capability dynamically (irq_line 0–15). Returns cap_id.
     #[inline(always)]
     pub fn irq_create(irq_line: u64) -> Result<u64, i64> {
-        let ret = syscall1(super::Syscall::IrqCreate as u64, irq_line);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+        check_val(syscall1(super::Syscall::IrqCreate as u64, irq_line))
     }
 
     /// Map a page from a multi-page Memory capability at the given offset.
     /// `flags`: bit 1 = WRITABLE, bit 63 = NO_EXECUTE.
     #[inline(always)]
     pub fn map_offset(vaddr: u64, mem_cap: u64, offset: u64, flags: u64) -> Result<(), i64> {
-        let ret = syscall4(super::Syscall::MapOffset as u64, vaddr, mem_cap, offset, flags);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall4(super::Syscall::MapOffset as u64, vaddr, mem_cap, offset, flags))
     }
 
     /// Set syscall redirect endpoint on a thread (LUCAS).
@@ -972,8 +933,7 @@ pub mod sys {
     /// to the specified endpoint.
     #[inline(always)]
     pub fn redirect_set(thread_cap: u64, ep_cap: u64) -> Result<(), i64> {
-        let ret = syscall2(super::Syscall::RedirectSet as u64, thread_cap, ep_cap);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall2(super::Syscall::RedirectSet as u64, thread_cap, ep_cap))
     }
 
     // ---------------------------------------------------------------
@@ -983,29 +943,25 @@ pub mod sys {
     /// Create a new empty user address space. Returns AS cap ID.
     #[inline(always)]
     pub fn addr_space_create() -> Result<u64, i64> {
-        let ret = syscall0(super::Syscall::AddrSpaceCreate as u64);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+        check_val(syscall0(super::Syscall::AddrSpaceCreate as u64))
     }
 
     /// Map a frame into a target address space (not the caller's).
     #[inline(always)]
     pub fn map_into(as_cap: u64, vaddr: u64, frame_cap: u64, flags: u64) -> Result<(), i64> {
-        let ret = syscall4(super::Syscall::MapInto as u64, as_cap, vaddr, frame_cap, flags);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall4(super::Syscall::MapInto as u64, as_cap, vaddr, frame_cap, flags))
     }
 
     /// Create a thread in a target address space. Returns thread cap ID.
     #[inline(always)]
     pub fn thread_create_in(as_cap: u64, rip: u64, rsp: u64) -> Result<u64, i64> {
-        let ret = syscall3(super::Syscall::ThreadCreateIn as u64, as_cap, rip, rsp);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+        check_val(syscall3(super::Syscall::ThreadCreateIn as u64, as_cap, rip, rsp))
     }
 
     /// Unmap a page from a target address space.
     #[inline(always)]
     pub fn unmap_from(as_cap: u64, vaddr: u64) -> Result<(), i64> {
-        let ret = syscall2(super::Syscall::UnmapFrom as u64, as_cap, vaddr);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall2(super::Syscall::UnmapFrom as u64, as_cap, vaddr))
     }
 
     // ---------------------------------------------------------------
@@ -1016,15 +972,13 @@ pub mod sys {
     /// `ep_cap` must be an Endpoint capability.
     #[inline(always)]
     pub fn svc_register(name_ptr: u64, name_len: u64, ep_cap: u64) -> Result<(), i64> {
-        let ret = syscall3(super::Syscall::SvcRegister as u64, name_ptr, name_len, ep_cap);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall3(super::Syscall::SvcRegister as u64, name_ptr, name_len, ep_cap))
     }
 
     /// Look up a service by name. Returns a derived endpoint cap ID.
     #[inline(always)]
     pub fn svc_lookup(name_ptr: u64, name_len: u64) -> Result<u64, i64> {
-        let ret = syscall2(super::Syscall::SvcLookup as u64, name_ptr, name_len);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+        check_val(syscall2(super::Syscall::SvcLookup as u64, name_ptr, name_len))
     }
 
     // ---------------------------------------------------------------
@@ -1035,24 +989,21 @@ pub mod sys {
     /// Returns the file size on success.
     #[inline(always)]
     pub fn initrd_read(name_ptr: u64, name_len: u64, buf_ptr: u64, buf_len: u64) -> Result<u64, i64> {
-        let ret = syscall4(super::Syscall::InitrdRead as u64, name_ptr, name_len, buf_ptr, buf_len);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(ret) }
+        check_val(syscall4(super::Syscall::InitrdRead as u64, name_ptr, name_len, buf_ptr, buf_len))
     }
 
     /// Write a BootInfo page into a target address space at 0xB00000.
     /// `caps_ptr` points to an array of cap IDs, `cap_count` is the number.
     #[inline(always)]
     pub fn bootinfo_write(as_cap: u64, caps_ptr: u64, cap_count: u64) -> Result<(), i64> {
-        let ret = syscall3(super::Syscall::BootInfoWrite as u64, as_cap, caps_ptr, cap_count);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall3(super::Syscall::BootInfoWrite as u64, as_cap, caps_ptr, cap_count))
     }
 
     /// Change page permissions (mprotect-like). W^X enforced by kernel.
     /// `flags`: bit 1 = WRITABLE, bit 63 = NO_EXECUTE.
     #[inline(always)]
     pub fn protect(vaddr: u64, flags: u64) -> Result<(), i64> {
-        let ret = syscall2(super::Syscall::Protect as u64, vaddr, flags);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall2(super::Syscall::Protect as u64, vaddr, flags))
     }
 
     /// Change file permissions (chmod).
@@ -1060,8 +1011,7 @@ pub mod sys {
     /// `mode`: Unix permission bits (e.g. 0o755).
     #[inline(always)]
     pub fn chmod(path_ptr: u64, path_len: u64, mode: u64) -> Result<(), i64> {
-        let ret = syscall3(super::Syscall::Chmod as u64, path_ptr, path_len, mode);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall3(super::Syscall::Chmod as u64, path_ptr, path_len, mode))
     }
 
     /// Change file ownership (chown).
@@ -1069,18 +1019,14 @@ pub mod sys {
     /// `uid`: new owner user ID. `gid`: new owner group ID.
     #[inline(always)]
     pub fn chown(path_ptr: u64, path_len: u64, uid: u64, gid: u64) -> Result<(), i64> {
-        let ret = syscall4(super::Syscall::Chown as u64, path_ptr, path_len, uid, gid);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall4(super::Syscall::Chown as u64, path_ptr, path_len, uid, gid))
     }
 
     /// Get thread info by pool index.
     /// Returns (tid, state, priority, cpu_ticks, mem_pages, is_user) or error.
     #[inline(always)]
     pub fn thread_info(idx: u64) -> Result<(u64, u64, u64, u64, u64, u64), i64> {
-        // We need to use raw syscall and read back multiple registers.
-        // For simplicity, use syscall1 — kernel writes results back to rdi/rsi/rdx/r8/r9/r10.
-        let ret = syscall1(super::Syscall::ThreadInfo as u64, idx);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok((0, 0, 0, 0, 0, 0)) }
+        check_val(syscall1(super::Syscall::ThreadInfo as u64, idx)).map(|_| (0, 0, 0, 0, 0, 0))
     }
 
     /// Get total live thread count.
@@ -1092,8 +1038,7 @@ pub mod sys {
     /// Set the FS_BASE MSR for the current thread (TLS support).
     #[inline(always)]
     pub fn set_fs_base(addr: u64) -> Result<(), i64> {
-        let ret = syscall1(super::Syscall::SetFsBase as u64, addr);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall1(super::Syscall::SetFsBase as u64, addr))
     }
 
     /// Get the FS_BASE MSR of the current thread.
@@ -1116,21 +1061,18 @@ pub mod sys {
     /// Writes 18 u64s to `out_buf`: [rax,rbx,rcx,rdx,rsi,rdi,rbp,r8..r15,rsp,fs_base,rflags].
     #[inline(always)]
     pub fn get_thread_regs(tid: u64, out_buf: &mut [u64; 18]) -> Result<(), i64> {
-        let ret = syscall2(super::SYS_GET_THREAD_REGS, tid, out_buf.as_mut_ptr() as u64);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall2(super::SYS_GET_THREAD_REGS, tid, out_buf.as_mut_ptr() as u64))
     }
 
     /// Set the async signal trampoline address for a thread.
     #[inline(always)]
     pub fn signal_entry(tid: u64, trampoline_addr: u64) -> Result<(), i64> {
-        let ret = syscall2(super::SYS_SIGNAL_ENTRY, tid, trampoline_addr);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall2(super::SYS_SIGNAL_ENTRY, tid, trampoline_addr))
     }
 
     /// Inject an async signal into a thread (sets pending bit).
     #[inline(always)]
     pub fn signal_inject(tid: u64, sig: u64) -> Result<(), i64> {
-        let ret = syscall2(super::SYS_SIGNAL_INJECT, tid, sig);
-        if (ret as i64) < 0 { Err(ret as i64) } else { Ok(()) }
+        check_unit(syscall2(super::SYS_SIGNAL_INJECT, tid, sig))
     }
 }

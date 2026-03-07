@@ -10,26 +10,34 @@ pub fn alloc_blocks(bitmap: &mut [u8; BITMAP_BYTES], max_blocks: u32, count: u32
     }
     let mut run_start: u32 = 0;
     let mut run_len: u32 = 0;
+    let mut bit: u32 = 0;
 
-    for bit in 0..max_blocks {
+    while bit < max_blocks {
         let byte_idx = (bit / 8) as usize;
+        let b = bitmap[byte_idx];
+        // Fast skip: entire byte allocated
+        if b == 0xFF && bit % 8 == 0 {
+            run_start = bit + 8;
+            run_len = 0;
+            bit += 8;
+            continue;
+        }
         let bit_idx = bit % 8;
-        if bitmap[byte_idx] & (1 << bit_idx) != 0 {
-            // Block is allocated, reset run.
+        if b & (1 << bit_idx) != 0 {
             run_start = bit + 1;
             run_len = 0;
         } else {
             run_len += 1;
             if run_len == count {
-                // Mark blocks as allocated.
-                for b in run_start..run_start + count {
-                    let bi = (b / 8) as usize;
-                    let bb = b % 8;
+                for bl in run_start..run_start + count {
+                    let bi = (bl / 8) as usize;
+                    let bb = bl % 8;
                     bitmap[bi] |= 1 << bb;
                 }
                 return Some(run_start);
             }
         }
+        bit += 1;
     }
     None
 }
@@ -43,14 +51,22 @@ pub fn free_blocks(bitmap: &mut [u8; BITMAP_BYTES], start: u32, count: u32) {
     }
 }
 
-/// Count the number of free blocks in the bitmap.
+/// Count the number of free blocks in the bitmap (byte-level optimization).
 pub fn count_free(bitmap: &[u8; BITMAP_BYTES], max_blocks: u32) -> u32 {
+    let full_bytes = (max_blocks / 8) as usize;
     let mut free = 0u32;
-    for bit in 0..max_blocks {
-        let byte_idx = (bit / 8) as usize;
-        let bit_idx = bit % 8;
-        if bitmap[byte_idx] & (1 << bit_idx) == 0 {
-            free += 1;
+    // Count full bytes using popcount
+    for i in 0..full_bytes {
+        free += 8 - (bitmap[i].count_ones());
+    }
+    // Count remaining bits
+    let remaining = max_blocks % 8;
+    if remaining > 0 {
+        let last_byte = bitmap[full_bytes];
+        for bit in 0..remaining {
+            if last_byte & (1 << bit) == 0 {
+                free += 1;
+            }
         }
     }
     free

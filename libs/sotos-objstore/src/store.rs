@@ -6,9 +6,9 @@ use crate::layout::*;
 use crate::bitmap;
 use crate::wal;
 
-/// Virtual address where ObjectStore is placed (5 pages).
+/// Virtual address where ObjectStore is placed (96 pages ≈ 384 KiB).
 const STORE_VADDR: u64 = 0xD00000;
-const STORE_PAGES: u64 = 5;
+const STORE_PAGES: u64 = 96;
 /// WRITABLE flag for map syscall.
 const MAP_WRITABLE: u64 = 2;
 
@@ -166,18 +166,18 @@ impl ObjectStore {
         if store.sb.magic != SUPERBLOCK_MAGIC {
             return Err("bad superblock magic");
         }
-        if store.sb.version != FS_VERSION && store.sb.version != 1
-            && store.sb.version != 2 && store.sb.version != 3 {
-            return Err("unsupported version");
+        // v5 layout has completely different sector offsets — old versions can't be migrated
+        // in-place without data loss. Auto-format instead (mkdisk.py regenerates disk.img).
+        if store.sb.version != FS_VERSION {
+            dbg(b"OBJSTORE: old version ");
+            dbg_u64(store.sb.version as u64);
+            dbg(b" -> auto-format to v5\n");
+            return Err("old version");
         }
-        let needs_dir_migration = store.sb.version == 1;
-        let needs_snap_migration = store.sb.version <= 2;
-        let needs_v4_migration = store.sb.version <= 3;
 
         // WAL replay.
         let replayed = wal::replay(&mut store.blk, &mut store.wal, &mut store.wal_buf)?;
         if replayed {
-            // Re-read superblock after replay (it may have been updated).
             store.blk.read_sector(SECTOR_SUPERBLOCK as u64)?;
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -194,104 +194,11 @@ impl ObjectStore {
         // Read directory.
         store.read_dir()?;
 
-        // Migrate v1 → v2: add root dir entry, set parent_oid for existing files
-        if needs_dir_migration {
-            dbg(b"OBJSTORE: migrating v1 -> v2\n");
+        // Read refcount table.
+        store.read_refcount()?;
 
-            // Set parent_oid = ROOT_OID for all existing entries
-            for entry in store.dir.iter_mut() {
-                if !entry.is_free() {
-                    entry.parent_oid = ROOT_OID;
-                }
-            }
-
-            // Find a free slot for root dir (or check if slot 0 is free)
-            let root_slot = if store.dir[0].is_free() {
-                0
-            } else {
-                store.dir.iter().position(|e| e.is_free()).ok_or("directory full for root")?
-            };
-
-            store.dir[root_slot] = DirEntry::zeroed();
-            store.dir[root_slot].oid = ROOT_OID;
-            store.dir[root_slot].name[0] = b'/';
-            store.dir[root_slot].flags = FLAG_DIR;
-            store.dir[root_slot].parent_oid = 0;
-            store.dir[root_slot].permissions = DEFAULT_DIR_PERMS;
-            let now = crate::layout::get_epoch_seconds();
-            store.dir[root_slot].created_time = now;
-            store.dir[root_slot].modified_time = now;
-            store.dir[root_slot].accessed_time = now;
-
-            // Fix next_oid if needed (root uses oid=1)
-            if store.sb.next_oid <= ROOT_OID {
-                store.sb.next_oid = ROOT_OID + 1;
-            }
-            store.sb.obj_count += 1;
-        }
-
-        // Migrate v2 → v3: initialize refcount and snapshot metadata
-        if needs_snap_migration {
-            dbg(b"OBJSTORE: migrating -> v3 (snapshots)\n");
-
-            // Initialize refcounts: set refcount=1 for all allocated blocks
-            store.refcount = [0u8; REFCOUNT_ENTRIES];
-            for entry in &store.dir {
-                if !entry.is_free() && entry.sector_count > 0 {
-                    for b in entry.sector_start..entry.sector_start + entry.sector_count {
-                        if (b as usize) < REFCOUNT_ENTRIES {
-                            store.refcount[b as usize] = 1;
-                        }
-                    }
-                }
-            }
-
-            store.snap_meta = [SnapMeta::zeroed(); MAX_SNAPSHOTS];
-
-            // Update data_start to new layout
-            store.sb.data_start = SECTOR_DATA;
-            store.sb.version = FS_VERSION;
-
-            store.flush_superblock()?;
-            store.flush_dir()?;
-            store.flush_refcount()?;
-            store.flush_snap_meta()?;
-        } else {
-            // Read refcount table
-            store.read_refcount()?;
-
-            // Read snapshot metadata
-            store.read_snap_meta()?;
-        }
-
-        // Migrate v3 → v4: larger directory table (32→128 entries) + u64 timestamps
-        if needs_v4_migration && !needs_snap_migration {
-            dbg(b"OBJSTORE: migrating -> v4 (128 entries + timestamps)\n");
-            // Zero out new directory slots (entries 32..128 are already zeroed from init)
-            // Update data_start and version
-            store.sb.data_start = SECTOR_DATA;
-            store.sb.dir_sectors = DIR_SECTORS;
-            store.sb.version = FS_VERSION;
-
-            // Convert old tick-based timestamps to epoch seconds
-            // (Old u32 ticks become 0 since they are in a different field now;
-            //  the struct was re-read with the new layout so old tick values
-            //  ended up in created_time's low bytes. We just set them to "now".)
-            let now = crate::layout::get_epoch_seconds();
-            for entry in store.dir.iter_mut() {
-                if !entry.is_free() && entry.created_time < 1_000_000_000 {
-                    // Old tick value — replace with approximate current time
-                    entry.created_time = now;
-                    entry.modified_time = now;
-                    entry.accessed_time = now;
-                }
-            }
-
-            store.flush_superblock()?;
-            store.flush_dir()?;
-            store.flush_refcount()?;
-            store.flush_snap_meta()?;
-        }
+        // Read snapshot metadata.
+        store.read_snap_meta()?;
 
         Ok(store)
     }
@@ -575,6 +482,28 @@ impl ObjectStore {
         Ok(())
     }
 
+    /// Rename an object: change its name and optionally move it to a new parent.
+    pub fn rename(&mut self, old_oid: u64, new_name: &[u8], new_parent: u64) -> Result<(), &'static str> {
+        let _slot = self.find_slot(old_oid).ok_or("object not found")?;
+        if new_name.is_empty() || new_name.len() >= MAX_NAME_LEN {
+            return Err("invalid name");
+        }
+        // If target name already exists in new_parent, delete it first
+        if let Some(existing) = self.find_in(new_name, new_parent) {
+            if existing != old_oid {
+                self.delete(existing)?;
+            }
+        }
+        // Re-find slot (delete may have shifted things, but find_slot uses oid)
+        let slot = self.find_slot(old_oid).ok_or("object not found after delete")?;
+        self.dir[slot].name = [0u8; MAX_NAME_LEN];
+        let copy_len = new_name.len().min(MAX_NAME_LEN - 1);
+        self.dir[slot].name[..copy_len].copy_from_slice(&new_name[..copy_len]);
+        self.dir[slot].parent_oid = new_parent;
+        self.wal_commit_metadata(slot)?;
+        Ok(())
+    }
+
     /// Find an object by name in the root directory. Returns OID or None.
     pub fn find(&self, name: &[u8]) -> Option<u64> {
         self.find_in(name, ROOT_OID)
@@ -778,29 +707,27 @@ impl ObjectStore {
             return Err("snapshot not found");
         }
 
-        // Read the snapshot's directory to decrement refcounts
-        let mut snap_dir = [DirEntry::zeroed(); DIR_ENTRY_COUNT];
+        // Process snapshot directory entries sector-by-sector (avoids large stack alloc)
+        let mut sector_entries = [DirEntry::zeroed(); DIR_ENTRIES_PER_SECTOR];
         for s in 0..DIR_SECTORS as usize {
             let snap_dir_sector = SECTOR_SNAP_DIR + (slot as u32 * DIR_SECTORS) + s as u32;
             self.blk.read_sector(snap_dir_sector as u64)?;
             let src = unsafe { core::slice::from_raw_parts(self.blk.data_ptr(), SECTOR_SIZE) };
-            let base = s * DIR_ENTRIES_PER_SECTOR;
             for i in 0..DIR_ENTRIES_PER_SECTOR {
                 let offset = i * 128;
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         src[offset..].as_ptr(),
-                        &mut snap_dir[base + i] as *mut DirEntry as *mut u8,
+                        &mut sector_entries[i] as *mut DirEntry as *mut u8,
                         128,
                     );
                 }
             }
-        }
-
-        // Decrement refcounts for snapshot's blocks; free if refcount reaches 0
-        for entry in &snap_dir {
-            if !entry.is_free() && entry.sector_count > 0 {
-                self.cow_free_blocks(entry.sector_start, entry.sector_count);
+            // Decrement refcounts for this sector's entries
+            for entry in &sector_entries {
+                if !entry.is_free() && entry.sector_count > 0 {
+                    self.cow_free_blocks(entry.sector_start, entry.sector_count);
+                }
             }
         }
 
@@ -828,7 +755,6 @@ impl ObjectStore {
             if !entry.is_free() && entry.sector_count > 0 {
                 let start = entry.sector_start;
                 let count = entry.sector_count;
-                // Decrement refcount; free bitmap bit if reaches 0
                 for b in start..start + count {
                     let idx = b as usize;
                     if idx < REFCOUNT_ENTRIES && self.refcount[idx] > 0 {
@@ -841,7 +767,7 @@ impl ObjectStore {
             }
         }
 
-        // Read snapshot's directory
+        // Read snapshot's directory (directly into self.dir)
         for s in 0..DIR_SECTORS as usize {
             let snap_dir_sector = SECTOR_SNAP_DIR + (slot as u32 * DIR_SECTORS) + s as u32;
             self.blk.read_sector(snap_dir_sector as u64)?;
@@ -868,7 +794,7 @@ impl ObjectStore {
             self.bitmap[bmp_offset..bmp_offset + SECTOR_SIZE].copy_from_slice(src);
         }
 
-        // Increment refcount for all restored blocks (they're now referenced by live dir + snapshot)
+        // Increment refcount for all restored blocks
         for entry in &self.dir {
             if !entry.is_free() && entry.sector_count > 0 {
                 for b in entry.sector_start..entry.sector_start + entry.sector_count {
@@ -985,7 +911,8 @@ impl ObjectStore {
         Ok(())
     }
 
-    /// WAL-commit metadata changes (bitmap + directory entry sector + superblock).
+    /// WAL-commit metadata changes (superblock + directory entry sector).
+    /// Bitmap is flushed separately (too large for WAL with 128 sectors).
     fn wal_commit_metadata(&mut self, dir_slot: usize) -> Result<(), &'static str> {
         wal::begin(&mut self.wal);
 
@@ -1001,15 +928,10 @@ impl ObjectStore {
         let dir_buf = self.serialize_dir_sector(dir_sector_idx);
         wal::stage(&mut self.wal, &mut self.wal_buf, dir_abs_sector, &dir_buf)?;
 
-        // Stage bitmap sector(s) — always write both.
-        for i in 0..BITMAP_SECTORS {
-            let bmp_offset = i as usize * SECTOR_SIZE;
-            let mut bmp_buf = [0u8; SECTOR_SIZE];
-            bmp_buf.copy_from_slice(&self.bitmap[bmp_offset..bmp_offset + SECTOR_SIZE]);
-            wal::stage(&mut self.wal, &mut self.wal_buf, SECTOR_BITMAP + i, &bmp_buf)?;
-        }
-
         wal::commit(&mut self.blk, &mut self.wal, &self.wal_buf)?;
+
+        // Flush bitmap separately (non-WAL — too many sectors for WAL staging).
+        self.flush_bitmap()?;
         Ok(())
     }
 
@@ -1033,69 +955,31 @@ impl ObjectStore {
 
     /// Flush superblock to disk (non-WAL, for format).
     fn flush_superblock(&mut self) -> Result<(), &'static str> {
-        let dst = unsafe {
-            core::slice::from_raw_parts_mut(self.blk.data_ptr_mut(), SECTOR_SIZE)
-        };
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                &self.sb as *const Superblock as *const u8,
-                dst.as_mut_ptr(),
-                SECTOR_SIZE,
-            );
-        }
-        self.blk.write_sector(SECTOR_SUPERBLOCK as u64)
+        write_sector_struct(&mut self.blk, SECTOR_SUPERBLOCK as u64, &self.sb)
     }
 
     /// Flush bitmap to disk (non-WAL, for format).
     fn flush_bitmap(&mut self) -> Result<(), &'static str> {
-        for i in 0..BITMAP_SECTORS {
-            let offset = i as usize * SECTOR_SIZE;
-            let dst = unsafe {
-                core::slice::from_raw_parts_mut(self.blk.data_ptr_mut(), SECTOR_SIZE)
-            };
-            dst.copy_from_slice(&self.bitmap[offset..offset + SECTOR_SIZE]);
-            self.blk.write_sector((SECTOR_BITMAP + i) as u64)?;
-        }
-        Ok(())
+        flush_sectors(&mut self.blk, &self.bitmap, SECTOR_BITMAP, BITMAP_SECTORS)
     }
 
     /// Flush all directory sectors to disk (non-WAL, for format/chmod/chown).
     pub fn flush_dir(&mut self) -> Result<(), &'static str> {
         for s in 0..DIR_SECTORS as usize {
             let buf = self.serialize_dir_sector(s);
-            let dst = unsafe {
-                core::slice::from_raw_parts_mut(self.blk.data_ptr_mut(), SECTOR_SIZE)
-            };
-            dst.copy_from_slice(&buf);
-            self.blk.write_sector((SECTOR_DIR + s as u32) as u64)?;
+            write_sector_buf(&mut self.blk, (SECTOR_DIR + s as u32) as u64, &buf)?;
         }
         Ok(())
     }
 
     /// Flush WAL header to disk (non-WAL, for format).
     fn flush_wal_header(&mut self) -> Result<(), &'static str> {
-        let dst = unsafe {
-            core::slice::from_raw_parts_mut(self.blk.data_ptr_mut(), SECTOR_SIZE)
-        };
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                &self.wal as *const WalHeader as *const u8,
-                dst.as_mut_ptr(),
-                SECTOR_SIZE,
-            );
-        }
-        self.blk.write_sector(SECTOR_WAL_HEADER as u64)
+        write_sector_struct(&mut self.blk, SECTOR_WAL_HEADER as u64, &self.wal)
     }
 
     /// Read bitmap from disk into memory.
     fn read_bitmap(&mut self) -> Result<(), &'static str> {
-        for i in 0..BITMAP_SECTORS {
-            self.blk.read_sector((SECTOR_BITMAP + i) as u64)?;
-            let offset = i as usize * SECTOR_SIZE;
-            let src = unsafe { core::slice::from_raw_parts(self.blk.data_ptr(), SECTOR_SIZE) };
-            self.bitmap[offset..offset + SECTOR_SIZE].copy_from_slice(src);
-        }
-        Ok(())
+        read_sectors(&mut self.blk, &mut self.bitmap, SECTOR_BITMAP, BITMAP_SECTORS)
     }
 
     /// Read all directory sectors from disk into memory.
@@ -1120,38 +1004,18 @@ impl ObjectStore {
 
     /// Flush refcount table to disk (8 sectors).
     fn flush_refcount(&mut self) -> Result<(), &'static str> {
-        for i in 0..REFCOUNT_SECTORS {
-            let offset = i as usize * SECTOR_SIZE;
-            let dst = unsafe { core::slice::from_raw_parts_mut(self.blk.data_ptr_mut(), SECTOR_SIZE) };
-            dst.copy_from_slice(&self.refcount[offset..offset + SECTOR_SIZE]);
-            self.blk.write_sector((SECTOR_REFCOUNT + i) as u64)?;
-        }
-        Ok(())
+        flush_sectors(&mut self.blk, &self.refcount, SECTOR_REFCOUNT, REFCOUNT_SECTORS)
     }
 
     /// Read refcount table from disk.
     fn read_refcount(&mut self) -> Result<(), &'static str> {
-        for i in 0..REFCOUNT_SECTORS {
-            self.blk.read_sector((SECTOR_REFCOUNT + i) as u64)?;
-            let offset = i as usize * SECTOR_SIZE;
-            let src = unsafe { core::slice::from_raw_parts(self.blk.data_ptr(), SECTOR_SIZE) };
-            self.refcount[offset..offset + SECTOR_SIZE].copy_from_slice(src);
-        }
-        Ok(())
+        read_sectors(&mut self.blk, &mut self.refcount, SECTOR_REFCOUNT, REFCOUNT_SECTORS)
     }
 
     /// Flush snapshot metadata to disk (4 sectors).
     fn flush_snap_meta(&mut self) -> Result<(), &'static str> {
         for i in 0..MAX_SNAPSHOTS {
-            let dst = unsafe { core::slice::from_raw_parts_mut(self.blk.data_ptr_mut(), SECTOR_SIZE) };
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    &self.snap_meta[i] as *const SnapMeta as *const u8,
-                    dst.as_mut_ptr(),
-                    SECTOR_SIZE,
-                );
-            }
-            self.blk.write_sector((SECTOR_SNAP_META + i as u32) as u64)?;
+            write_sector_struct(&mut self.blk, (SECTOR_SNAP_META + i as u32) as u64, &self.snap_meta[i])?;
         }
         Ok(())
     }
@@ -1207,6 +1071,52 @@ impl ObjectStore {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Standalone sector I/O helpers (avoid borrow conflicts with &mut self)
+// ---------------------------------------------------------------------------
+
+/// Write multiple sectors from a contiguous byte array.
+fn flush_sectors(blk: &mut VirtioBlk, data: &[u8], base_sector: u32, count: u32) -> Result<(), &'static str> {
+    for i in 0..count {
+        let offset = i as usize * SECTOR_SIZE;
+        let dst = unsafe { core::slice::from_raw_parts_mut(blk.data_ptr_mut(), SECTOR_SIZE) };
+        dst.copy_from_slice(&data[offset..offset + SECTOR_SIZE]);
+        blk.write_sector((base_sector + i) as u64)?;
+    }
+    Ok(())
+}
+
+/// Read multiple sectors into a contiguous byte array.
+fn read_sectors(blk: &mut VirtioBlk, data: &mut [u8], base_sector: u32, count: u32) -> Result<(), &'static str> {
+    for i in 0..count {
+        blk.read_sector((base_sector + i) as u64)?;
+        let offset = i as usize * SECTOR_SIZE;
+        let src = unsafe { core::slice::from_raw_parts(blk.data_ptr(), SECTOR_SIZE) };
+        data[offset..offset + SECTOR_SIZE].copy_from_slice(src);
+    }
+    Ok(())
+}
+
+/// Write a single sector from a buffer.
+fn write_sector_buf(blk: &mut VirtioBlk, sector: u64, buf: &[u8; SECTOR_SIZE]) -> Result<(), &'static str> {
+    let dst = unsafe { core::slice::from_raw_parts_mut(blk.data_ptr_mut(), SECTOR_SIZE) };
+    dst.copy_from_slice(buf);
+    blk.write_sector(sector)
+}
+
+/// Write a struct as a single sector (must fit in SECTOR_SIZE).
+fn write_sector_struct<T>(blk: &mut VirtioBlk, sector: u64, val: &T) -> Result<(), &'static str> {
+    let dst = unsafe { core::slice::from_raw_parts_mut(blk.data_ptr_mut(), SECTOR_SIZE) };
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            val as *const T as *const u8,
+            dst.as_mut_ptr(),
+            SECTOR_SIZE,
+        );
+    }
+    blk.write_sector(sector)
 }
 
 /// Calculate number of sectors needed for `size` bytes.

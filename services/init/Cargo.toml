@@ -9,6 +9,7 @@ sotos-pci = { path = "../../libs/sotos-pci" }
 sotos-virtio = { path = "../../libs/sotos-virtio" }
 sotos-objstore = { path = "../../libs/sotos-objstore" }
 sotos-ld = { path = "../../libs/sotos-ld" }
+sotos-gui = { path = "../../libs/sotos-gui" }
 
 [profile.dev]
 panic = "abort"

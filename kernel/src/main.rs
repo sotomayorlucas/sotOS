@@ -357,14 +357,183 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
 
 use sotos_common::{KB_RING_ADDR as KB_RING_PAGE, MOUSE_RING_ADDR as MOUSE_RING_PAGE};
 
+// ---------------------------------------------------------------------------
+// Process loading helpers — shared by all load_*_process() functions
+// ---------------------------------------------------------------------------
+
+/// Address constants for process setup.
+const PROCESS_STACK_BASE: u64 = 0x900000;
+const ASLR_JITTER_PAGES: u64 = 16;
+const BAR0_VIRT_BASE: u64 = 0xC00000;
+const PCI_CONFIG_PORT: u16 = 0xCF8;
+const PCI_DATA_PORT: u16 = 0xCFC;
+
+/// Allocate a user stack with ASLR jitter and a guard page.
+/// Returns `stack_top` (the initial RSP value for the new thread).
+fn allocate_user_stack(
+    addr_space: &mm::paging::AddressSpace,
+    stack_pages: u64,
+    name: &str,
+) -> u64 {
+    use mm::paging::{PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
+    let hhdm = mm::hhdm_offset();
+
+    let stack_rand = (mm::random_u64() % ASLR_JITTER_PAGES) * 0x1000;
+    let stack_base = PROCESS_STACK_BASE + stack_rand;
+
+    // Guard page: present but not user-accessible — triggers fault on overflow.
+    let guard_frame = mm::alloc_frame().unwrap_or_else(|| panic!("no frame for {} stack guard", name));
+    addr_space.map_page(stack_base - 0x1000, guard_frame.addr(), PAGE_PRESENT);
+
+    for i in 0..stack_pages {
+        let sf = mm::alloc_frame().unwrap_or_else(|| panic!("no frame for {} stack", name));
+        unsafe { core::ptr::write_bytes((sf.addr() + hhdm) as *mut u8, 0, 4096); }
+        addr_space.map_page(
+            stack_base + i * 0x1000, sf.addr(),
+            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER,
+        );
+    }
+
+    let stack_top = stack_base + stack_pages * 0x1000;
+    kdebug!("  {}: stack = {:#x}..{:#x} (ASLR offset {:#x})", name, stack_base, stack_top, stack_rand);
+    stack_top
+}
+
+/// Allocate a zeroed BootInfo page and map it read-only into the given address space.
+/// Returns the physical address of the page (write BootInfo struct via HHDM).
+fn alloc_bootinfo_page(addr_space: &mm::paging::AddressSpace, name: &str) -> u64 {
+    use mm::paging::{PAGE_PRESENT, PAGE_USER};
+    use sotos_common::BOOT_INFO_ADDR;
+    let hhdm = mm::hhdm_offset();
+
+    let frame = mm::alloc_frame().unwrap_or_else(|| panic!("no frame for {} BootInfo", name));
+    let phys = frame.addr();
+    unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096); }
+    addr_space.map_page(BOOT_INFO_ADDR, phys, PAGE_PRESENT | PAGE_USER);
+    phys
+}
+
+/// Write a BootInfo struct to a pre-allocated physical page.
+fn write_bootinfo(phys: u64, info: &sotos_common::BootInfo) {
+    let hhdm = mm::hhdm_offset();
+    unsafe {
+        let ptr = (phys + hhdm) as *mut sotos_common::BootInfo;
+        core::ptr::write(ptr, *info);
+    }
+}
+
+/// Load an ELF binary into an address space, returning the entry point.
+/// Returns None on failure (logs the error).
+fn load_elf_into(data: &[u8], addr_space: &mm::paging::AddressSpace, name: &str) -> Option<u64> {
+    match elf::load(data, addr_space) {
+        Ok(entry) => {
+            kdebug!("  {}: entry = {:#x}", name, entry);
+            Some(entry)
+        }
+        Err(msg) => {
+            kdebug!("  {}: ELF load failed: {}", name, msg);
+            None
+        }
+    }
+}
+
+/// Pre-map device BAR0 MMIO pages (uncacheable) at BAR0_VIRT_BASE.
+fn map_bar0_mmio(addr_space: &mm::paging::AddressSpace, bar0_phys: u64, pages: u64, name: &str) {
+    use mm::paging::{PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE, PAGE_CACHE_DISABLE, PAGE_WRITE_THROUGH};
+    for i in 0..pages {
+        addr_space.map_page(
+            BAR0_VIRT_BASE + i * 0x1000,
+            bar0_phys + i * 0x1000,
+            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_CACHE_DISABLE | PAGE_WRITE_THROUGH,
+        );
+    }
+    kdebug!("  {}: BAR0 {:#x} mapped at {:#x} ({}p, UC)", name, bar0_phys, BAR0_VIRT_BASE, pages);
+}
+
+/// Scan PCI bus 0 for a device matching the given class/subclass (and optional prog_if).
+/// Returns (BAR0 physical address, IRQ line) if found.
+/// Enables bus mastering + memory space in the PCI command register.
+fn scan_pci_for_device(class: u8, subclass: u8, prog_if: Option<u8>, name: &str) -> Option<(u64, u8)> {
+    use x86_64::instructions::port::Port;
+
+    let mut addr_port = Port::<u32>::new(PCI_CONFIG_PORT);
+    let mut data_port = Port::<u32>::new(PCI_DATA_PORT);
+
+    for dev in 0..32u8 {
+        let address: u32 = (1 << 31) | ((dev as u32) << 11);
+
+        // Read vendor/device (offset 0x00).
+        unsafe { addr_port.write(address); }
+        let vendor_device = unsafe { data_port.read() };
+        if (vendor_device & 0xFFFF) == 0xFFFF {
+            continue;
+        }
+
+        // Read class/subclass/prog_if (offset 0x08).
+        unsafe { addr_port.write(address | 0x08); }
+        let class_rev = unsafe { data_port.read() };
+        let dev_class = (class_rev >> 24) as u8;
+        let dev_subclass = ((class_rev >> 16) & 0xFF) as u8;
+        let dev_prog_if = ((class_rev >> 8) & 0xFF) as u8;
+
+        if dev_class != class || dev_subclass != subclass {
+            continue;
+        }
+        if let Some(required_pi) = prog_if {
+            if dev_prog_if != required_pi {
+                continue;
+            }
+        }
+
+        // Device found. Read BAR0 (offset 0x10).
+        unsafe { addr_port.write(address | 0x10); }
+        let bar0 = unsafe { data_port.read() };
+        if bar0 & 1 != 0 {
+            continue; // I/O port BAR, skip
+        }
+        let bar_type = (bar0 >> 1) & 3;
+        let base_lo = (bar0 & !0xF) as u64;
+        let bar0_phys = if bar_type == 2 {
+            // 64-bit BAR: read BAR1 (offset 0x14).
+            unsafe { addr_port.write(address | 0x14); }
+            let bar1 = unsafe { data_port.read() };
+            base_lo | ((bar1 as u64) << 32)
+        } else {
+            base_lo
+        };
+
+        // Read IRQ line (offset 0x3C).
+        unsafe { addr_port.write(address | 0x3C); }
+        let irq_reg = unsafe { data_port.read() };
+        let irq_line = (irq_reg & 0xFF) as u8;
+
+        // Enable bus mastering (bit 2) + memory space (bit 1).
+        unsafe { addr_port.write(address | 0x04); }
+        let cmd = unsafe { data_port.read() };
+        unsafe { addr_port.write(address | 0x04); }
+        unsafe { data_port.write(cmd | (1 << 1) | (1 << 2)); }
+
+        kdebug!("  {}: PCI dev={} BAR0={:#x} IRQ={}", name, dev, bar0_phys, irq_line);
+        return Some((bar0_phys, irq_line));
+    }
+    None
+}
+
+/// Create a PCI config I/O port capability (0xCF8-0xCFF).
+fn create_pci_cap(name: &str) -> cap::CapId {
+    let pci_cap = cap::insert(
+        cap::CapObject::IoPort { base: PCI_CONFIG_PORT, count: 8 },
+        cap::Rights::ALL, None,
+    ).unwrap_or_else(|| panic!("failed to create {} PCI ioport cap", name));
+    kdebug!("  {} cap {}: port 0xCF8-0xCFF (PCI config)", name, pci_cap.raw());
+    pci_cap
+}
+
 /// Create root capabilities for init (VMM and keyboard caps removed — they go to separate processes).
 ///
 /// Cap 0: I/O port 0xCF8-0xCFF (PCI config)
 fn create_init_caps() {
-    // Cap 0: PCI config space ports 0xCF8-0xCFF (8 bytes: address + data)
-    let pci_cap = cap::insert(cap::CapObject::IoPort { base: 0xCF8, count: 8 }, cap::Rights::ALL, None)
-        .expect("failed to create PCI ioport cap");
-    kdebug!("  cap {}: port 0xCF8-0xCFF (PCI config)", pci_cap.raw());
+    create_pci_cap("init");
 }
 
 /// Create the user address space, map KB ring page, create caps.
@@ -404,7 +573,7 @@ fn spawn_init_process() -> u64 {
 /// BootInfo, and spawn a user thread. The new thread shares the existing
 /// user address space (same CR3).
 fn load_initrd(cr3: u64) {
-    use mm::paging::{AddressSpace, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
+    use mm::paging::AddressSpace;
 
     let response = match MODULE_REQUEST.get_response() {
         Some(r) => r,
@@ -462,23 +631,7 @@ fn load_initrd(cr3: u64) {
         }
     }
 
-    // Allocate a user stack with ASLR jitter + guard page below.
-    let stack_rand = (mm::random_u64() % 16) * 0x1000; // 0..64 KiB jitter
-    let stack_base: u64 = 0x900000 + stack_rand;
-    let stack_pages: u64 = 4;
-    // Guard page: present but not user-accessible — triggers fault on stack overflow.
-    let guard_frame = mm::alloc_frame().expect("no frame for stack guard");
-    addr_space.map_page(stack_base - 0x1000, guard_frame.addr(), PAGE_PRESENT);
-    for i in 0..stack_pages {
-        let sf = mm::alloc_frame().expect("no frame for ELF stack");
-        let sp = sf.addr();
-        unsafe {
-            core::ptr::write_bytes((sp + mm::hhdm_offset()) as *mut u8, 0, 4096);
-        }
-        addr_space.map_page(stack_base + i * 0x1000, sp, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-    }
-    let stack_top = stack_base + stack_pages * 0x1000;
-    kdebug!("  init: stack = {:#x}..{:#x} (ASLR offset {:#x})", stack_base, stack_top, stack_rand);
+    let stack_top = allocate_user_stack(&addr_space, 4, "init");
 
     // Write BootInfo page at 0xB00000 (read-only for userspace).
     write_boot_info(cr3, &addr_space, stack_top);
@@ -524,21 +677,13 @@ fn write_boot_info(
     addr_space: &mm::paging::AddressSpace,
     stack_top: u64,
 ) {
-    use mm::paging::{PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE, PAGE_CACHE_DISABLE, PAGE_WRITE_THROUGH};
+    use mm::paging::{PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER, PAGE_CACHE_DISABLE, PAGE_WRITE_THROUGH};
     use sotos_common::{BOOT_INFO_ADDR, BOOT_INFO_MAGIC, BootInfo};
 
     let hhdm = mm::hhdm_offset();
-    let frame = mm::alloc_frame().expect("no frame for BootInfo");
-    let phys = frame.addr();
-    unsafe {
-        core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096);
-    }
-
-    // Map read-only into user address space (PAGE_PRESENT | PAGE_USER, no WRITABLE).
-    addr_space.map_page(BOOT_INFO_ADDR, phys, PAGE_PRESENT | PAGE_USER);
+    let phys = alloc_bootinfo_page(addr_space, "init");
 
     // Collect all existing capability IDs (caps 0..N created during spawn_init_process).
-    // We know caps 0-9 were created. Query the cap table for them.
     let mut info = BootInfo::empty();
     info.magic = BOOT_INFO_MAGIC;
 
@@ -555,6 +700,7 @@ fn write_boot_info(
     info.guest_entry = GUEST_ENTRY.load(Ordering::Acquire);
 
     // Map framebuffer into user address space if available.
+    const FB_USER_BASE: u64 = 0x4000000;
     if let Some(fb_response) = FRAMEBUFFER_REQUEST.get_response() {
         if let Some(fb) = fb_response.framebuffers().next() {
             let fb_virt = fb.addr() as u64;
@@ -565,18 +711,17 @@ fn write_boot_info(
             let bpp = fb.bpp() as u32;
             let fb_size = (pitch as u64) * (height as u64);
             let fb_pages = (fb_size + 0xFFF) / 0x1000;
-            let fb_user_base: u64 = 0x4000000;
 
             for i in 0..fb_pages {
                 addr_space.map_page(
-                    fb_user_base + i * 0x1000,
+                    FB_USER_BASE + i * 0x1000,
                     fb_phys + i * 0x1000,
                     PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
                         | PAGE_CACHE_DISABLE | PAGE_WRITE_THROUGH,
                 );
             }
 
-            info.fb_addr = fb_user_base;
+            info.fb_addr = FB_USER_BASE;
             info.fb_width = width;
             info.fb_height = height;
             info.fb_pitch = pitch;
@@ -587,12 +732,7 @@ fn write_boot_info(
 
     info.stack_top = stack_top;
 
-    // Write the struct via HHDM.
-    unsafe {
-        let ptr = (phys + hhdm) as *mut BootInfo;
-        core::ptr::write(ptr, info);
-    }
-
+    write_bootinfo(phys, &info);
     kdebug!("  bootinfo: {} caps at {:#x}", count, BOOT_INFO_ADDR);
 }
 
@@ -602,36 +742,15 @@ fn write_boot_info(
 /// creates VMM-specific capabilities, and spawns the thread.
 /// Must be spawned BEFORE init so it registers for faults first.
 fn load_vmm_process(vmm_data: &[u8], init_cr3: u64) {
-    use mm::paging::{AddressSpace, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
-
-    let vmm_as = AddressSpace::new_user();
+    let vmm_as = mm::paging::AddressSpace::new_user();
     let vmm_cr3 = vmm_as.cr3();
 
-    let vmm_entry = match elf::load(vmm_data, &vmm_as) {
-        Ok(e) => e,
-        Err(msg) => {
-            kdebug!("  vmm: ELF load failed: {}", msg);
-            return;
-        }
+    let vmm_entry = match load_elf_into(vmm_data, &vmm_as, "vmm") {
+        Some(e) => e,
+        None => return,
     };
-    kdebug!("  vmm: entry = {:#x}", vmm_entry);
 
-    let hhdm = mm::hhdm_offset();
-
-    // Stack for VMM with ASLR jitter + guard page.
-    let stack_rand = (mm::random_u64() % 16) * 0x1000;
-    let stack_base: u64 = 0x900000 + stack_rand;
-    let stack_pages: u64 = 4;
-    let guard_frame = mm::alloc_frame().expect("no frame for vmm stack guard");
-    vmm_as.map_page(stack_base - 0x1000, guard_frame.addr(), PAGE_PRESENT);
-    for i in 0..stack_pages {
-        let sf = mm::alloc_frame().expect("no frame for vmm stack");
-        unsafe { core::ptr::write_bytes((sf.addr() + hhdm) as *mut u8, 0, 4096); }
-        vmm_as.map_page(stack_base + i * 0x1000, sf.addr(),
-            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-    }
-    let stack_top = stack_base + stack_pages * 0x1000;
-
+    let stack_top = allocate_user_stack(&vmm_as, 4, "vmm");
     write_vmm_boot_info(&vmm_as, init_cr3);
 
     sched::spawn_user(vmm_entry, stack_top, vmm_cr3);
@@ -647,17 +766,9 @@ fn write_vmm_boot_info(
     vmm_as: &mm::paging::AddressSpace,
     init_cr3: u64,
 ) {
-    use mm::paging::{PAGE_PRESENT, PAGE_USER};
     use sotos_common::{BOOT_INFO_ADDR, BOOT_INFO_MAGIC, BootInfo};
 
-    let hhdm = mm::hhdm_offset();
-    let frame = mm::alloc_frame().expect("no frame for vmm BootInfo");
-    let phys = frame.addr();
-    unsafe {
-        core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096);
-    }
-
-    vmm_as.map_page(BOOT_INFO_ADDR, phys, PAGE_PRESENT | PAGE_USER);
+    let phys = alloc_bootinfo_page(vmm_as, "vmm");
 
     // Cap 0: VMM notification (fault delivery).
     let n_vmm = ipc::notify::create().expect("failed to create vmm notification");
@@ -676,11 +787,7 @@ fn write_vmm_boot_info(
     info.caps[0] = n_vmm_cap.raw() as u64;
     info.caps[1] = init_as_cap.raw() as u64;
 
-    unsafe {
-        let ptr = (phys + hhdm) as *mut BootInfo;
-        core::ptr::write(ptr, info);
-    }
-
+    write_bootinfo(phys, &info);
     kdebug!("  vmm bootinfo: 2 caps at {:#x}", BOOT_INFO_ADDR);
 }
 
@@ -694,46 +801,23 @@ fn load_kbd_process(kbd_data: &[u8], init_cr3: u64) {
     let kbd_as = AddressSpace::new_user();
     let kbd_cr3 = kbd_as.cr3();
 
-    // Load ELF segments into the kbd address space.
-    let kbd_entry = match elf::load(kbd_data, &kbd_as) {
-        Ok(e) => e,
-        Err(msg) => {
-            kdebug!("  kbd: ELF load failed: {}", msg);
-            return;
-        }
+    let kbd_entry = match load_elf_into(kbd_data, &kbd_as, "kbd") {
+        Some(e) => e,
+        None => return,
     };
-    kdebug!("  kbd: entry = {:#x}", kbd_entry);
 
-    let hhdm = mm::hhdm_offset();
+    let stack_top = allocate_user_stack(&kbd_as, 4, "kbd");
 
-    // Stack for kbd with ASLR jitter + guard page.
-    let stack_rand = (mm::random_u64() % 16) * 0x1000;
-    let stack_base: u64 = 0x900000 + stack_rand;
-    let stack_pages: u64 = 4;
-    let guard_frame = mm::alloc_frame().expect("no frame for kbd stack guard");
-    kbd_as.map_page(stack_base - 0x1000, guard_frame.addr(), PAGE_PRESENT);
-    for i in 0..stack_pages {
-        let sf = mm::alloc_frame().expect("no frame for kbd stack");
-        unsafe { core::ptr::write_bytes((sf.addr() + hhdm) as *mut u8, 0, 4096); }
-        kbd_as.map_page(stack_base + i * 0x1000, sf.addr(),
-            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-    }
-    let stack_top = stack_base + stack_pages * 0x1000;
-
-    // Map shared KB ring page into kbd's AS at 0x510000.
+    // Map shared KB + mouse ring pages from init's address space.
     let init_as = AddressSpace::from_cr3(init_cr3);
     let kb_ring_phys = init_as.lookup_phys(KB_RING_PAGE)
         .expect("init's KB ring page not mapped");
-    kbd_as.map_page(KB_RING_PAGE, kb_ring_phys,
-        PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+    kbd_as.map_page(KB_RING_PAGE, kb_ring_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
 
-    // Map shared mouse ring page into kbd's AS at 0x520000.
     let mouse_ring_phys = init_as.lookup_phys(MOUSE_RING_PAGE)
         .expect("init's mouse ring page not mapped");
-    kbd_as.map_page(MOUSE_RING_PAGE, mouse_ring_phys,
-        PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+    kbd_as.map_page(MOUSE_RING_PAGE, mouse_ring_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
 
-    // Create kbd capabilities and write BootInfo.
     write_kbd_boot_info(kbd_cr3, &kbd_as);
 
     sched::spawn_user(kbd_entry, stack_top, kbd_cr3);
@@ -751,25 +835,15 @@ fn write_kbd_boot_info(
     _kbd_cr3: u64,
     kbd_as: &mm::paging::AddressSpace,
 ) {
-    use mm::paging::{PAGE_PRESENT, PAGE_USER};
     use sotos_common::{BOOT_INFO_ADDR, BOOT_INFO_MAGIC, BootInfo};
 
-    let hhdm = mm::hhdm_offset();
-    let frame = mm::alloc_frame().expect("no frame for kbd BootInfo");
-    let phys = frame.addr();
-    unsafe {
-        core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096);
-    }
-
-    // Map read-only into kbd address space.
-    kbd_as.map_page(BOOT_INFO_ADDR, phys, PAGE_PRESENT | PAGE_USER);
+    let phys = alloc_bootinfo_page(kbd_as, "kbd");
 
     // Create kbd-specific capabilities.
     let irq_cap = cap::insert(cap::CapObject::Irq { line: 1 }, cap::Rights::ALL, None)
         .expect("failed to create kbd irq cap");
     kdebug!("  kbd cap {}: IRQ 1 (keyboard)", irq_cap.raw());
 
-    // Port 0x60 (data) and 0x64 (command/status) — count=5 covers 0x60..0x64.
     let port_cap = cap::insert(cap::CapObject::IoPort { base: 0x60, count: 5 }, cap::Rights::ALL, None)
         .expect("failed to create kbd ioport cap");
     kdebug!("  kbd cap {}: port 0x60-0x64", port_cap.raw());
@@ -779,7 +853,6 @@ fn write_kbd_boot_info(
         .expect("failed to create kbd notification cap");
     kdebug!("  kbd cap {}: notification (KB+mouse IRQ)", n_kb_cap.raw());
 
-    // IRQ 12 for PS/2 mouse.
     let mouse_irq_cap = cap::insert(cap::CapObject::Irq { line: 12 }, cap::Rights::ALL, None)
         .expect("failed to create mouse irq cap");
     kdebug!("  kbd cap {}: IRQ 12 (mouse)", mouse_irq_cap.raw());
@@ -792,10 +865,7 @@ fn write_kbd_boot_info(
     info.caps[2] = n_kb_cap.raw() as u64;
     info.caps[3] = mouse_irq_cap.raw() as u64;
 
-    unsafe {
-        let ptr = (phys + hhdm) as *mut BootInfo;
-        core::ptr::write(ptr, info);
-    }
+    write_bootinfo(phys, &info);
 
     kdebug!("  kbd bootinfo: 4 caps at {:#x}", BOOT_INFO_ADDR);
 }
@@ -805,39 +875,16 @@ fn write_kbd_boot_info(
 /// Creates a new address space, loads the ELF, maps stack,
 /// creates net-specific capabilities, and spawns the thread.
 fn load_net_process(net_data: &[u8]) {
-    use mm::paging::{AddressSpace, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
-
-    let net_as = AddressSpace::new_user();
+    let net_as = mm::paging::AddressSpace::new_user();
     let net_cr3 = net_as.cr3();
 
-    // Load ELF segments into the net address space.
-    let net_entry = match elf::load(net_data, &net_as) {
-        Ok(e) => e,
-        Err(msg) => {
-            kdebug!("  net: ELF load failed: {}", msg);
-            return;
-        }
+    let net_entry = match load_elf_into(net_data, &net_as, "net") {
+        Some(e) => e,
+        None => return,
     };
-    kdebug!("  net: entry = {:#x}", net_entry);
 
-    let hhdm = mm::hhdm_offset();
-
-    // Stack for net with ASLR jitter + guard page.
     // 16 pages (64 KiB) — VirtioNet::init + DHCP + main loop need significant stack in debug mode.
-    let stack_rand = (mm::random_u64() % 16) * 0x1000;
-    let stack_base: u64 = 0x900000 + stack_rand;
-    let stack_pages: u64 = 16;
-    let guard_frame = mm::alloc_frame().expect("no frame for net stack guard");
-    net_as.map_page(stack_base - 0x1000, guard_frame.addr(), PAGE_PRESENT);
-    for i in 0..stack_pages {
-        let sf = mm::alloc_frame().expect("no frame for net stack");
-        unsafe { core::ptr::write_bytes((sf.addr() + hhdm) as *mut u8, 0, 4096); }
-        net_as.map_page(stack_base + i * 0x1000, sf.addr(),
-            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-    }
-    let stack_top = stack_base + stack_pages * 0x1000;
-
-    // Create net capabilities and write BootInfo.
+    let stack_top = allocate_user_stack(&net_as, 16, "net");
     write_net_boot_info(net_cr3, &net_as);
 
     sched::spawn_user(net_entry, stack_top, net_cr3);
@@ -852,35 +899,17 @@ fn write_net_boot_info(
     _net_cr3: u64,
     net_as: &mm::paging::AddressSpace,
 ) {
-    use mm::paging::{PAGE_PRESENT, PAGE_USER};
     use sotos_common::{BOOT_INFO_ADDR, BOOT_INFO_MAGIC, BootInfo};
 
-    let hhdm = mm::hhdm_offset();
-    let frame = mm::alloc_frame().expect("no frame for net BootInfo");
-    let phys = frame.addr();
-    unsafe {
-        core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096);
-    }
-
-    // Map read-only into net address space.
-    net_as.map_page(BOOT_INFO_ADDR, phys, PAGE_PRESENT | PAGE_USER);
-
-    // Create net-specific capabilities.
-    // Cap 0: PCI config space ports 0xCF8-0xCFF
-    let pci_cap = cap::insert(cap::CapObject::IoPort { base: 0xCF8, count: 8 }, cap::Rights::ALL, None)
-        .expect("failed to create net PCI ioport cap");
-    kdebug!("  net cap {}: port 0xCF8-0xCFF (PCI config)", pci_cap.raw());
+    let phys = alloc_bootinfo_page(net_as, "net");
+    let pci_cap = create_pci_cap("net");
 
     let mut info = BootInfo::empty();
     info.magic = BOOT_INFO_MAGIC;
     info.cap_count = 1;
     info.caps[0] = pci_cap.raw() as u64;
 
-    unsafe {
-        let ptr = (phys + hhdm) as *mut BootInfo;
-        core::ptr::write(ptr, info);
-    }
-
+    write_bootinfo(phys, &info);
     kdebug!("  net bootinfo: 1 cap at {:#x}", BOOT_INFO_ADDR);
 }
 
@@ -888,71 +917,13 @@ fn write_net_boot_info(
 // NVMe SSD driver process
 // ---------------------------------------------------------------------------
 
-/// Scan PCI bus 0 from kernel (direct I/O port access) for an NVMe controller.
-/// Returns (BAR0 physical address, IRQ line) if found.
+// NVMe: class=0x01 (Mass Storage), subclass=0x08 (NVM), any prog_if
 fn scan_pci_for_nvme() -> Option<(u64, u8)> {
-    use x86_64::instructions::port::Port;
-
-    let mut addr_port = Port::<u32>::new(0xCF8);
-    let mut data_port = Port::<u32>::new(0xCFC);
-
-    for dev in 0..32u8 {
-        let address: u32 = (1 << 31) | ((dev as u32) << 11);
-        // Read vendor/device (offset 0x00).
-        unsafe { addr_port.write(address); }
-        let vendor_device = unsafe { data_port.read() };
-        if (vendor_device & 0xFFFF) == 0xFFFF {
-            continue;
-        }
-        // Read class/subclass (offset 0x08).
-        unsafe { addr_port.write(address | 0x08); }
-        let class_rev = unsafe { data_port.read() };
-        let class = (class_rev >> 24) as u8;
-        let subclass = ((class_rev >> 16) & 0xFF) as u8;
-
-        if class == 0x01 && subclass == 0x08 {
-            // NVMe controller found. Read BAR0 (offset 0x10).
-            unsafe { addr_port.write(address | 0x10); }
-            let bar0 = unsafe { data_port.read() };
-            // Check if MMIO (bit 0 = 0).
-            if bar0 & 1 != 0 {
-                continue; // I/O port BAR, skip
-            }
-            let bar_type = (bar0 >> 1) & 3;
-            let base_lo = (bar0 & !0xF) as u64;
-            let bar0_phys = if bar_type == 2 {
-                // 64-bit BAR: read BAR1 (offset 0x14).
-                unsafe { addr_port.write(address | 0x14); }
-                let bar1 = unsafe { data_port.read() };
-                base_lo | ((bar1 as u64) << 32)
-            } else {
-                base_lo
-            };
-
-            // Read IRQ line (offset 0x3C).
-            unsafe { addr_port.write(address | 0x3C); }
-            let irq_reg = unsafe { data_port.read() };
-            let irq_line = (irq_reg & 0xFF) as u8;
-
-            // Enable bus mastering (bit 2) + memory space (bit 1) in Command register.
-            unsafe { addr_port.write(address | 0x04); }
-            let cmd = unsafe { data_port.read() };
-            unsafe { addr_port.write(address | 0x04); }
-            unsafe { data_port.write(cmd | (1 << 1) | (1 << 2)); }
-
-            kdebug!("  nvme: PCI dev={} BAR0={:#x} IRQ={}", dev, bar0_phys, irq_line);
-            return Some((bar0_phys, irq_line));
-        }
-    }
-    None
+    scan_pci_for_device(0x01, 0x08, None, "nvme")
 }
 
 /// Load the NVMe driver as a fully pre-mapped separate process.
 fn load_nvme_process(nvme_data: &[u8]) {
-    use mm::paging::{AddressSpace, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE,
-                     PAGE_CACHE_DISABLE, PAGE_WRITE_THROUGH};
-
-    // Scan PCI for NVMe BAR0 physical address.
     let (bar0_phys, _irq_line) = match scan_pci_for_nvme() {
         Some(r) => r,
         None => {
@@ -961,48 +932,16 @@ fn load_nvme_process(nvme_data: &[u8]) {
         }
     };
 
-    let nvme_as = AddressSpace::new_user();
+    let nvme_as = mm::paging::AddressSpace::new_user();
     let nvme_cr3 = nvme_as.cr3();
 
-    // Load ELF segments.
-    let nvme_entry = match elf::load(nvme_data, &nvme_as) {
-        Ok(e) => e,
-        Err(msg) => {
-            kdebug!("  nvme: ELF load failed: {}", msg);
-            return;
-        }
+    let nvme_entry = match load_elf_into(nvme_data, &nvme_as, "nvme") {
+        Some(e) => e,
+        None => return,
     };
-    kdebug!("  nvme: entry = {:#x}", nvme_entry);
 
-    let hhdm = mm::hhdm_offset();
-
-    // Stack with ASLR jitter + guard page.
-    let stack_rand = (mm::random_u64() % 16) * 0x1000;
-    let stack_base: u64 = 0x900000 + stack_rand;
-    let stack_pages: u64 = 4;
-    let guard_frame = mm::alloc_frame().expect("no frame for nvme stack guard");
-    nvme_as.map_page(stack_base - 0x1000, guard_frame.addr(), PAGE_PRESENT);
-    for i in 0..stack_pages {
-        let sf = mm::alloc_frame().expect("no frame for nvme stack");
-        unsafe { core::ptr::write_bytes((sf.addr() + hhdm) as *mut u8, 0, 4096); }
-        nvme_as.map_page(stack_base + i * 0x1000, sf.addr(),
-            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-    }
-    let stack_top = stack_base + stack_pages * 0x1000;
-
-    // Pre-map BAR0 MMIO at 0xC00000 (16 pages, UC flags).
-    let mmio_pages: u64 = 16;
-    for i in 0..mmio_pages {
-        nvme_as.map_page(
-            0xC00000 + i * 0x1000,
-            bar0_phys + i * 0x1000,
-            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
-                | PAGE_CACHE_DISABLE | PAGE_WRITE_THROUGH,
-        );
-    }
-    kdebug!("  nvme: BAR0 {:#x} mapped at 0xC00000 ({}p, UC)", bar0_phys, mmio_pages);
-
-    // Write BootInfo + caps.
+    let stack_top = allocate_user_stack(&nvme_as, 4, "nvme");
+    map_bar0_mmio(&nvme_as, bar0_phys, 16, "nvme");
     write_nvme_boot_info(&nvme_as);
 
     sched::spawn_user(nvme_entry, stack_top, nvme_cr3);
@@ -1014,33 +953,17 @@ fn load_nvme_process(nvme_data: &[u8]) {
 /// Creates fresh capabilities:
 ///   Cap 0: I/O port 0xCF8-0xCFF (PCI config)
 fn write_nvme_boot_info(nvme_as: &mm::paging::AddressSpace) {
-    use mm::paging::{PAGE_PRESENT, PAGE_USER};
     use sotos_common::{BOOT_INFO_ADDR, BOOT_INFO_MAGIC, BootInfo};
 
-    let hhdm = mm::hhdm_offset();
-    let frame = mm::alloc_frame().expect("no frame for nvme BootInfo");
-    let phys = frame.addr();
-    unsafe {
-        core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096);
-    }
-
-    nvme_as.map_page(BOOT_INFO_ADDR, phys, PAGE_PRESENT | PAGE_USER);
-
-    // Cap 0: PCI config space ports.
-    let pci_cap = cap::insert(cap::CapObject::IoPort { base: 0xCF8, count: 8 }, cap::Rights::ALL, None)
-        .expect("failed to create nvme PCI ioport cap");
-    kdebug!("  nvme cap {}: port 0xCF8-0xCFF (PCI config)", pci_cap.raw());
+    let phys = alloc_bootinfo_page(nvme_as, "nvme");
+    let pci_cap = create_pci_cap("nvme");
 
     let mut info = BootInfo::empty();
     info.magic = BOOT_INFO_MAGIC;
     info.cap_count = 1;
     info.caps[0] = pci_cap.raw() as u64;
 
-    unsafe {
-        let ptr = (phys + hhdm) as *mut BootInfo;
-        core::ptr::write(ptr, info);
-    }
-
+    write_bootinfo(phys, &info);
     kdebug!("  nvme bootinfo: 1 cap at {:#x}", BOOT_INFO_ADDR);
 }
 
@@ -1048,70 +971,14 @@ fn write_nvme_boot_info(nvme_as: &mm::paging::AddressSpace) {
 // xHCI USB Host Controller driver process
 // ---------------------------------------------------------------------------
 
-/// Scan PCI bus 0 from kernel for an xHCI USB controller.
-/// Matches class=0x0C, subclass=0x03, prog_if=0x30.
-/// Returns (BAR0 physical address, IRQ line) if found.
+// xHCI: class=0x0C (Serial Bus), subclass=0x03 (USB), prog_if=0x30 (xHCI)
 fn scan_pci_for_xhci() -> Option<(u64, u8)> {
-    use x86_64::instructions::port::Port;
-
-    let mut addr_port = Port::<u32>::new(0xCF8);
-    let mut data_port = Port::<u32>::new(0xCFC);
-
-    for dev in 0..32u8 {
-        let address: u32 = (1 << 31) | ((dev as u32) << 11);
-        // Read vendor/device (offset 0x00).
-        unsafe { addr_port.write(address); }
-        let vendor_device = unsafe { data_port.read() };
-        if (vendor_device & 0xFFFF) == 0xFFFF {
-            continue;
-        }
-        // Read class/subclass/prog_if (offset 0x08).
-        unsafe { addr_port.write(address | 0x08); }
-        let class_rev = unsafe { data_port.read() };
-        let class = (class_rev >> 24) as u8;
-        let subclass = ((class_rev >> 16) & 0xFF) as u8;
-        let prog_if = ((class_rev >> 8) & 0xFF) as u8;
-
-        if class == 0x0C && subclass == 0x03 && prog_if == 0x30 {
-            // xHCI controller found. Read BAR0 (offset 0x10).
-            unsafe { addr_port.write(address | 0x10); }
-            let bar0 = unsafe { data_port.read() };
-            if bar0 & 1 != 0 {
-                continue; // I/O port BAR, skip
-            }
-            let bar_type = (bar0 >> 1) & 3;
-            let base_lo = (bar0 & !0xF) as u64;
-            let bar0_phys = if bar_type == 2 {
-                // 64-bit BAR.
-                unsafe { addr_port.write(address | 0x14); }
-                let bar1 = unsafe { data_port.read() };
-                base_lo | ((bar1 as u64) << 32)
-            } else {
-                base_lo
-            };
-
-            // Read IRQ line (offset 0x3C).
-            unsafe { addr_port.write(address | 0x3C); }
-            let irq_reg = unsafe { data_port.read() };
-            let irq_line = (irq_reg & 0xFF) as u8;
-
-            // Enable bus mastering (bit 2) + memory space (bit 1).
-            unsafe { addr_port.write(address | 0x04); }
-            let cmd = unsafe { data_port.read() };
-            unsafe { addr_port.write(address | 0x04); }
-            unsafe { data_port.write(cmd | (1 << 1) | (1 << 2)); }
-
-            kdebug!("  xhci: PCI dev={} BAR0={:#x} IRQ={}", dev, bar0_phys, irq_line);
-            return Some((bar0_phys, irq_line));
-        }
-    }
-    None
+    scan_pci_for_device(0x0C, 0x03, Some(0x30), "xhci")
 }
 
 /// Load the xHCI driver as a fully pre-mapped separate process.
 fn load_xhci_process(xhci_data: &[u8], init_cr3: u64) {
-    use mm::paging::{AddressSpace, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE,
-                     PAGE_CACHE_DISABLE, PAGE_WRITE_THROUGH};
+    use mm::paging::{AddressSpace, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
 
     let (bar0_phys, irq_line) = match scan_pci_for_xhci() {
         Some(r) => r,
@@ -1124,49 +991,19 @@ fn load_xhci_process(xhci_data: &[u8], init_cr3: u64) {
     let xhci_as = AddressSpace::new_user();
     let xhci_cr3 = xhci_as.cr3();
 
-    let xhci_entry = match elf::load(xhci_data, &xhci_as) {
-        Ok(e) => e,
-        Err(msg) => {
-            kdebug!("  xhci: ELF load failed: {}", msg);
-            return;
-        }
+    let xhci_entry = match load_elf_into(xhci_data, &xhci_as, "xhci") {
+        Some(e) => e,
+        None => return,
     };
-    kdebug!("  xhci: entry = {:#x}", xhci_entry);
 
-    let hhdm = mm::hhdm_offset();
+    let stack_top = allocate_user_stack(&xhci_as, 4, "xhci");
+    map_bar0_mmio(&xhci_as, bar0_phys, 32, "xhci");
 
-    // Stack with ASLR jitter + guard page.
-    let stack_rand = (mm::random_u64() % 16) * 0x1000;
-    let stack_base: u64 = 0x900000 + stack_rand;
-    let stack_pages: u64 = 4;
-    let guard_frame = mm::alloc_frame().expect("no frame for xhci stack guard");
-    xhci_as.map_page(stack_base - 0x1000, guard_frame.addr(), PAGE_PRESENT);
-    for i in 0..stack_pages {
-        let sf = mm::alloc_frame().expect("no frame for xhci stack");
-        unsafe { core::ptr::write_bytes((sf.addr() + hhdm) as *mut u8, 0, 4096); }
-        xhci_as.map_page(stack_base + i * 0x1000, sf.addr(),
-            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-    }
-    let stack_top = stack_base + stack_pages * 0x1000;
-
-    // Pre-map BAR0 MMIO at 0xC00000 (32 pages, UC flags).
-    let mmio_pages: u64 = 32;
-    for i in 0..mmio_pages {
-        xhci_as.map_page(
-            0xC00000 + i * 0x1000,
-            bar0_phys + i * 0x1000,
-            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
-                | PAGE_CACHE_DISABLE | PAGE_WRITE_THROUGH,
-        );
-    }
-    kdebug!("  xhci: BAR0 {:#x} mapped at 0xC00000 ({}p, UC)", bar0_phys, mmio_pages);
-
-    // Map shared KB ring page (0x510000) from init's address space.
+    // Map shared KB ring page from init's address space.
     let init_as = AddressSpace::from_cr3(init_cr3);
     let kb_ring_phys = init_as.lookup_phys(KB_RING_PAGE)
         .expect("init's KB ring page not mapped");
-    xhci_as.map_page(KB_RING_PAGE, kb_ring_phys,
-        PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+    xhci_as.map_page(KB_RING_PAGE, kb_ring_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
     kdebug!("  xhci: KB ring page mapped at {:#x}", KB_RING_PAGE);
 
     write_xhci_boot_info(&xhci_as, irq_line);
@@ -1182,29 +1019,15 @@ fn load_xhci_process(xhci_data: &[u8], init_cr3: u64) {
 ///   Cap 1: IRQ (xHCI interrupt line)
 ///   Cap 2: Notification (IRQ delivery)
 fn write_xhci_boot_info(xhci_as: &mm::paging::AddressSpace, irq_line: u8) {
-    use mm::paging::{PAGE_PRESENT, PAGE_USER};
     use sotos_common::{BOOT_INFO_ADDR, BOOT_INFO_MAGIC, BootInfo};
 
-    let hhdm = mm::hhdm_offset();
-    let frame = mm::alloc_frame().expect("no frame for xhci BootInfo");
-    let phys = frame.addr();
-    unsafe {
-        core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096);
-    }
+    let phys = alloc_bootinfo_page(xhci_as, "xhci");
+    let pci_cap = create_pci_cap("xhci");
 
-    xhci_as.map_page(BOOT_INFO_ADDR, phys, PAGE_PRESENT | PAGE_USER);
-
-    // Cap 0: PCI config space ports.
-    let pci_cap = cap::insert(cap::CapObject::IoPort { base: 0xCF8, count: 8 }, cap::Rights::ALL, None)
-        .expect("failed to create xhci PCI ioport cap");
-    kdebug!("  xhci cap {}: port 0xCF8-0xCFF (PCI config)", pci_cap.raw());
-
-    // Cap 1: IRQ.
     let irq_cap = cap::insert(cap::CapObject::Irq { line: irq_line as u32 }, cap::Rights::ALL, None)
         .expect("failed to create xhci IRQ cap");
     kdebug!("  xhci cap {}: IRQ {}", irq_cap.raw(), irq_line);
 
-    // Cap 2: Notification for IRQ delivery.
     let n_xhci = ipc::notify::create().expect("failed to create xhci notification");
     let n_xhci_cap = cap::insert(cap::CapObject::Notification { id: n_xhci.0.raw() }, cap::Rights::ALL, None)
         .expect("failed to create xhci notification cap");
@@ -1217,10 +1040,6 @@ fn write_xhci_boot_info(xhci_as: &mm::paging::AddressSpace, irq_line: u8) {
     info.caps[1] = irq_cap.raw() as u64;
     info.caps[2] = n_xhci_cap.raw() as u64;
 
-    unsafe {
-        let ptr = (phys + hhdm) as *mut BootInfo;
-        core::ptr::write(ptr, info);
-    }
-
+    write_bootinfo(phys, &info);
     kdebug!("  xhci bootinfo: 3 caps at {:#x}", BOOT_INFO_ADDR);
 }

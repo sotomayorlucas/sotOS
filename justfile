@@ -21,6 +21,10 @@ USER_NET_TEST := "services/net-test/target/x86_64-unknown-none/debug/sotos-net-t
 MUSL_LD := "ld-musl-x86_64.so.1"
 USER_NANO := "nano"
 USER_BUSYBOX := "busybox"
+USER_LINKS := "links"
+USER_HELLO_GLIBC := "hello_glibc"
+GLIBC_LD := "ld-linux-x86-64.so.2"
+GLIBC_LIBC := "libc.so.6"
 LIBNCURSESW := "libncursesw.so.6"
 TERMINFO_XTERM := "xterm"
 TESTLIB := "target/libtest.so"
@@ -31,7 +35,7 @@ default: run
 
 # Build userspace init
 build-user:
-    cd services/init && CARGO_ENCODED_RUSTFLAGS="$(printf '%s\x1f%s\x1f%s' '-Clink-arg=-Tlinker.ld' '-Crelocation-model=static' '-Zstack-protector=strong')" cargo build
+    cd services/init && CARGO_ENCODED_RUSTFLAGS="$(printf '%s\x1f%s\x1f%s\x1f%s' '-Clink-arg=-Tlinker.ld' '-Crelocation-model=static' '-Zstack-protector=strong' '-Zub-checks=no')" cargo build
 
 # Build LUCAS shell (Linux-ABI guest binary)
 build-shell:
@@ -87,11 +91,11 @@ release:
 
 # Create CPIO initrd from userspace binaries
 initrd: build-user build-shell build-kbd build-net build-nvme build-xhci build-vmm build-hello build-hello-linux build-net-test build-testlib
-    python scripts/mkinitrd.py --output {{INITRD}} --file init={{USER_INIT}} --file shell={{USER_SHELL}} --file kbd={{USER_KBD}} --file net={{USER_NET}} --file nvme={{USER_NVME}} --file xhci={{USER_XHCI}} --file vmm={{USER_VMM}} --file hello={{USER_HELLO}} --file hello-linux={{USER_HELLO_LINUX}} --file hello-musl={{USER_HELLO_MUSL}} --file hello_dynamic={{USER_HELLO_DYNAMIC}} --file ld-musl-x86_64.so.1={{MUSL_LD}} --file nano={{USER_NANO}} --file libncursesw.so.6={{LIBNCURSESW}} --file xterm={{TERMINFO_XTERM}} --file libtest.so={{TESTLIB}} --file net-test={{USER_NET_TEST}} --file busybox={{USER_BUSYBOX}}
+    python scripts/mkinitrd.py --output {{INITRD}} --file init={{USER_INIT}} --file shell={{USER_SHELL}} --file kbd={{USER_KBD}} --file net={{USER_NET}} --file nvme={{USER_NVME}} --file xhci={{USER_XHCI}} --file vmm={{USER_VMM}} --file hello={{USER_HELLO}} --file hello-linux={{USER_HELLO_LINUX}} --file hello-musl={{USER_HELLO_MUSL}} --file hello_dynamic={{USER_HELLO_DYNAMIC}} --file ld-musl-x86_64.so.1={{MUSL_LD}} --file nano={{USER_NANO}} --file libncursesw.so.6={{LIBNCURSESW}} --file xterm={{TERMINFO_XTERM}} --file libtest.so={{TESTLIB}} --file net-test={{USER_NET_TEST}} --file busybox={{USER_BUSYBOX}} --file links={{USER_LINKS}} --file hello_glibc={{USER_HELLO_GLIBC}} --file ld-linux-x86-64.so.2={{GLIBC_LD}} --file libc.so.6={{GLIBC_LIBC}}
 
 # Create the bootable disk image (BIOS + Limine)
 image: build initrd
-    python scripts/mkimage.py --kernel {{KERNEL}} --initrd {{INITRD}} --output {{IMAGE}}
+    python scripts/mkimage.py --kernel {{KERNEL}} --initrd {{INITRD}} --output {{IMAGE}} --size 128
 
 # Build and run in QEMU (serial output to terminal, single CPU)
 run: image
@@ -100,7 +104,7 @@ run: image
         -serial stdio \
         -display none \
         -no-reboot \
-        -m 256M
+        -m 512M
 
 # Run with SMP (4 CPUs — may hang due to scheduler race, use for testing only)
 run-smp: image
@@ -109,7 +113,7 @@ run-smp: image
         -serial stdio \
         -display none \
         -no-reboot \
-        -m 256M \
+        -m 512M \
         -smp 4
 
 # Run with QEMU display window (for framebuffer/keyboard/mouse)
@@ -122,7 +126,21 @@ run-gui: image create-test-disk
         -device virtio-blk-pci,drive=disk0,disable-modern=on \
         -serial stdio \
         -no-reboot \
-        -m 256M \
+        -m 512M \
+        -display sdl \
+        -machine usb=off
+
+# Run with QEMU display + networking (for links/browser with internet)
+run-gui-net: image create-test-disk
+    "{{QEMU}}" \
+        -drive format=raw,file={{IMAGE}} \
+        -drive if=none,format=raw,file=target/disk.img,id=disk0 \
+        -device virtio-blk-pci,drive=disk0,disable-modern=on \
+        -netdev user,id=net0,hostfwd=udp::5555-:5555,hostfwd=tcp::7777-:7 \
+        -device virtio-net-pci,netdev=net0,disable-modern=on \
+        -serial stdio \
+        -no-reboot \
+        -m 512M \
         -display sdl \
         -machine usb=off
 
@@ -133,12 +151,16 @@ debug: image
         -serial stdio \
         -display none \
         -no-reboot \
-        -m 256M \
+        -m 512M \
         -s -S
 
-# Create a 1 MiB test disk for virtio-blk
+# Create a 256 MiB ObjectStore v5 disk (or inject rootfs if present)
 create-test-disk:
-    python scripts/mkdisk.py
+    python scripts/mkdisk.py --size 256
+
+# Create a rootfs-populated disk from an extracted rootfs directory
+create-rootfs-disk ROOTFS="rootfs":
+    python scripts/mkdisk.py --size 256 --rootfs {{ROOTFS}}
 
 # Run with virtio-net (and virtio-blk)
 run-net: image create-test-disk
@@ -150,7 +172,7 @@ run-net: image create-test-disk
         -device virtio-net-pci,netdev=net0,disable-modern=on \
         -serial stdio \
         -no-reboot \
-        -m 256M
+        -m 512M
 
 # Run with virtio-net + Wireshark packet capture (pcap)
 run-net-pcap: image create-test-disk
@@ -163,7 +185,7 @@ run-net-pcap: image create-test-disk
         -object filter-dump,id=dump0,netdev=net0,file=target/net.pcap \
         -serial stdio \
         -no-reboot \
-        -m 256M
+        -m 512M
 
 # Run with virtio-blk test disk
 run-blk: image create-test-disk
@@ -173,7 +195,7 @@ run-blk: image create-test-disk
         -device virtio-blk-pci,drive=disk0,disable-modern=on \
         -serial stdio \
         -no-reboot \
-        -m 256M
+        -m 512M
 
 # Create a 64 MiB NVMe test disk
 create-nvme-disk:
@@ -189,7 +211,7 @@ run-nvme: image create-test-disk create-nvme-disk
         -device nvme,serial=sotOS-NVMe,drive=nvme0 \
         -serial stdio \
         -no-reboot \
-        -m 256M
+        -m 512M
 
 # Run with xHCI USB controller (and virtio-blk for ObjectStore)
 run-xhci: image create-test-disk
@@ -201,7 +223,7 @@ run-xhci: image create-test-disk
         -device usb-kbd,bus=xhci.0 \
         -serial stdio \
         -no-reboot \
-        -m 256M
+        -m 512M
 
 # Run with ALL devices (virtio-blk, virtio-net, NVMe, xHCI USB kbd+mouse, AC97 audio, AHCI SATA, display)
 run-full: image create-test-disk create-nvme-disk
@@ -233,6 +255,10 @@ flash DISK: image
 # Clean build artifacts
 clean:
     cargo clean
+
+# Run interactive cybersecurity demo (serial console, automated test sequence)
+demo: image create-test-disk
+    python scripts/interactive_test.py
 
 # Check without building (fast feedback)
 check:

@@ -17,423 +17,92 @@ pub extern "C" fn __stack_chk_fail() -> ! {
 }
 
 // ---------------------------------------------------------------------------
-// Linux syscall wrappers (raw inline asm — the kernel redirects these via LUCAS)
+// Linux syscall primitives (x86_64 ABI: rdi, rsi, rdx, r10, r8, r9)
 // ---------------------------------------------------------------------------
 
 #[inline(always)]
-fn linux_write(fd: u64, buf: *const u8, len: usize) -> i64 {
+fn syscall0(nr: u64) -> i64 {
     let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 1u64 => ret,
-            in("rdi") fd,
-            in("rsi") buf as u64,
-            in("rdx") len as u64,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
+    unsafe { core::arch::asm!("syscall", inlateout("rax") nr => ret,
+        lateout("rcx") _, lateout("r11") _, options(nostack)); }
     ret
 }
 
 #[inline(always)]
-fn linux_read(fd: u64, buf: *mut u8, len: usize) -> i64 {
+fn syscall1(nr: u64, a1: u64) -> i64 {
     let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 0u64 => ret,
-            in("rdi") fd,
-            in("rsi") buf as u64,
-            in("rdx") len as u64,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
+    unsafe { core::arch::asm!("syscall", inlateout("rax") nr => ret,
+        in("rdi") a1, lateout("rcx") _, lateout("r11") _, options(nostack)); }
     ret
 }
 
 #[inline(always)]
-fn linux_open(path: *const u8, flags: u64) -> i64 {
+fn syscall2(nr: u64, a1: u64, a2: u64) -> i64 {
     let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 2u64 => ret,
-            in("rdi") path as u64,
-            in("rsi") flags,
-            in("rdx") 0u64, // mode (unused)
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
+    unsafe { core::arch::asm!("syscall", inlateout("rax") nr => ret,
+        in("rdi") a1, in("rsi") a2,
+        lateout("rcx") _, lateout("r11") _, options(nostack)); }
     ret
 }
 
 #[inline(always)]
-fn linux_close(fd: u64) -> i64 {
+fn syscall3(nr: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 3u64 => ret,
-            in("rdi") fd,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
+    unsafe { core::arch::asm!("syscall", inlateout("rax") nr => ret,
+        in("rdi") a1, in("rsi") a2, in("rdx") a3,
+        lateout("rcx") _, lateout("r11") _, options(nostack)); }
     ret
 }
 
 #[inline(always)]
-fn linux_unlink(path: *const u8) -> i64 {
+fn syscall6(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i64 {
     let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 87u64 => ret,
-            in("rdi") path as u64,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
+    unsafe { core::arch::asm!("syscall", inlateout("rax") nr => ret,
+        in("rdi") a1, in("rsi") a2, in("rdx") a3,
+        in("r10") a4, in("r8") a5, in("r9") a6,
+        lateout("rcx") _, lateout("r11") _, options(nostack)); }
     ret
 }
 
-#[inline(always)]
-fn linux_stat(path: *const u8, statbuf: *mut u8) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 4u64 => ret,
-            in("rdi") path as u64,
-            in("rsi") statbuf as u64,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
+// ---------------------------------------------------------------------------
+// Linux syscall wrappers (one-liners atop primitives)
+// ---------------------------------------------------------------------------
 
-#[inline(always)]
-fn linux_fstat(fd: u64, statbuf: *mut u8) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 5u64 => ret,
-            in("rdi") fd,
-            in("rsi") statbuf as u64,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-#[inline(always)]
-fn linux_lseek(fd: u64, offset: i64, whence: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 8u64 => ret,
-            in("rdi") fd,
-            in("rsi") offset as u64,
-            in("rdx") whence,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-#[inline(always)]
-fn linux_brk(addr: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 12u64 => ret,
-            in("rdi") addr,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-#[inline(always)]
-fn linux_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 9u64 => ret,
-            in("rdi") addr,
-            in("rsi") len,
-            in("rdx") prot,
-            in("r10") flags,
-            in("r8") fd,
-            in("r9") offset,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
+#[inline(always)] fn linux_write(fd: u64, buf: *const u8, len: usize) -> i64 { syscall3(1, fd, buf as u64, len as u64) }
+#[inline(always)] fn linux_read(fd: u64, buf: *mut u8, len: usize) -> i64 { syscall3(0, fd, buf as u64, len as u64) }
+#[inline(always)] fn linux_open(path: *const u8, flags: u64) -> i64 { syscall3(2, path as u64, flags, 0) }
+#[inline(always)] fn linux_close(fd: u64) -> i64 { syscall1(3, fd) }
+#[inline(always)] fn linux_stat(path: *const u8, buf: *mut u8) -> i64 { syscall2(4, path as u64, buf as u64) }
+#[allow(dead_code)] #[inline(always)] fn linux_fstat(fd: u64, buf: *mut u8) -> i64 { syscall2(5, fd, buf as u64) }
+#[allow(dead_code)] #[inline(always)] fn linux_lseek(fd: u64, off: i64, whence: u64) -> i64 { syscall3(8, fd, off as u64, whence) }
+#[allow(dead_code)] #[inline(always)] fn linux_mmap(a: u64, l: u64, p: u64, f: u64, fd: u64, o: u64) -> i64 { syscall6(9, a, l, p, f, fd, o) }
+#[allow(dead_code)] #[inline(always)] fn linux_brk(addr: u64) -> i64 { syscall1(12, addr) }
+#[inline(always)] fn linux_getpid() -> i64 { syscall0(39) }
+#[inline(always)] fn linux_clone(child_fn: u64) -> i64 { syscall2(56, child_fn, 0) }
+#[inline(always)] fn linux_execve(path: *const u8, argv: *const u64) -> i64 { syscall3(59, path as u64, argv as u64, 0) }
+#[inline(always)] fn linux_waitpid(pid: u64) -> i64 { syscall2(61, pid, 0) }
+#[inline(always)] fn linux_kill(pid: u64, sig: u64) -> i64 { syscall2(62, pid, sig) }
+#[inline(always)] fn linux_getcwd(buf: *mut u8, size: u64) -> i64 { syscall2(79, buf as u64, size) }
+#[inline(always)] fn linux_chdir(path: *const u8) -> i64 { syscall1(80, path as u64) }
+#[inline(always)] fn linux_mkdir(path: *const u8, mode: u64) -> i64 { syscall2(83, path as u64, mode) }
+#[inline(always)] fn linux_rmdir(path: *const u8) -> i64 { syscall1(84, path as u64) }
+#[inline(always)] fn linux_unlink(path: *const u8) -> i64 { syscall1(87, path as u64) }
+#[allow(dead_code)] #[inline(always)] fn linux_getppid() -> i64 { syscall0(110) }
+#[inline(always)] fn linux_socket(dom: u64, typ: u64, proto: u64) -> i64 { syscall3(41, dom, typ, proto) }
+#[inline(always)] fn linux_connect(fd: u64, addr: *const u8, len: u64) -> i64 { syscall3(42, fd, addr as u64, len) }
+#[inline(always)] fn linux_sendto(fd: u64, buf: *const u8, len: u64, flags: u64) -> i64 { syscall6(44, fd, buf as u64, len, flags, 0, 0) }
+#[inline(always)] fn linux_recvfrom(fd: u64, buf: *mut u8, len: u64, flags: u64) -> i64 { syscall6(45, fd, buf as u64, len, flags, 0, 0) }
+// Custom sotOS syscalls (intercepted by LUCAS)
+#[inline(always)] fn linux_dns_resolve(name: *const u8, len: usize) -> u64 { syscall2(200, name as u64, len as u64) as u64 }
+#[inline(always)] fn linux_traceroute_hop(dst: u64, ttl: u64) -> u64 { syscall2(201, dst, ttl) as u64 }
+#[inline(always)] fn linux_icmp_ping(dst: u64, seq: u64) -> u64 { syscall2(202, dst, seq) as u64 }
 
 #[inline(always)]
 fn linux_exit(status: u64) -> ! {
     unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rax") 60u64,
-            in("rdi") status,
-            options(nostack, noreturn),
-        );
+        core::arch::asm!("syscall", in("rax") 60u64, in("rdi") status,
+            options(nostack, noreturn));
     }
-}
-
-fn linux_clone(child_fn: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 56u64 => ret,
-            in("rdi") child_fn,
-            in("rsi") 0u64,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-fn linux_waitpid(pid: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 61u64 => ret,
-            in("rdi") pid,
-            in("rsi") 0u64,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-fn linux_getpid() -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 39u64 => ret,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-fn linux_getppid() -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 110u64 => ret,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-fn linux_execve(path: *const u8, argv: *const u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 59u64 => ret,
-            in("rdi") path as u64,
-            in("rsi") argv as u64,
-            in("rdx") 0u64,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-fn linux_socket(domain: u64, sock_type: u64, protocol: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 41u64 => ret,
-            in("rdi") domain,
-            in("rsi") sock_type,
-            in("rdx") protocol,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-fn linux_connect(fd: u64, addr: *const u8, addrlen: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 42u64 => ret,
-            in("rdi") fd,
-            in("rsi") addr as u64,
-            in("rdx") addrlen,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-fn linux_sendto(fd: u64, buf: *const u8, len: u64, flags: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 44u64 => ret,
-            in("rdi") fd,
-            in("rsi") buf as u64,
-            in("rdx") len,
-            in("r10") flags,
-            in("r8") 0u64,  // dest_addr (null)
-            in("r9") 0u64,  // addrlen
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-fn linux_recvfrom(fd: u64, buf: *mut u8, len: u64, flags: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 45u64 => ret,
-            in("rdi") fd,
-            in("rsi") buf as u64,
-            in("rdx") len,
-            in("r10") flags,
-            in("r8") 0u64,  // src_addr (null)
-            in("r9") 0u64,  // addrlen (null)
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-fn linux_kill(pid: u64, sig: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 62u64 => ret,
-            in("rdi") pid,
-            in("rsi") sig,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-fn linux_getcwd(buf: *mut u8, size: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 79u64 => ret,
-            in("rdi") buf as u64,
-            in("rsi") size,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-fn linux_chdir(path: *const u8) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 80u64 => ret,
-            in("rdi") path as u64,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-fn linux_mkdir(path: *const u8, mode: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 83u64 => ret,
-            in("rdi") path as u64,
-            in("rsi") mode,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-fn linux_rmdir(path: *const u8) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 84u64 => ret,
-            in("rdi") path as u64,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +188,79 @@ fn parse_u64_simple(s: &[u8]) -> u64 {
         i += 1;
     }
     val
+}
+
+// ---------------------------------------------------------------------------
+// File I/O helpers
+// ---------------------------------------------------------------------------
+
+/// Read from an open fd until EOF or buf full. Returns bytes read.
+fn read_all(fd: u64, buf: &mut [u8]) -> usize {
+    let mut total: usize = 0;
+    loop {
+        let n = linux_read(fd, buf[total..].as_mut_ptr(), buf.len() - total);
+        if n <= 0 { break; }
+        total += n as usize;
+        if total >= buf.len() { break; }
+    }
+    total
+}
+
+/// Open file by name, read contents into buf, close. Returns bytes read or -1 on error.
+fn slurp_file(name: &[u8], buf: &mut [u8]) -> i64 {
+    let mut path_buf = [0u8; 64];
+    let path = null_terminate(name, &mut path_buf);
+    let fd = linux_open(path, 0);
+    if fd < 0 { return -1; }
+    let total = read_all(fd as u64, buf);
+    linux_close(fd as u64);
+    total as i64
+}
+
+/// Read a line of input (simple: no history/completion). Returns length.
+fn read_simple_line(buf: &mut [u8]) -> usize {
+    let mut pos: usize = 0;
+    loop {
+        let mut ch = [0u8; 1];
+        let n = linux_read(0, ch.as_mut_ptr(), 1);
+        if n <= 0 { continue; }
+        match ch[0] {
+            b'\r' | b'\n' => { print(b"\n"); return pos; }
+            0x08 | 0x7F => {
+                if pos > 0 { pos -= 1; print(b"\x08 \x08"); }
+            }
+            0x20..=0x7E => {
+                if pos < buf.len() - 1 {
+                    buf[pos] = ch[0];
+                    pos += 1;
+                    linux_write(1, &ch[0] as *const u8, 1);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Open a virtual file (prefix + name), read and print response.
+fn open_virtual_and_print(prefix: &[u8], name: &[u8], on_error: &[u8]) {
+    let mut path_buf = [0u8; 64];
+    let mut pos = prefix.len();
+    path_buf[..pos].copy_from_slice(prefix);
+    if !name.is_empty() {
+        let n = name.len().min(path_buf.len() - pos - 1);
+        path_buf[pos..pos + n].copy_from_slice(&name[..n]);
+        pos += n;
+    }
+    path_buf[pos] = 0;
+    let fd = linux_open(path_buf.as_ptr(), 0);
+    if fd >= 0 {
+        let mut buf = [0u8; 256];
+        let n = linux_read(fd as u64, buf.as_mut_ptr(), buf.len());
+        if n > 0 { linux_write(1, buf.as_ptr(), n as usize); }
+        linux_close(fd as u64);
+    } else {
+        print(on_error);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -695,6 +437,7 @@ static mut HISTORY: [HistEntry; HIST_SIZE] = {
 static mut HIST_COUNT: usize = 0;
 static mut HIST_WRITE: usize = 0; // next write index (circular)
 
+#[allow(dead_code)]
 fn history_slice() -> &'static [HistEntry] {
     unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(HISTORY) as *const HistEntry, HIST_SIZE) }
 }
@@ -868,6 +611,7 @@ fn find_byte(s: &[u8], b: u8) -> Option<usize> {
 }
 
 /// Glob pattern match: supports leading `*suffix`, trailing `prefix*`, and exact match.
+#[allow(dead_code)]
 fn pattern_match(pattern: &[u8], text: &[u8]) -> bool {
     if eq(pattern, b"*") { return true; }
     if pattern.is_empty() { return text.is_empty(); }
@@ -1182,7 +926,7 @@ fn tab_complete_builtin(prefix: &[u8], line_buf: &mut [u8; 256], pos: &mut usize
         b"cd", b"pwd", b"snap", b"fork", b"getpid", b"exec", b"ps", b"top", b"kill",
         b"resolve", b"ping", b"traceroute", b"wget", b"export", b"env", b"unset",
         b"exit", b"jobs", b"fg", b"bg", b"history", b"wc", b"sort", b"uniq", b"diff",
-        b"function",
+        b"function", b"syslog", b"netmirror", b"snapshot",
     ];
 
     let mut matches: [usize; 40] = [0; 40];
@@ -1269,13 +1013,7 @@ fn tab_complete_file(prefix: &[u8], line_buf: &mut [u8; 256], pos: &mut usize, _
     }
 
     let mut listing = [0u8; 2048];
-    let mut total: usize = 0;
-    loop {
-        let n = linux_read(fd as u64, listing[total..].as_mut_ptr(), listing.len() - total);
-        if n <= 0 { break; }
-        total += n as usize;
-        if total >= listing.len() { break; }
-    }
+    let total = read_all(fd as u64, &mut listing);
     linux_close(fd as u64);
 
     if cwd_ret > 0 && last_slash > 0 { linux_chdir(old_cwd.as_ptr()); }
@@ -1466,16 +1204,8 @@ fn dispatch_with_redirects(line: &[u8]) {
         linux_close(out_fd as u64);
     } else if in_fd >= 0 {
         // Input redirect only — read from file and feed to command as stdin
-        // For commands that read stdin (like wc, sort, uniq with no file arg)
         let mut input_data = [0u8; 4096];
-        let mut input_len: usize = 0;
-        loop {
-            let n = linux_read(in_fd as u64, input_data[input_len..].as_mut_ptr(),
-                              input_data.len() - input_len);
-            if n <= 0 { break; }
-            input_len += n as usize;
-            if input_len >= input_data.len() { break; }
-        }
+        let input_len = read_all(in_fd as u64, &mut input_data);
         linux_close(in_fd as u64);
         dispatch_command_with_stdin(cmd, &input_data[..input_len]);
     } else {
@@ -1523,14 +1253,7 @@ fn capture_command_extended(cmd: &[u8], buf: &mut [u8], in_fd: i64) -> usize {
     // For commands with stdin, read stdin data and process
     if in_fd >= 0 {
         let mut input_data = [0u8; 4096];
-        let mut input_len: usize = 0;
-        loop {
-            let n = linux_read(in_fd as u64, input_data[input_len..].as_mut_ptr(),
-                              input_data.len() - input_len);
-            if n <= 0 { break; }
-            input_len += n as usize;
-            if input_len >= input_data.len() { break; }
-        }
+        let input_len = read_all(in_fd as u64, &mut input_data);
         return capture_command_with_stdin(cmd, &input_data[..input_len], buf);
     }
 
@@ -1564,33 +1287,7 @@ fn execute_heredoc(cmd: &[u8], delim: &[u8], line_buf: &mut [u8; 256]) {
     // Read lines until we see the delimiter
     loop {
         print(b"> ");
-        let mut pos: usize = 0;
-        loop {
-            let mut ch = [0u8; 1];
-            let n = linux_read(0, ch.as_mut_ptr(), 1);
-            if n <= 0 { continue; }
-            let c = ch[0];
-            match c {
-                b'\r' | b'\n' => {
-                    print(b"\n");
-                    break;
-                }
-                0x08 | 0x7F => {
-                    if pos > 0 {
-                        pos -= 1;
-                        print(b"\x08 \x08");
-                    }
-                }
-                0x20..=0x7E => {
-                    if pos < line_buf.len() - 1 {
-                        line_buf[pos] = c;
-                        pos += 1;
-                        linux_write(1, &c as *const u8, 1);
-                    }
-                }
-                _ => {}
-            }
-        }
+        let pos = read_simple_line(line_buf);
         let input_line = trim(&line_buf[..pos]);
         // Check if this is the delimiter
         if eq(input_line, delim) {
@@ -1694,33 +1391,7 @@ fn read_function_def(first_line: &[u8], line_buf: &mut [u8; 256]) {
 
     loop {
         print(b"> ");
-        let mut pos: usize = 0;
-        loop {
-            let mut ch = [0u8; 1];
-            let n = linux_read(0, ch.as_mut_ptr(), 1);
-            if n <= 0 { continue; }
-            let c = ch[0];
-            match c {
-                b'\r' | b'\n' => {
-                    print(b"\n");
-                    break;
-                }
-                0x08 | 0x7F => {
-                    if pos > 0 {
-                        pos -= 1;
-                        print(b"\x08 \x08");
-                    }
-                }
-                0x20..=0x7E => {
-                    if pos < line_buf.len() - 1 {
-                        line_buf[pos] = c;
-                        pos += 1;
-                        linux_write(1, &c as *const u8, 1);
-                    }
-                }
-                _ => {}
-            }
-        }
+        let pos = read_simple_line(line_buf);
         let input_line = trim(&line_buf[..pos]);
         if eq(input_line, b"}") {
             break;
@@ -2073,6 +1744,19 @@ fn dispatch_command(line: &[u8]) {
         } else if starts_with(line, b"diff ") {
             let args = trim(&line[5..]);
             cmd_diff(args);
+        } else if starts_with(line, b"syslog") {
+            let n = if line.len() > 7 { parse_u64_simple(trim(&line[7..])) } else { 10 };
+            cmd_syslog(n);
+        } else if starts_with(line, b"netmirror ") {
+            let arg = trim(&line[10..]);
+            cmd_netmirror(arg);
+        } else if eq(line, b"netmirror") {
+            print(b"usage: netmirror on|off\n");
+        } else if starts_with(line, b"snapshot ") {
+            let arg = trim(&line[9..]);
+            cmd_snap(arg);
+        } else if eq(line, b"snapshot") {
+            cmd_snap(b"list");
         } else if eq(line, b"exit") {
             print(b"bye!\n");
             linux_exit(0);
@@ -2205,20 +1889,10 @@ fn cmd_wc(name: &[u8]) {
         print(b"usage: wc <file>\n");
         return;
     }
-    let mut path_buf = [0u8; 64];
-    let path = null_terminate(name, &mut path_buf);
-    let fd = linux_open(path, 0);
-    if fd < 0 { print(b"wc: file not found\n"); return; }
-
     let mut data = [0u8; 4096];
-    let mut total: usize = 0;
-    loop {
-        let n = linux_read(fd as u64, data[total..].as_mut_ptr(), data.len() - total);
-        if n <= 0 { break; }
-        total += n as usize;
-        if total >= data.len() { break; }
-    }
-    linux_close(fd as u64);
+    let total = slurp_file(name, &mut data);
+    if total < 0 { print(b"wc: file not found\n"); return; }
+    let total = total as usize;
 
     let mut out_buf = [0u8; 128];
     let len = wc_data(&data[..total], &mut out_buf);
@@ -2285,20 +1959,10 @@ fn cmd_sort(name: &[u8]) {
         print(b"usage: sort <file>\n");
         return;
     }
-    let mut path_buf = [0u8; 64];
-    let path = null_terminate(name, &mut path_buf);
-    let fd = linux_open(path, 0);
-    if fd < 0 { print(b"sort: file not found\n"); return; }
-
     let mut data = [0u8; 4096];
-    let mut total: usize = 0;
-    loop {
-        let n = linux_read(fd as u64, data[total..].as_mut_ptr(), data.len() - total);
-        if n <= 0 { break; }
-        total += n as usize;
-        if total >= data.len() { break; }
-    }
-    linux_close(fd as u64);
+    let total = slurp_file(name, &mut data);
+    if total < 0 { print(b"sort: file not found\n"); return; }
+    let total = total as usize;
 
     let mut out_buf = [0u8; 4096];
     let len = sort_data(&data[..total], &mut out_buf);
@@ -2375,20 +2039,10 @@ fn cmd_uniq(name: &[u8]) {
         print(b"usage: uniq <file>\n");
         return;
     }
-    let mut path_buf = [0u8; 64];
-    let path = null_terminate(name, &mut path_buf);
-    let fd = linux_open(path, 0);
-    if fd < 0 { print(b"uniq: file not found\n"); return; }
-
     let mut data = [0u8; 4096];
-    let mut total: usize = 0;
-    loop {
-        let n = linux_read(fd as u64, data[total..].as_mut_ptr(), data.len() - total);
-        if n <= 0 { break; }
-        total += n as usize;
-        if total >= data.len() { break; }
-    }
-    linux_close(fd as u64);
+    let total = slurp_file(name, &mut data);
+    if total < 0 { print(b"uniq: file not found\n"); return; }
+    let total = total as usize;
 
     let mut out_buf = [0u8; 4096];
     let len = uniq_data(&data[..total], &mut out_buf);
@@ -2443,34 +2097,16 @@ fn cmd_diff(args: &[u8]) {
         }
 
         // Read file1
-        let mut path_buf1 = [0u8; 64];
-        let path1 = null_terminate(file1, &mut path_buf1);
-        let fd1 = linux_open(path1, 0);
-        if fd1 < 0 { print(b"diff: cannot open "); print(file1); print(b"\n"); return; }
         let mut data1 = [0u8; 4096];
-        let mut len1: usize = 0;
-        loop {
-            let n = linux_read(fd1 as u64, data1[len1..].as_mut_ptr(), data1.len() - len1);
-            if n <= 0 { break; }
-            len1 += n as usize;
-            if len1 >= data1.len() { break; }
-        }
-        linux_close(fd1 as u64);
+        let len1 = slurp_file(file1, &mut data1);
+        if len1 < 0 { print(b"diff: cannot open "); print(file1); print(b"\n"); return; }
+        let len1 = len1 as usize;
 
         // Read file2
-        let mut path_buf2 = [0u8; 64];
-        let path2 = null_terminate(file2, &mut path_buf2);
-        let fd2 = linux_open(path2, 0);
-        if fd2 < 0 { print(b"diff: cannot open "); print(file2); print(b"\n"); return; }
         let mut data2 = [0u8; 4096];
-        let mut len2: usize = 0;
-        loop {
-            let n = linux_read(fd2 as u64, data2[len2..].as_mut_ptr(), data2.len() - len2);
-            if n <= 0 { break; }
-            len2 += n as usize;
-            if len2 >= data2.len() { break; }
-        }
-        linux_close(fd2 as u64);
+        let len2 = slurp_file(file2, &mut data2);
+        if len2 < 0 { print(b"diff: cannot open "); print(file2); print(b"\n"); return; }
+        let len2 = len2 as usize;
 
         // Line-by-line comparison
         diff_data(&data1[..len1], &data2[..len2]);
@@ -2615,21 +2251,10 @@ fn cmd_tail(args: &[u8]) {
     } else { name = args; }
     if name.is_empty() { print(b"usage: tail [-n N] <file>\n"); return; }
 
-    let mut path_buf = [0u8; 64];
-    let path = null_terminate(name, &mut path_buf);
-    let fd = linux_open(path, 0);
-    if fd < 0 { print(b"tail: file not found\n"); return; }
-
-    // Read entire file into buffer, then print last N lines.
     let mut data = [0u8; 4096];
-    let mut total: usize = 0;
-    loop {
-        let n = linux_read(fd as u64, data[total..].as_mut_ptr(), (data.len() - total) as usize);
-        if n <= 0 { break; }
-        total += n as usize;
-        if total >= data.len() { break; }
-    }
-    linux_close(fd as u64);
+    let total = slurp_file(name, &mut data);
+    if total < 0 { print(b"tail: file not found\n"); return; }
+    let total = total as usize;
 
     // Count total lines, find start of last N.
     let mut line_count: usize = 0;
@@ -2655,21 +2280,10 @@ fn cmd_grep(args: &[u8]) {
         let name = trim(&args[sp + 1..]);
         if name.is_empty() { print(b"usage: grep <pattern> <file>\n"); return; }
 
-        let mut path_buf = [0u8; 64];
-        let path = null_terminate(name, &mut path_buf);
-        let fd = linux_open(path, 0);
-        if fd < 0 { print(b"grep: file not found\n"); return; }
-
-        // Read line-by-line and print matching lines.
         let mut buf = [0u8; 4096];
-        let mut total: usize = 0;
-        loop {
-            let n = linux_read(fd as u64, buf[total..].as_mut_ptr(), (buf.len() - total) as usize);
-            if n <= 0 { break; }
-            total += n as usize;
-            if total >= buf.len() { break; }
-        }
-        linux_close(fd as u64);
+        let total = slurp_file(name, &mut buf);
+        if total < 0 { print(b"grep: file not found\n"); return; }
+        let total = total as usize;
 
         // Scan for lines containing the pattern.
         let mut line_start: usize = 0;
@@ -2872,35 +2486,12 @@ fn execute_pipe(left: &[u8], right: &[u8]) {
 /// Capture a command's output into a buffer for piping.
 fn capture_command(cmd: &[u8], buf: &mut [u8]) -> usize {
     if starts_with(cmd, b"cat ") {
-        let name = trim(&cmd[4..]);
-        let mut path_buf = [0u8; 64];
-        let path = null_terminate(name, &mut path_buf);
-        let fd = linux_open(path, 0);
-        if fd < 0 { return 0; }
-        let mut total: usize = 0;
-        loop {
-            let n = linux_read(fd as u64, buf[total..].as_mut_ptr(), (buf.len() - total) as usize);
-            if n <= 0 { break; }
-            total += n as usize;
-            if total >= buf.len() { break; }
-        }
-        linux_close(fd as u64);
-        return total;
+        let n = slurp_file(trim(&cmd[4..]), buf);
+        return if n < 0 { 0 } else { n as usize };
     }
     if eq(cmd, b"ls") || starts_with(cmd, b"ls ") {
-        let mut path_buf = [0u8; 4];
-        let path = null_terminate(b".", &mut path_buf);
-        let fd = linux_open(path, 0);
-        if fd < 0 { return 0; }
-        let mut total: usize = 0;
-        loop {
-            let n = linux_read(fd as u64, buf[total..].as_mut_ptr(), (buf.len() - total) as usize);
-            if n <= 0 { break; }
-            total += n as usize;
-            if total >= buf.len() { break; }
-        }
-        linux_close(fd as u64);
-        return total;
+        let n = slurp_file(b".", buf);
+        return if n < 0 { 0 } else { n as usize };
     }
     if eq(cmd, b"env") {
         let mut total: usize = 0;
@@ -2930,19 +2521,8 @@ fn capture_command(cmd: &[u8], buf: &mut [u8]) -> usize {
         return 0;
     }
     if eq(cmd, b"ps") {
-        let mut path_buf = [0u8; 8];
-        let path = null_terminate(b"/proc", &mut path_buf);
-        let fd = linux_open(path, 0);
-        if fd < 0 { return 0; }
-        let mut total: usize = 0;
-        loop {
-            let n = linux_read(fd as u64, buf[total..].as_mut_ptr(), (buf.len() - total) as usize);
-            if n <= 0 { break; }
-            total += n as usize;
-            if total >= buf.len() { break; }
-        }
-        linux_close(fd as u64);
-        return total;
+        let n = slurp_file(b"/proc", buf);
+        return if n < 0 { 0 } else { n as usize };
     }
     if eq(cmd, b"uname") {
         let s = b"sotOS 0.1.0 x86_64 LUCAS\n";
@@ -2962,19 +2542,10 @@ fn capture_command(cmd: &[u8], buf: &mut [u8]) -> usize {
             } else { return 0; }
         } else { name = args; }
         if name.is_empty() { return 0; }
-        let mut path_buf = [0u8; 64];
-        let path = null_terminate(name, &mut path_buf);
-        let fd = linux_open(path, 0);
-        if fd < 0 { return 0; }
         let mut data = [0u8; 4096];
-        let mut dlen: usize = 0;
-        loop {
-            let n = linux_read(fd as u64, data[dlen..].as_mut_ptr(), data.len() - dlen);
-            if n <= 0 { break; }
-            dlen += n as usize;
-            if dlen >= data.len() { break; }
-        }
-        linux_close(fd as u64);
+        let dlen = slurp_file(name, &mut data);
+        if dlen < 0 { return 0; }
+        let dlen = dlen as usize;
         let mut total: usize = 0;
         let mut lines: usize = 0;
         for i in 0..dlen {
@@ -2998,19 +2569,10 @@ fn capture_command(cmd: &[u8], buf: &mut [u8]) -> usize {
             } else { return 0; }
         } else { name = args; }
         if name.is_empty() { return 0; }
-        let mut path_buf = [0u8; 64];
-        let path = null_terminate(name, &mut path_buf);
-        let fd = linux_open(path, 0);
-        if fd < 0 { return 0; }
         let mut data = [0u8; 4096];
-        let mut dlen: usize = 0;
-        loop {
-            let n = linux_read(fd as u64, data[dlen..].as_mut_ptr(), data.len() - dlen);
-            if n <= 0 { break; }
-            dlen += n as usize;
-            if dlen >= data.len() { break; }
-        }
-        linux_close(fd as u64);
+        let dlen = slurp_file(name, &mut data);
+        if dlen < 0 { return 0; }
+        let dlen = dlen as usize;
         let mut line_count: usize = 0;
         for i in 0..dlen { if data[i] == b'\n' { line_count += 1; } }
         let skip = if line_count > num_lines { line_count - num_lines } else { 0 };
@@ -3032,19 +2594,10 @@ fn capture_command(cmd: &[u8], buf: &mut [u8]) -> usize {
             let pattern = &args[..sp];
             let name = trim(&args[sp + 1..]);
             if name.is_empty() { return 0; }
-            let mut path_buf = [0u8; 64];
-            let path = null_terminate(name, &mut path_buf);
-            let fd = linux_open(path, 0);
-            if fd < 0 { return 0; }
             let mut data = [0u8; 4096];
-            let mut dlen: usize = 0;
-            loop {
-                let n = linux_read(fd as u64, data[dlen..].as_mut_ptr(), data.len() - dlen);
-                if n <= 0 { break; }
-                dlen += n as usize;
-                if dlen >= data.len() { break; }
-            }
-            linux_close(fd as u64);
+            let dlen = slurp_file(name, &mut data);
+            if dlen < 0 { return 0; }
+            let dlen = dlen as usize;
             let mut total: usize = 0;
             let mut line_start: usize = 0;
             let mut i: usize = 0;
@@ -3482,83 +3035,49 @@ fn cmd_pwd() {
     }
 }
 
+fn cmd_syslog(max_entries: u64) {
+    let mut num_buf = [0u8; 10];
+    let num_len = u64_to_dec(max_entries, &mut num_buf);
+    open_virtual_and_print(b"/proc/syslog/", &num_buf[..num_len], b"syslog: cannot read\n");
+}
+
+fn cmd_netmirror(arg: &[u8]) {
+    open_virtual_and_print(b"/proc/netmirror/", arg, b"netmirror: failed\n");
+}
+
+fn u64_to_dec(mut val: u64, buf: &mut [u8; 10]) -> usize {
+    if val == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 10];
+    let mut i = 0;
+    while val > 0 && i < 10 {
+        tmp[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+        i += 1;
+    }
+    for j in 0..i {
+        buf[j] = tmp[i - 1 - j];
+    }
+    i
+}
+
 fn cmd_snap(args: &[u8]) {
     if starts_with(args, b"create ") {
         let name = trim(&args[7..]);
-        if name.is_empty() {
-            print(b"usage: snap create <name>\n");
-            return;
-        }
-        // Open /snap/create/<name> to trigger snapshot creation
-        let mut path_buf = [0u8; 64];
-        let prefix = b"/snap/create/";
-        path_buf[..prefix.len()].copy_from_slice(prefix);
-        let copy_len = name.len().min(path_buf.len() - prefix.len() - 1);
-        path_buf[prefix.len()..prefix.len() + copy_len].copy_from_slice(&name[..copy_len]);
-        path_buf[prefix.len() + copy_len] = 0;
-        let fd = linux_open(path_buf.as_ptr(), 0);
-        if fd >= 0 {
-            let mut buf = [0u8; 64];
-            let n = linux_read(fd as u64, buf.as_mut_ptr(), buf.len());
-            if n > 0 { linux_write(1, buf.as_ptr(), n as usize); }
-            linux_close(fd as u64);
-        } else {
-            print(b"snap create: failed\n");
-        }
+        if name.is_empty() { print(b"usage: snap create <name>\n"); return; }
+        open_virtual_and_print(b"/snap/create/", name, b"snap create: failed\n");
     } else if eq(args, b"list") {
-        let mut path_buf = [0u8; 16];
-        let path = null_terminate(b"/snap/list", &mut path_buf);
-        let fd = linux_open(path, 0);
-        if fd >= 0 {
-            let mut buf = [0u8; 256];
-            let n = linux_read(fd as u64, buf.as_mut_ptr(), buf.len());
-            if n > 0 { linux_write(1, buf.as_ptr(), n as usize); }
-            linux_close(fd as u64);
-        } else {
-            print(b"snap list: failed\n");
-        }
+        open_virtual_and_print(b"/snap/list", b"", b"snap list: failed\n");
     } else if starts_with(args, b"restore ") {
         let name = trim(&args[8..]);
-        if name.is_empty() {
-            print(b"usage: snap restore <name>\n");
-            return;
-        }
-        let mut path_buf = [0u8; 64];
-        let prefix = b"/snap/restore/";
-        path_buf[..prefix.len()].copy_from_slice(prefix);
-        let copy_len = name.len().min(path_buf.len() - prefix.len() - 1);
-        path_buf[prefix.len()..prefix.len() + copy_len].copy_from_slice(&name[..copy_len]);
-        path_buf[prefix.len() + copy_len] = 0;
-        let fd = linux_open(path_buf.as_ptr(), 0);
-        if fd >= 0 {
-            let mut buf = [0u8; 64];
-            let n = linux_read(fd as u64, buf.as_mut_ptr(), buf.len());
-            if n > 0 { linux_write(1, buf.as_ptr(), n as usize); }
-            linux_close(fd as u64);
-        } else {
-            print(b"snap restore: failed\n");
-        }
+        if name.is_empty() { print(b"usage: snap restore <name>\n"); return; }
+        open_virtual_and_print(b"/snap/restore/", name, b"snap restore: failed\n");
     } else if starts_with(args, b"delete ") {
         let name = trim(&args[7..]);
-        if name.is_empty() {
-            print(b"usage: snap delete <name>\n");
-            return;
-        }
-        let mut path_buf = [0u8; 64];
-        let prefix = b"/snap/delete/";
-        path_buf[..prefix.len()].copy_from_slice(prefix);
-        let copy_len = name.len().min(path_buf.len() - prefix.len() - 1);
-        path_buf[prefix.len()..prefix.len() + copy_len].copy_from_slice(&name[..copy_len]);
-        path_buf[prefix.len() + copy_len] = 0;
-        let fd = linux_open(path_buf.as_ptr(), 0);
-        if fd >= 0 {
-            let mut buf = [0u8; 64];
-            let n = linux_read(fd as u64, buf.as_mut_ptr(), buf.len());
-            if n > 0 { linux_write(1, buf.as_ptr(), n as usize); }
-            linux_close(fd as u64);
-        } else {
-            print(b"snap delete: failed\n");
-        }
+        if name.is_empty() { print(b"usage: snap delete <name>\n"); return; }
+        open_virtual_and_print(b"/snap/delete/", name, b"snap delete: failed\n");
     } else {
         print(b"usage: snap create|list|restore|delete [<name>]\n");
     }
@@ -3609,16 +3128,20 @@ fn cmd_exec(line: &[u8]) {
     }
     let prog_name = &line[..prog_end];
 
-    // Build /bin/<prog_name>\0 into EXEC_NAME_BUF
-    let prefix = b"/bin/";
-    let total = prefix.len() + prog_name.len();
+    // Build path into EXEC_NAME_BUF: absolute paths pass through, relative get /bin/ prefix
+    let is_absolute = !prog_name.is_empty() && prog_name[0] == b'/';
+    let total = if is_absolute { prog_name.len() } else { 5 + prog_name.len() };
     if total >= 63 {
         print(b"exec: name too long\n");
         return;
     }
     unsafe {
-        EXEC_NAME_BUF[..prefix.len()].copy_from_slice(prefix);
-        EXEC_NAME_BUF[prefix.len()..total].copy_from_slice(prog_name);
+        if is_absolute {
+            EXEC_NAME_BUF[..prog_name.len()].copy_from_slice(prog_name);
+        } else {
+            EXEC_NAME_BUF[..5].copy_from_slice(b"/bin/");
+            EXEC_NAME_BUF[5..total].copy_from_slice(prog_name);
+        }
         EXEC_NAME_BUF[total] = 0;
         EXEC_NAME_LEN = total;
 
@@ -3722,61 +3245,6 @@ fn cmd_kill(args: &[u8]) {
             }
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Custom sotOS syscalls (intercepted by LUCAS)
-// ---------------------------------------------------------------------------
-
-/// DNS resolve: syscall 200(hostname_ptr, hostname_len) → IP as u32 (0 = failed)
-fn linux_dns_resolve(name: *const u8, len: usize) -> u64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 200u64 => ret,
-            in("rdi") name as u64,
-            in("rsi") len as u64,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-/// ICMP ping: syscall 202(dst_ip, seq) → 0=timeout, 1=reply | (ttl << 32)
-fn linux_icmp_ping(dst_ip: u64, seq: u64) -> u64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 202u64 => ret,
-            in("rdi") dst_ip,
-            in("rsi") seq,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-/// Traceroute hop: syscall 201(dst_ip, ttl) → responder_ip | (reached_flag << 32)
-fn linux_traceroute_hop(dst_ip: u64, ttl: u64) -> u64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 201u64 => ret,
-            in("rdi") dst_ip,
-            in("rsi") ttl,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
 }
 
 // ---------------------------------------------------------------------------
@@ -4169,7 +3637,7 @@ fn find_header_value<'a>(headers: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     let mut i: usize = 0;
     while i + name.len() + 1 < headers.len() {
         // Check if this position matches the header name (case-insensitive).
-        if (headers[i] == b'\n' || i == 0) {
+        if headers[i] == b'\n' || i == 0 {
             let start = if headers[i] == b'\n' { i + 1 } else { i };
             if start + name.len() + 1 < headers.len() {
                 let mut matches = true;

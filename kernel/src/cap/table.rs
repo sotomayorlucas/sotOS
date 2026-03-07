@@ -156,19 +156,18 @@ impl CapabilityTable {
             return;
         }
 
-        // Walk the pool and revoke all children whose parent was revoked.
-        // This is O(n*depth) in the worst case — acceptable for bounded pool sizes.
+        // Iteratively revoke orphaned children until no more are found.
         let mut to_revoke: Vec<PoolHandle> = Vec::new();
-        let mut changed = true;
-        while changed {
-            changed = false;
+        loop {
             for (handle, entry) in self.entries.iter() {
                 if let Some(parent_handle) = entry.parent {
                     if self.entries.get(parent_handle).is_none() {
                         to_revoke.push(handle);
-                        changed = true;
                     }
                 }
+            }
+            if to_revoke.is_empty() {
+                break;
             }
             for h in to_revoke.drain(..) {
                 self.entries.free(h);

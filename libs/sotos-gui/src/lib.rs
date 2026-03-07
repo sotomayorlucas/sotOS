@@ -7,11 +7,18 @@
 //! - Mouse cursor rendering (16x16 sprite)
 //! - Event system: mouse click hit-testing and event delivery
 //! - Basic drawing primitives: fill_rect, draw_line, draw_char, blit
+//! - Modern desktop renderer via embedded-graphics (rounded windows, traffic-light buttons)
 //!
 //! All rendering operates on raw pixel buffers (32-bit BGRA format).
 //! No heap allocation — all state is fixed-size arrays.
 
 #![no_std]
+
+pub mod display;
+pub mod desktop;
+
+pub use display::FramebufferDisplay;
+pub use desktop::{draw_modern_desktop, DesktopLayout};
 
 /// Maximum number of windows managed by the compositor.
 pub const MAX_WINDOWS: usize = 16;
@@ -104,7 +111,7 @@ fn font_glyph(c: u8) -> [u8; 8] {
         b'.' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00],
         b':' => [0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00],
         b'/' => [0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x00, 0x00],
-        b'x' | b'X' => [0x00, 0x00, 0x42, 0x24, 0x18, 0x24, 0x42, 0x00],
+        b'x' => [0x00, 0x00, 0x42, 0x24, 0x18, 0x24, 0x42, 0x00],
         _ => {
             // Fallback glyph (box) for characters without a defined bitmap.
             [0x00, 0x7E, 0x42, 0x42, 0x42, 0x7E, 0x00, 0x00]
@@ -572,12 +579,15 @@ impl WindowManager {
         for i in 0..self.window_count {
             sorted[i] = i;
         }
-        // Simple insertion sort by z_order.
-        for i in 1..self.window_count {
-            let mut j = i;
-            while j > 0 && self.windows[sorted[j]].z_order < self.windows[sorted[j - 1]].z_order {
-                sorted.swap(j, j - 1);
-                j -= 1;
+        // Insertion sort by z_order (MAX_WINDOWS=16, nearly-sorted is common case).
+        let n = self.window_count;
+        if n > 1 {
+            for i in 1..n {
+                let mut j = i;
+                while j > 0 && self.windows[sorted[j]].z_order < self.windows[sorted[j - 1]].z_order {
+                    sorted.swap(j, j - 1);
+                    j -= 1;
+                }
             }
         }
 
@@ -722,15 +732,15 @@ impl WindowManager {
 // Drawing primitives (operate on a raw u32 framebuffer)
 // ---------------------------------------------------------------------------
 
-/// Fill a rectangle with a solid color.
+/// Fill a rectangle with a solid color (scanline-optimized).
 pub fn fill_rect_fb(fb: *mut u32, stride: u32, x: u32, y: u32, w: u32, h: u32, color: u32) {
+    if w == 0 || h == 0 { return; }
     for row in 0..h {
-        for col in 0..w {
-            let px = x + col;
-            let py = y + row;
-            let offset = (py * stride + px) as usize;
-            unsafe {
-                *fb.add(offset) = color;
+        let offset = ((y + row) * stride + x) as usize;
+        unsafe {
+            let row_ptr = fb.add(offset);
+            for col in 0..w as usize {
+                *row_ptr.add(col) = color;
             }
         }
     }
@@ -874,7 +884,7 @@ fn draw_rect_border(
     let _ = (screen_w, screen_h); // used for clipping in callers
 }
 
-/// Blit a source framebuffer onto the destination framebuffer.
+/// Blit a source framebuffer onto the destination framebuffer (clipped once at entry).
 pub fn blit_fb(
     dst: *mut u32,
     dst_stride: u32,
@@ -887,19 +897,27 @@ pub fn blit_fb(
     w: u32,
     h: u32,
 ) {
-    for row in 0..h {
-        for col in 0..w {
-            let px = dst_x + col as i32;
-            let py = dst_y + row as i32;
-            if px >= 0 && py >= 0 && (px as u32) < dst_w && (py as u32) < dst_h {
-                let src_offset = (row * src_stride + col) as usize;
-                let dst_offset = (py as u32 * dst_stride + px as u32) as usize;
-                unsafe {
-                    let pixel = *src.add(src_offset);
-                    // Simple alpha check: if alpha is non-zero, draw it.
-                    if pixel & 0xFF00_0000 != 0 {
-                        *dst.add(dst_offset) = pixel;
-                    }
+    // Clip source region to destination bounds once.
+    let src_x0 = if dst_x < 0 { (-dst_x) as u32 } else { 0 };
+    let src_y0 = if dst_y < 0 { (-dst_y) as u32 } else { 0 };
+    let dx0 = (dst_x.max(0)) as u32;
+    let dy0 = (dst_y.max(0)) as u32;
+    let visible_w = w.saturating_sub(src_x0).min(dst_w.saturating_sub(dx0));
+    let visible_h = h.saturating_sub(src_y0).min(dst_h.saturating_sub(dy0));
+    if visible_w == 0 || visible_h == 0 { return; }
+
+    for row in 0..visible_h {
+        let sy = src_y0 + row;
+        let dy = dy0 + row;
+        let src_row = (sy * src_stride + src_x0) as usize;
+        let dst_row = (dy * dst_stride + dx0) as usize;
+        unsafe {
+            let sp = src.add(src_row);
+            let dp = dst.add(dst_row);
+            for col in 0..visible_w as usize {
+                let pixel = *sp.add(col);
+                if pixel & 0xFF00_0000 != 0 {
+                    *dp.add(col) = pixel;
                 }
             }
         }

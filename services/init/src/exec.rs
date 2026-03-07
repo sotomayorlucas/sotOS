@@ -1,0 +1,675 @@
+use sotos_common::sys;
+use core::sync::atomic::{AtomicU64, Ordering};
+use crate::framebuffer::{print, print_hex64};
+use crate::process::NEXT_CHILD_STACK;
+use crate::vdso;
+use crate::{vfs_lock, vfs_unlock, shared_store};
+
+/// Spinlock for serializing execve ELF loading (shared temp buffer).
+pub(crate) static EXEC_LOCK: AtomicU64 = AtomicU64::new(0);
+/// Temp buffer for execve ELF loading (separate from SPAWN/DL buffers).
+pub(crate) const EXEC_BUF_BASE: u64 = 0x5400000;
+pub(crate) const EXEC_BUF_PAGES: u64 = 1280; // 5 MiB (links is ~4.9 MiB)
+pub(crate) const EXEC_TEMP_MAP: u64 = 0x5900000; // past EXEC_BUF_BASE + 1280*4K
+/// Temp buffer for loading the interpreter ELF (for dynamic binaries).
+pub(crate) const INTERP_BUF_BASE: u64 = 0xA000000; // Far from other regions
+pub(crate) const INTERP_BUF_PAGES: u64 = 220; // ~900 KiB, enough for ld-musl (~845 KiB)
+/// Load base for the dynamic interpreter (ET_DYN, position-independent).
+pub(crate) const INTERP_LOAD_BASE: u64 = 0x6000000;
+
+/// Max args for execve (including argv[0]).
+pub(crate) const MAX_EXEC_ARGS: usize = 16;
+/// Max length of a single argv string.
+pub(crate) const MAX_EXEC_ARG_LEN: usize = 128;
+
+pub(crate) const MAP_WRITABLE: u64 = 2;
+
+#[inline(always)]
+pub(crate) fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
+    }
+    ((hi as u64) << 32) | lo as u64
+}
+
+/// Send an IPC reply with a single return value.
+pub(crate) fn reply_val(ep_cap: u64, val: i64) {
+    let reply = sotos_common::IpcMsg {
+        tag: 0,
+        regs: [val as u64, 0, 0, 0, 0, 0, 0, 0],
+    };
+    let _ = sys::send(ep_cap, &reply);
+}
+
+/// Format a u64 as decimal into buf. Returns number of bytes written.
+pub(crate) fn format_u64_into(buf: &mut [u8], mut n: u64) -> usize {
+    if n == 0 {
+        if !buf.is_empty() {
+            buf[0] = b'0';
+        }
+        return 1;
+    }
+    let mut tmp = [0u8; 20];
+    let mut i = 0;
+    while n > 0 {
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    let len = i.min(buf.len());
+    for j in 0..len {
+        buf[j] = tmp[i - 1 - j];
+    }
+    len
+}
+
+/// Copy a NUL-terminated path from guest memory into a local buffer.
+/// Returns the length (excluding NUL).
+pub(crate) fn copy_guest_path(guest_ptr: u64, out: &mut [u8]) -> usize {
+    let max = out.len() - 1; // leave room for NUL
+    let mut i = 0;
+    while i < max {
+        let b = unsafe { *((guest_ptr + i as u64) as *const u8) };
+        if b == 0 {
+            break;
+        }
+        out[i] = b;
+        i += 1;
+    }
+    out[i] = 0;
+    i
+}
+
+/// Check if a byte slice starts with a prefix.
+pub(crate) fn starts_with(hay: &[u8], needle: &[u8]) -> bool {
+    hay.len() >= needle.len() && &hay[..needle.len()] == needle
+}
+
+/// Map ELF PT_LOAD segments from a buffer into the current address space.
+/// For ET_DYN (position-independent), vaddrs are offset by `base`.
+/// For ET_EXEC, `base` should be 0.
+/// `buf_base` is the virtual address where the ELF file data is mapped.
+pub(crate) fn map_elf_segments(
+    buf_base: u64,
+    _elf_info: &sotos_common::elf::ElfInfo,
+    segments: &[sotos_common::elf::LoadSegment; sotos_common::elf::MAX_LOAD_SEGMENTS],
+    seg_count: usize,
+    base: u64,
+) -> Result<(), i64> {
+    for si in 0..seg_count {
+        let seg = &segments[si];
+        if seg.memsz == 0 { continue; }
+        let load_vaddr = base + seg.vaddr;
+        let seg_start = load_vaddr & !0xFFF;
+        let seg_end = (load_vaddr + seg.memsz as u64 + 0xFFF) & !0xFFF;
+        let is_writable = (seg.flags & 2) != 0;
+
+        let mut page_vaddr = seg_start;
+        while page_vaddr < seg_end {
+            let frame_cap = sys::frame_alloc().map_err(|_| -12i64)?;
+
+            // Map temporarily to copy data
+            if sys::map(EXEC_TEMP_MAP, frame_cap, MAP_WRITABLE).is_err() {
+                return Err(-12);
+            }
+
+            unsafe { core::ptr::write_bytes(EXEC_TEMP_MAP as *mut u8, 0, 4096); }
+
+            // Copy file data for this page
+            let page_start = page_vaddr;
+            let page_end = page_vaddr + 4096;
+            let file_region_start = load_vaddr;
+            let file_region_end = load_vaddr + seg.filesz as u64;
+            let copy_start = page_start.max(file_region_start);
+            let copy_end = page_end.min(file_region_end);
+
+            if copy_start < copy_end {
+                let dst_offset = (copy_start - page_start) as usize;
+                let src_offset = seg.offset + (copy_start - load_vaddr) as usize;
+                let count = (copy_end - copy_start) as usize;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (buf_base as *const u8).add(src_offset),
+                        (EXEC_TEMP_MAP as *mut u8).add(dst_offset),
+                        count,
+                    );
+                }
+            }
+
+            let _ = sys::unmap(EXEC_TEMP_MAP);
+
+            let flags = if is_writable { MAP_WRITABLE } else { 0 };
+            if sys::map(page_vaddr, frame_cap, flags).is_err() {
+                return Err(-12);
+            }
+
+            page_vaddr += 4096;
+        }
+    }
+    Ok(())
+}
+
+/// Map a temporary buffer for reading ELF files from initrd.
+pub(crate) fn map_temp_buf(base: u64, pages: u64) -> Result<(), i64> {
+    for i in 0..pages {
+        let f = sys::frame_alloc().map_err(|_| -12i64)?;
+        if sys::map(base + i * 0x1000, f, MAP_WRITABLE).is_err() {
+            for j in 0..i { let _ = sys::unmap_free(base + j * 0x1000); }
+            return Err(-12);
+        }
+    }
+    Ok(())
+}
+
+/// Unmap a temporary buffer and free the underlying physical frames.
+pub(crate) fn unmap_temp_buf(base: u64, pages: u64) {
+    for i in 0..pages { let _ = sys::unmap_free(base + i * 0x1000); }
+}
+
+/// Load an ELF from initrd into the current address space, create a thread
+/// with syscall redirect, and return the new endpoint cap.
+/// Supports both static (ET_EXEC) and dynamic (ET_DYN with PT_INTERP) binaries.
+/// Caller must hold EXEC_LOCK.
+pub(crate) fn exec_from_initrd(bin_name: &[u8]) -> Result<(u64, u64), i64> {
+    let empty: [[u8; MAX_EXEC_ARG_LEN]; 0] = [];
+    exec_from_initrd_argv(bin_name, &empty)
+}
+
+pub(crate) fn exec_from_initrd_argv(bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_LEN]]) -> Result<(u64, u64), i64> {
+    // Step 1: Map temp buffer and read main ELF from initrd
+    map_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES)?;
+
+    let file_size = match sys::initrd_read(
+        bin_name.as_ptr() as u64,
+        bin_name.len() as u64,
+        EXEC_BUF_BASE,
+        EXEC_BUF_PAGES * 0x1000,
+    ) {
+        Ok(sz) => sz as usize,
+        Err(_) => {
+            unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
+            return Err(-2);
+        }
+    };
+
+    // Delegate to shared ELF loading path
+    exec_loaded_elf(file_size, bin_name, argv)
+}
+
+/// Load an ELF from VFS into the current address space, create a redirected thread.
+/// Caller must hold EXEC_LOCK.
+pub(crate) fn exec_from_vfs(path: &[u8]) -> Result<(u64, u64), i64> {
+    let empty: [[u8; MAX_EXEC_ARG_LEN]; 0] = [];
+    exec_from_vfs_argv(path, &empty)
+}
+
+/// Load an ELF from VFS with argv support.
+/// Caller must hold EXEC_LOCK.
+pub(crate) fn exec_from_vfs_argv(path: &[u8], argv: &[[u8; MAX_EXEC_ARG_LEN]]) -> Result<(u64, u64), i64> {
+    // Step 1: Map temp buffer and read main ELF from VFS
+    map_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES)?;
+
+    let buf_cap = (EXEC_BUF_PAGES * 0x1000) as usize;
+    let file_size: usize;
+
+    vfs_lock();
+    let vfs_result = unsafe { shared_store() }.and_then(|store| {
+        use sotos_objstore::ROOT_OID;
+        let oid = store.resolve_path(path, ROOT_OID).ok()?;
+        let entry = store.stat(oid)?;
+        let size = entry.size as usize;
+        if size > buf_cap { return None; }
+        let dst = unsafe { core::slice::from_raw_parts_mut(EXEC_BUF_BASE as *mut u8, size) };
+        store.read_obj(oid, dst).ok()?;
+        Some(size)
+    });
+    vfs_unlock();
+
+    match vfs_result {
+        Some(sz) => file_size = sz,
+        None => {
+            unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
+            return Err(-2);
+        }
+    }
+
+    // Step 2-8 are identical to exec_from_initrd_argv — factor into shared helper
+    exec_loaded_elf(file_size, path, argv)
+}
+
+/// Common ELF loading path after the binary data is already at EXEC_BUF_BASE.
+/// Used by both exec_from_initrd_argv and exec_from_vfs_argv.
+fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_LEN]]) -> Result<(u64, u64), i64> {
+    use sotos_common::elf;
+
+    let elf_data = unsafe { core::slice::from_raw_parts(EXEC_BUF_BASE as *const u8, file_size) };
+    let elf_info = match elf::parse(elf_data) {
+        Ok(info) => info,
+        Err(_) => {
+            unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
+            return Err(-8);
+        }
+    };
+
+    let mut segments = [const { elf::LoadSegment { offset: 0, vaddr: 0, filesz: 0, memsz: 0, flags: 0 } }; elf::MAX_LOAD_SEGMENTS];
+    let seg_count = elf::load_segments(elf_data, &elf_info, &mut segments);
+
+    let interp_info = elf::parse_interp(elf_data, &elf_info);
+    let is_dynamic = interp_info.is_some();
+
+    let main_base: u64 = if elf_info.elf_type == 3 { 0x400000 } else { 0 };
+
+    if let Err(e) = map_elf_segments(EXEC_BUF_BASE, &elf_info, &segments, seg_count, main_base) {
+        unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
+        return Err(e);
+    }
+
+    let mut exec_entry = main_base + elf_info.entry;
+    let mut interp_base: u64 = 0;
+
+    if let Some(ref interp) = interp_info {
+        let mut interp_name_buf = [0u8; 64];
+        let interp_path = &elf_data[interp.offset..interp.offset + interp.len];
+        let mut basename_start = 0;
+        for idx in 0..interp.len {
+            if interp_path[idx] == b'/' { basename_start = idx + 1; }
+        }
+        let interp_name_len = interp.len - basename_start;
+        let safe_len = interp_name_len.min(63);
+        interp_name_buf[..safe_len].copy_from_slice(&interp_path[basename_start..basename_start + safe_len]);
+        let interp_name = &interp_name_buf[..safe_len];
+
+        if let Err(e) = map_temp_buf(INTERP_BUF_BASE, INTERP_BUF_PAGES) {
+            unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
+            return Err(e);
+        }
+
+        // Try initrd first, then VFS for the interpreter
+        let interp_size = match sys::initrd_read(
+            interp_name.as_ptr() as u64,
+            interp_name.len() as u64,
+            INTERP_BUF_BASE,
+            INTERP_BUF_PAGES * 0x1000,
+        ) {
+            Ok(sz) => sz as usize,
+            Err(_) => {
+                let mut vfs_size: usize = 0;
+                let interp_full = &elf_data[interp.offset..interp.offset + interp.len];
+                for try_path in [interp_full, interp_name].iter() {
+                    vfs_lock();
+                    let result = unsafe { shared_store() }.and_then(|store| {
+                        use sotos_objstore::ROOT_OID;
+                        let oid = store.resolve_path(try_path, ROOT_OID).ok()?;
+                        let entry = store.stat(oid)?;
+                        let size = entry.size as usize;
+                        let buf_cap = (INTERP_BUF_PAGES * 0x1000) as usize;
+                        if size > buf_cap { return None; }
+                        let dst = unsafe { core::slice::from_raw_parts_mut(INTERP_BUF_BASE as *mut u8, size) };
+                        store.read_obj(oid, dst).ok()?;
+                        Some(size)
+                    });
+                    vfs_unlock();
+                    if let Some(sz) = result { vfs_size = sz; break; }
+                }
+                if vfs_size == 0 {
+                    print(b"EXEC: interpreter not found: ");
+                    print(interp_name);
+                    print(b"\n");
+                    unmap_temp_buf(INTERP_BUF_BASE, INTERP_BUF_PAGES);
+                    unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
+                    return Err(-2);
+                }
+                vfs_size
+            }
+        };
+
+        let interp_data = unsafe { core::slice::from_raw_parts(INTERP_BUF_BASE as *const u8, interp_size) };
+        let interp_elf = match elf::parse(interp_data) {
+            Ok(info) => info,
+            Err(_) => {
+                unmap_temp_buf(INTERP_BUF_BASE, INTERP_BUF_PAGES);
+                unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
+                return Err(-8);
+            }
+        };
+
+        let mut interp_segs = [const { elf::LoadSegment { offset: 0, vaddr: 0, filesz: 0, memsz: 0, flags: 0 } }; elf::MAX_LOAD_SEGMENTS];
+        let interp_seg_count = elf::load_segments(interp_data, &interp_elf, &mut interp_segs);
+
+        interp_base = INTERP_LOAD_BASE;
+        // Unmap previous interpreter pages (e.g., leftover from musl dynamic test)
+        for pg in 0..0x110u64 {
+            let _ = sys::unmap_free(interp_base + pg * 0x1000);
+        }
+        if let Err(e) = map_elf_segments(INTERP_BUF_BASE, &interp_elf, &interp_segs, interp_seg_count, interp_base) {
+            unmap_temp_buf(INTERP_BUF_BASE, INTERP_BUF_PAGES);
+            unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
+            return Err(e);
+        }
+
+        exec_entry = interp_base + interp_elf.entry;
+
+        // Pre-apply interpreter relocations (RELR + RELA RELATIVE).
+        // glibc's ld-linux uses SSE (movaps/punpcklqdq) in its bootstrap code,
+        // and our kernel doesn't save/restore XMM state on timer interrupts.
+        // By pre-applying relocations, ld-linux's self-relocation becomes a no-op.
+        apply_interp_relocs(interp_data, &interp_elf, interp_base);
+
+        unmap_temp_buf(INTERP_BUF_BASE, INTERP_BUF_PAGES);
+    }
+
+    // Allocate stack (32 pages = 128 KiB — glibc ld-linux needs ~66 KiB during startup)
+    const CHILD_STACK_PAGES: u64 = 32;
+    const CHILD_STACK_SIZE: u64 = CHILD_STACK_PAGES * 0x1000;
+    let stack_addr = NEXT_CHILD_STACK.fetch_add(CHILD_STACK_SIZE, Ordering::SeqCst);
+    for pg in 0..CHILD_STACK_PAGES {
+        let f = sys::frame_alloc().map_err(|_| -12i64)?;
+        if sys::map(stack_addr + pg * 0x1000, f, MAP_WRITABLE).is_err() {
+            unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
+            return Err(-12);
+        }
+    }
+
+    // Build Linux-style initial stack
+    let stack_top = stack_addr + CHILD_STACK_SIZE;
+    let str_area = stack_top - 2048;
+    let mut spos: usize = 0;
+
+    let argc: usize = if argv.is_empty() { 1 } else { argv.len() };
+    let mut argv_addrs = [0u64; MAX_EXEC_ARGS];
+    if argv.is_empty() {
+        argv_addrs[0] = str_area + spos as u64;
+        unsafe {
+            let dst = (str_area + spos as u64) as *mut u8;
+            core::ptr::copy_nonoverlapping(bin_name.as_ptr(), dst, bin_name.len());
+            *dst.add(bin_name.len()) = 0;
+        }
+        spos += bin_name.len() + 1;
+    } else {
+        for a in 0..argv.len() {
+            argv_addrs[a] = str_area + spos as u64;
+            let mut alen = 0;
+            while alen < MAX_EXEC_ARG_LEN && argv[a][alen] != 0 { alen += 1; }
+            unsafe {
+                let dst = (str_area + spos as u64) as *mut u8;
+                core::ptr::copy_nonoverlapping(argv[a].as_ptr(), dst, alen);
+                *dst.add(alen) = 0;
+            }
+            spos += alen + 1;
+        }
+    }
+
+    spos = (spos + 7) & !7;
+
+    let random_addr = str_area + spos as u64;
+    unsafe {
+        let rp = random_addr as *mut u64;
+        let mut seed = rdtsc();
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        *rp = seed;
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        *rp.add(1) = seed;
+    }
+    spos += 16;
+
+    let elf_base = main_base + if seg_count > 0 { segments[0].vaddr & !0xFFF } else { 0 };
+    let phdr_vaddr = elf_base + elf_info.phoff as u64;
+
+    // Environment strings
+    let env_term = b"TERM=xterm\0";
+    let env_home = b"HOME=/\0";
+    let env_terminfo = b"TERMINFO=/usr/share/terminfo\0";
+    let env_path = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin\0";
+    let env_term_addr = str_area + spos as u64;
+    unsafe { core::ptr::copy_nonoverlapping(env_term.as_ptr(), env_term_addr as *mut u8, env_term.len()); }
+    spos += env_term.len();
+    let env_home_addr = str_area + spos as u64;
+    unsafe { core::ptr::copy_nonoverlapping(env_home.as_ptr(), env_home_addr as *mut u8, env_home.len()); }
+    spos += env_home.len();
+    let env_terminfo_addr = str_area + spos as u64;
+    unsafe { core::ptr::copy_nonoverlapping(env_terminfo.as_ptr(), env_terminfo_addr as *mut u8, env_terminfo.len()); }
+    spos += env_terminfo.len();
+    let env_path_addr = str_area + spos as u64;
+    unsafe { core::ptr::copy_nonoverlapping(env_path.as_ptr(), env_path_addr as *mut u8, env_path.len()); }
+
+    // Auxv: 10 pairs for dynamic, 9 for static (added AT_UID/AT_GID/AT_CLKTCK)
+    let auxv_pairs: u64 = if is_dynamic { 12 } else { 11 };
+    let env_count: u64 = 4;
+    let entries: u64 = 1 + argc as u64 + 1 + env_count + 1 + auxv_pairs * 2;
+    let rsp = (str_area - entries as u64 * 8) & !0xF;
+
+    unsafe {
+        let sp = rsp as *mut u64;
+        let mut i: usize = 0;
+        *sp.add(i) = argc as u64; i += 1;
+        for a in 0..argc { *sp.add(i) = argv_addrs[a]; i += 1; }
+        *sp.add(i) = 0; i += 1;
+        *sp.add(i) = env_term_addr; i += 1;
+        *sp.add(i) = env_home_addr; i += 1;
+        *sp.add(i) = env_terminfo_addr; i += 1;
+        *sp.add(i) = env_path_addr; i += 1;
+        *sp.add(i) = 0; i += 1;
+        // AT_PHDR(3)
+        *sp.add(i) = 3; i += 1; *sp.add(i) = phdr_vaddr; i += 1;
+        // AT_PHENT(4)
+        *sp.add(i) = 4; i += 1; *sp.add(i) = 56; i += 1;
+        // AT_PHNUM(5)
+        *sp.add(i) = 5; i += 1; *sp.add(i) = elf_info.phnum as u64; i += 1;
+        // AT_PAGESZ(6)
+        *sp.add(i) = 6; i += 1; *sp.add(i) = 4096; i += 1;
+        // AT_RANDOM(25)
+        *sp.add(i) = 25; i += 1; *sp.add(i) = random_addr; i += 1;
+        // AT_ENTRY(9)
+        *sp.add(i) = 9; i += 1; *sp.add(i) = main_base + elf_info.entry; i += 1;
+        // AT_SYSINFO_EHDR(33)
+        *sp.add(i) = 33; i += 1; *sp.add(i) = vdso::VDSO_BASE; i += 1;
+        // AT_UID(11), AT_EUID(12), AT_GID(13), AT_EGID(14)
+        *sp.add(i) = 11; i += 1; *sp.add(i) = 0; i += 1;
+        *sp.add(i) = 13; i += 1; *sp.add(i) = 0; i += 1;
+        // AT_CLKTCK(17) — clock ticks per second
+        *sp.add(i) = 17; i += 1; *sp.add(i) = 100; i += 1;
+        // AT_BASE(7) for dynamic binaries
+        if is_dynamic {
+            *sp.add(i) = 7; i += 1; *sp.add(i) = interp_base; i += 1;
+        }
+        // AT_NULL(0)
+        *sp.add(i) = 0; i += 1;
+        *sp.add(i) = 0;
+    }
+
+    print(b"EXEC: entry=0x");
+    print_hex64(exec_entry);
+    print(b" rsp=0x");
+    print_hex64(rsp);
+    if is_dynamic {
+        print(b" [dynamic] AT_BASE=0x");
+        print_hex64(interp_base);
+        print(b" AT_ENTRY=0x");
+        print_hex64(main_base + elf_info.entry);
+    }
+    print(b"\n");
+
+    // Pre-TLS for glibc: allocate a page, write the AT_RANDOM canary at +0x28.
+    // glibc's ld-linux has stack-protector-enabled functions that run before
+    // arch_prctl(ARCH_SET_FS) — they read fs:0x28 as the canary. By setting
+    // FS_BASE to this pre-TLS page (via a trampoline), the canary is consistent
+    // before and after glibc's own TLS setup.
+    const PRE_TLS_ADDR: u64 = 0xB70000; // below vDSO (0xB80000)
+    if let Ok(f) = sys::frame_alloc() {
+        if sys::map(PRE_TLS_ADDR, f, MAP_WRITABLE).is_ok() {
+            unsafe {
+                core::ptr::write_bytes(PRE_TLS_ADDR as *mut u8, 0, 4096);
+                // Copy the canary from AT_RANDOM to TLS+0x28
+                let canary = core::ptr::read(random_addr as *const u64);
+                core::ptr::write((PRE_TLS_ADDR + 0x28) as *mut u64, canary);
+            }
+        }
+    }
+
+    // Write a trampoline at the vDSO pre-TLS setup stub (0xB80740):
+    //   mov edi, 0x1002        ; ARCH_SET_FS
+    //   mov rsi, PRE_TLS_ADDR  ; pre-TLS address
+    //   mov eax, 158           ; SYS_arch_prctl
+    //   syscall
+    //   mov rax, <exec_entry>
+    //   jmp rax
+    const TRAMPOLINE_ADDR: u64 = 0xB80740;
+    unsafe {
+        let p = TRAMPOLINE_ADDR as *mut u8;
+        // mov edi, 0x1002 (5 bytes: BF 02 10 00 00)
+        *p = 0xBF; *p.add(1) = 0x02; *p.add(2) = 0x10; *p.add(3) = 0x00; *p.add(4) = 0x00;
+        // movabs rsi, PRE_TLS_ADDR (10 bytes: 48 BE xx xx xx xx xx xx xx xx)
+        *p.add(5) = 0x48; *p.add(6) = 0xBE;
+        core::ptr::copy_nonoverlapping(&PRE_TLS_ADDR as *const u64 as *const u8, p.add(7), 8);
+        // mov eax, 158 (5 bytes: B8 9E 00 00 00)
+        *p.add(15) = 0xB8; *p.add(16) = 0x9E; *p.add(17) = 0x00; *p.add(18) = 0x00; *p.add(19) = 0x00;
+        // syscall (2 bytes: 0F 05)
+        *p.add(20) = 0x0F; *p.add(21) = 0x05;
+        // movabs rax, exec_entry (10 bytes: 48 B8 xx xx xx xx xx xx xx xx)
+        *p.add(22) = 0x48; *p.add(23) = 0xB8;
+        core::ptr::copy_nonoverlapping(&exec_entry as *const u64 as *const u8, p.add(24), 8);
+        // jmp rax (2 bytes: FF E0)
+        *p.add(32) = 0xFF; *p.add(33) = 0xE0;
+    }
+
+    // Make trampoline page executable (VMM demand-pages as RW+NX; we need RX)
+    let _ = sys::protect(TRAMPOLINE_ADDR & !0xFFF, 0); // 0 = read+execute (no write)
+
+    let child_entry = TRAMPOLINE_ADDR;
+
+    let new_ep = match sys::endpoint_create() {
+        Ok(e) => e,
+        Err(_) => {
+            unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
+            return Err(-12);
+        }
+    };
+    let new_thread = match sys::thread_create_redirected(child_entry, rsp, new_ep) {
+        Ok(t) => t,
+        Err(_) => {
+            unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
+            return Err(-12);
+        }
+    };
+    let _ = sys::signal_entry(new_thread, vdso::SIGNAL_TRAMPOLINE_ADDR);
+
+    unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
+    Ok((new_ep, new_thread))
+}
+
+/// Pre-apply interpreter relocations (RELR + RELA) so the dynamic linker's
+/// self-relocation bootstrap becomes a no-op. This works around kernels that
+/// don't save/restore SSE state (glibc's ld-linux uses movaps in bootstrap).
+///
+/// `elf_data`: raw ELF bytes of the interpreter (still in temp buffer).
+/// `elf_info`: parsed ELF header.
+/// `base`: load base address where segments are mapped.
+fn apply_interp_relocs(elf_data: &[u8], elf_info: &sotos_common::elf::ElfInfo, base: u64) {
+    // Find PT_DYNAMIC segment
+    let mut dyn_offset = 0usize;
+    let mut dyn_size = 0usize;
+    let mut found = false;
+    for i in 0..elf_info.phnum {
+        let ph = elf_info.phoff + i * elf_info.phentsize;
+        if ph + elf_info.phentsize > elf_data.len() { break; }
+        let p_type = u32::from_le_bytes([
+            elf_data[ph], elf_data[ph+1], elf_data[ph+2], elf_data[ph+3],
+        ]);
+        if p_type == 2 { // PT_DYNAMIC
+            dyn_offset = u64::from_le_bytes([
+                elf_data[ph+8], elf_data[ph+9], elf_data[ph+10], elf_data[ph+11],
+                elf_data[ph+12], elf_data[ph+13], elf_data[ph+14], elf_data[ph+15],
+            ]) as usize;
+            dyn_size = u64::from_le_bytes([
+                elf_data[ph+32], elf_data[ph+33], elf_data[ph+34], elf_data[ph+35],
+                elf_data[ph+36], elf_data[ph+37], elf_data[ph+38], elf_data[ph+39],
+            ]) as usize;
+            found = true;
+            break;
+        }
+    }
+    if !found { return; }
+
+    // Parse DYNAMIC entries to find DT_RELA, DT_RELASZ, DT_RELR, DT_RELRSZ
+    let mut rela_off: u64 = 0;
+    let mut rela_sz: u64 = 0;
+    let mut relr_off: u64 = 0;
+    let mut relr_sz: u64 = 0;
+    let mut pos = dyn_offset;
+    let end = (dyn_offset + dyn_size).min(elf_data.len());
+    while pos + 16 <= end {
+        let tag = u64::from_le_bytes([
+            elf_data[pos], elf_data[pos+1], elf_data[pos+2], elf_data[pos+3],
+            elf_data[pos+4], elf_data[pos+5], elf_data[pos+6], elf_data[pos+7],
+        ]);
+        let val = u64::from_le_bytes([
+            elf_data[pos+8], elf_data[pos+9], elf_data[pos+10], elf_data[pos+11],
+            elf_data[pos+12], elf_data[pos+13], elf_data[pos+14], elf_data[pos+15],
+        ]);
+        match tag {
+            0 => break,       // DT_NULL
+            7 => rela_off = val,  // DT_RELA
+            8 => rela_sz = val,   // DT_RELASZ
+            0x24 => relr_off = val, // DT_RELR
+            0x23 => relr_sz = val,  // DT_RELRSZ
+            _ => {}
+        }
+        pos += 16;
+    }
+
+    // Apply RELA RELATIVE relocations (type 8 = R_X86_64_RELATIVE)
+    if rela_off != 0 && rela_sz != 0 {
+        let rela_file_off = rela_off as usize;
+        let mut rp = rela_file_off;
+        let rela_end = (rela_file_off + rela_sz as usize).min(elf_data.len());
+        while rp + 24 <= rela_end {
+            let r_offset = u64::from_le_bytes([
+                elf_data[rp], elf_data[rp+1], elf_data[rp+2], elf_data[rp+3],
+                elf_data[rp+4], elf_data[rp+5], elf_data[rp+6], elf_data[rp+7],
+            ]);
+            let r_info = u64::from_le_bytes([
+                elf_data[rp+8], elf_data[rp+9], elf_data[rp+10], elf_data[rp+11],
+                elf_data[rp+12], elf_data[rp+13], elf_data[rp+14], elf_data[rp+15],
+            ]);
+            let r_addend = u64::from_le_bytes([
+                elf_data[rp+16], elf_data[rp+17], elf_data[rp+18], elf_data[rp+19],
+                elf_data[rp+20], elf_data[rp+21], elf_data[rp+22], elf_data[rp+23],
+            ]);
+            let r_type = (r_info & 0xFFFFFFFF) as u32;
+            let target = base + r_offset;
+            match r_type {
+                8 => { // R_X86_64_RELATIVE
+                    unsafe { *(target as *mut u64) = base + r_addend; }
+                }
+                6 => { // R_X86_64_GLOB_DAT — set to symbol value (0 for unresolved)
+                    let sym_idx = (r_info >> 32) as usize;
+                    // For ld-linux, symbols like __rseq_offset/size are internal
+                    // and point to addresses within ld-linux's own data
+                    if r_addend != 0 {
+                        unsafe { *(target as *mut u64) = base + r_addend; }
+                    } else {
+                        // Try to resolve: symbol value is in .dynsym
+                        // sym_value = read from dynsym[sym_idx].st_value
+                        // For now, just set to 0 (safe for rseq)
+                        let _ = sym_idx;
+                        unsafe { *(target as *mut u64) = 0; }
+                    }
+                }
+                0x25 => { // R_X86_64_IRELATIVE — call resolver at base+addend
+                    // We can't safely call the resolver from the loader.
+                    // Skip — ld-linux's bootstrap will handle this.
+                }
+                _ => {}
+            }
+            rp += 24;
+        }
+    }
+
+    // RELR relocations: NOT pre-applied.
+    // RELR format does `*ptr += base` which is NOT idempotent — if we pre-apply,
+    // glibc's bootstrap will add base again (double relocation → crash).
+    // RELA RELATIVE is safe because it sets `*(base+off) = base+addend` (idempotent).
+    // ld-linux's bootstrap handles RELR itself.
+}

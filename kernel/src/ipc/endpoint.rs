@@ -283,30 +283,21 @@ pub fn send(ep_handle: PoolHandle, msg: Message) -> Result<(), SysError> {
     };
     // Core pool lock dropped here.
 
+    let mut msg = msg;
+    process_cap_transfer(&mut msg);
+
     match action {
-        SendAction::ReplyToCaller(caller_tid) => {
-            let mut msg = msg;
-            process_cap_transfer(&mut msg);
-            sched::write_ipc_msg(sched::ThreadId(caller_tid), msg);
-            sched::wake(sched::ThreadId(caller_tid));
-            Ok(())
-        }
-        SendAction::Rendezvous(recv_tid) => {
-            let mut msg = msg;
-            process_cap_transfer(&mut msg);
-            sched::write_ipc_msg(sched::ThreadId(recv_tid), msg);
-            sched::wake(sched::ThreadId(recv_tid));
-            Ok(())
+        SendAction::ReplyToCaller(tid) | SendAction::Rendezvous(tid) => {
+            sched::write_ipc_msg(sched::ThreadId(tid), msg);
+            sched::wake(sched::ThreadId(tid));
         }
         SendAction::Block => {
-            let mut msg = msg;
-            process_cap_transfer(&mut msg);
             sched::set_current_ipc(ep_handle.raw(), sched::IpcRole::Sender, msg);
             sched::block_current();
             sched::clear_current_ipc();
-            Ok(())
         }
     }
+    Ok(())
 }
 
 /// Synchronous receive: block until a sender is ready, receive message.

@@ -200,13 +200,19 @@ impl AddressSpace {
     /// Returns `true` if the page was present and has been unmapped,
     /// `false` if the walk failed (missing intermediate table or PTE not present).
     pub fn unmap_page(&self, virt: u64) -> bool {
+        self.unmap_page_phys(virt).is_some()
+    }
+
+    /// Unmap a single 4 KiB page, returning the physical address of the
+    /// frame that was mapped there (if any).
+    pub fn unmap_page_phys(&self, virt: u64) -> Option<u64> {
         let hhdm = hhdm_offset();
 
         // PML4 → PDP
         let pml4 = (self.pml4_phys + hhdm) as *const u64;
         let pml4e = unsafe { *pml4.add(pml4_index(virt)) };
         if pml4e & PAGE_PRESENT == 0 {
-            return false;
+            return None;
         }
         let pdp_phys = pml4e & 0x000F_FFFF_FFFF_F000;
 
@@ -214,7 +220,7 @@ impl AddressSpace {
         let pdp = (pdp_phys + hhdm) as *const u64;
         let pdpe = unsafe { *pdp.add(pdp_index(virt)) };
         if pdpe & PAGE_PRESENT == 0 {
-            return false;
+            return None;
         }
         let pd_phys = pdpe & 0x000F_FFFF_FFFF_F000;
 
@@ -222,18 +228,19 @@ impl AddressSpace {
         let pd = (pd_phys + hhdm) as *const u64;
         let pde = unsafe { *pd.add(pd_index(virt)) };
         if pde & PAGE_PRESENT == 0 {
-            return false;
+            return None;
         }
         let pt_phys = pde & 0x000F_FFFF_FFFF_F000;
 
-        // Clear leaf PTE
+        // Clear leaf PTE and return its physical address
         let pt = (pt_phys + hhdm) as *mut u64;
         let pte = unsafe { &mut *pt.add(pt_index(virt)) };
         if *pte & PAGE_PRESENT == 0 {
-            return false;
+            return None;
         }
+        let phys = *pte & 0x000F_FFFF_FFFF_F000;
         *pte = 0;
-        true
+        Some(phys)
     }
 
     /// Update the flags of an already-mapped page (mprotect-like).

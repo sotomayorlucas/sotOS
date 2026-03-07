@@ -81,14 +81,34 @@ impl BitmapAllocator {
     }
 
     fn allocate(&mut self) -> Option<PhysFrame> {
-        // Linear scan from the search hint.
-        for i in 0..self.total_frames {
-            let idx = (self.search_hint + i) % self.total_frames;
-            if !self.is_set(idx) {
-                self.set(idx);
-                self.free_frames -= 1;
-                self.search_hint = idx + 1;
-                return Some(PhysFrame::from_addr(idx as u64 * FRAME_SIZE as u64));
+        // Word-level scan: check 64 bits at a time, then find free bit within word.
+        let total = self.total_frames;
+        let hint = self.search_hint;
+        // First pass: hint..total, second pass: 0..hint
+        for pass in 0..2 {
+            let (start, end) = if pass == 0 { (hint, total) } else { (0, hint) };
+            let mut idx = start;
+            while idx < end {
+                let byte = idx / 8;
+                // Fast skip: if entire byte is full (0xFF), skip 8 frames
+                let b = unsafe { *self.bitmap.add(byte) };
+                if b == 0xFF {
+                    idx = (byte + 1) * 8;
+                    continue;
+                }
+                // Found a byte with a free bit — scan within it
+                let bit = idx % 8;
+                for b_off in bit..8 {
+                    let frame_idx = byte * 8 + b_off;
+                    if frame_idx >= end { break; }
+                    if (b >> b_off) & 1 == 0 {
+                        self.set(frame_idx);
+                        self.free_frames -= 1;
+                        self.search_hint = frame_idx + 1;
+                        return Some(PhysFrame::from_addr(frame_idx as u64 * FRAME_SIZE as u64));
+                    }
+                }
+                idx = (byte + 1) * 8;
             }
         }
         None
@@ -96,24 +116,40 @@ impl BitmapAllocator {
 
     fn allocate_contiguous(&mut self, count: usize) -> Option<PhysFrame> {
         if count == 0 { return None; }
-        let limit = self.total_frames.checked_sub(count - 1)?;
-        for start in 0..limit {
-            let idx = (self.search_hint + start) % self.total_frames;
-            if idx + count > self.total_frames { continue; }
-            let mut all_free = true;
-            for j in 0..count {
-                if self.is_set(idx + j) {
-                    all_free = false;
-                    break;
+        let total = self.total_frames;
+        if count > total { return None; }
+        let limit = total - count + 1;
+        let hint = self.search_hint.min(limit);
+        // Two passes: hint..limit, then 0..hint
+        for pass in 0..2 {
+            let (start, end) = if pass == 0 { (hint, limit) } else { (0, hint) };
+            let mut idx = start;
+            while idx < end {
+                // Fast skip full bytes
+                let byte = idx / 8;
+                let b = unsafe { *self.bitmap.add(byte) };
+                if b == 0xFF && idx % 8 == 0 {
+                    idx += 8;
+                    continue;
                 }
-            }
-            if all_free {
-                for j in 0..count {
-                    self.set(idx + j);
+                if self.is_set(idx) {
+                    idx += 1;
+                    continue;
                 }
-                self.free_frames -= count;
-                self.search_hint = idx + count;
-                return Some(PhysFrame::from_addr(idx as u64 * FRAME_SIZE as u64));
+                // Found a free frame — check if count contiguous frames are free
+                let mut run = 1;
+                while run < count && !self.is_set(idx + run) {
+                    run += 1;
+                }
+                if run >= count {
+                    for j in 0..count {
+                        self.set(idx + j);
+                    }
+                    self.free_frames -= count;
+                    self.search_hint = idx + count;
+                    return Some(PhysFrame::from_addr(idx as u64 * FRAME_SIZE as u64));
+                }
+                idx += run + 1;
             }
         }
         None
@@ -134,9 +170,12 @@ impl BitmapAllocator {
 pub fn init(memory_map: &MemoryMapResponse, hhdm_offset: u64) {
     let entries = memory_map.entries();
 
-    // Find the highest physical address to determine bitmap size.
+    // Find the highest USABLE physical address to determine bitmap size.
+    // Only track usable RAM regions — MMIO regions above physical RAM
+    // don't need frame allocator tracking (avoids a 32 MB bitmap for 1 TiB).
     let max_addr = entries
         .iter()
+        .filter(|e| e.entry_type == EntryType::USABLE)
         .map(|e| e.base + e.length)
         .max()
         .unwrap_or(0);
@@ -217,4 +256,9 @@ pub fn free_frame(frame: PhysFrame) {
     if let Some(alloc) = ALLOCATOR.lock().as_mut() {
         alloc.free(frame);
     }
+}
+
+/// Return the number of currently free frames.
+pub fn free_count() -> usize {
+    ALLOCATOR.lock().as_ref().map(|a| a.free_frames).unwrap_or(0)
 }

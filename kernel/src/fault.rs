@@ -36,6 +36,12 @@ struct FaultState {
     global_queue: VecDeque<FaultInfo>,
 }
 
+impl FaultState {
+    fn find_handler_mut(&mut self, cr3: u64) -> Option<&mut FaultHandler> {
+        self.handlers.iter_mut().find(|h| h.cr3 == cr3)
+    }
+}
+
 static FAULT_STATE: Mutex<FaultState> = Mutex::new(FaultState {
     handlers: Vec::new(),
     global_notify: None,
@@ -50,14 +56,9 @@ pub fn register(notify_handle: PoolHandle, cr3: u64) {
     let mut state = FAULT_STATE.lock();
     if cr3 == 0 {
         state.global_notify = Some(notify_handle);
+    } else if let Some(h) = state.find_handler_mut(cr3) {
+        h.notify_handle = notify_handle;
     } else {
-        // Check if already registered for this CR3.
-        for h in state.handlers.iter_mut() {
-            if h.cr3 == cr3 {
-                h.notify_handle = notify_handle;
-                return;
-            }
-        }
         state.handlers.push(FaultHandler {
             cr3,
             notify_handle,
@@ -73,14 +74,12 @@ pub fn push_fault(tid: u32, addr: u64, code: u64, cr3: u64) -> bool {
         let mut state = FAULT_STATE.lock();
 
         // Try per-AS handler first.
-        for h in state.handlers.iter_mut() {
-            if h.cr3 == cr3 {
-                let handle = h.notify_handle;
-                h.queue.push_back(FaultInfo { tid, addr, code, cr3 });
-                drop(state);
-                let _ = notify::signal(handle);
-                return true;
-            }
+        if let Some(h) = state.find_handler_mut(cr3) {
+            let handle = h.notify_handle;
+            h.queue.push_back(FaultInfo { tid, addr, code, cr3 });
+            drop(state);
+            let _ = notify::signal(handle);
+            return true;
         }
 
         // Fall back to global handler.

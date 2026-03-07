@@ -99,6 +99,9 @@ const SYS_BOOTINFO_WRITE: u64 = 133;
 /// Syscall number — page permission change (mprotect-like).
 const SYS_PROTECT: u64 = 134;
 
+/// Syscall number — unmap + free physical frame in one step.
+const SYS_UNMAP_FREE: u64 = 24;
+
 /// Syscall number — IPC call with timeout.
 const SYS_CALL_TIMEOUT: u64 = 135;
 
@@ -546,6 +549,24 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
                 let aspace = AddressSpace::from_cr3(cr3);
                 if aspace.unmap_page(vaddr) {
                     paging::invlpg(vaddr);
+                    frame.rax = 0;
+                } else {
+                    frame.rax = SysError::NotFound as i64 as u64;
+                }
+            }
+        }
+
+        // SYS_UNMAP_FREE — unmap + free physical frame in one step
+        SYS_UNMAP_FREE => {
+            let vaddr = frame.rdi;
+            if vaddr & 0xFFF != 0 || vaddr >= USER_ADDR_LIMIT {
+                frame.rax = SysError::InvalidArg as i64 as u64;
+            } else {
+                let cr3 = paging::read_cr3();
+                let aspace = AddressSpace::from_cr3(cr3);
+                if let Some(phys) = aspace.unmap_page_phys(vaddr) {
+                    paging::invlpg(vaddr);
+                    mm::free_frame(PhysFrame::from_addr(phys));
                     frame.rax = 0;
                 } else {
                     frame.rax = SysError::NotFound as i64 as u64;
@@ -1438,6 +1459,11 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
             frame.rax = serial::read_byte_nonblocking()
                 .map(|b| b as u64)
                 .unwrap_or(u64::MAX); // -1 as unsigned = no data
+        }
+
+        // SYS_DEBUG_FREE_FRAMES (252) — return number of free physical frames
+        252 => {
+            frame.rax = mm::frame::free_count() as u64;
         }
 
         // SYS_DEBUG_PHYS_READ (254) — read u64 from physical address via HHDM
