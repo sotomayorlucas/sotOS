@@ -751,6 +751,12 @@ static mut MOUSE_READ_IDX: u32 = 0;
 pub(crate) unsafe fn poll_mouse() {
     if FB_PTR == 0 { return; }
 
+    // Route through compositor if active.
+    if COMPOSITOR_ACTIVE {
+        poll_mouse_compositor();
+        return;
+    }
+
     let mring = MOUSE_RING_ADDR as *mut u32;
     let mut moved = false;
 
@@ -787,6 +793,132 @@ pub(crate) unsafe fn poll_mouse() {
         fb_draw_cursor();
         MOUSE_PREV_X = MOUSE_X;
         MOUSE_PREV_Y = MOUSE_Y;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GUI Compositor (live window compositing, drag & drop)
+// ---------------------------------------------------------------------------
+
+/// Whether the GUI compositor has taken over the display.
+static mut COMPOSITOR_ACTIVE: bool = false;
+
+/// The live window manager / compositor (None until gui_compositor_init).
+static mut WM: Option<sotos_gui::WindowManager> = None;
+
+/// Virtual addresses for GUI window pixel buffers (mapped via frame_alloc).
+const GUI_WIN1_ADDR: u64 = 0x7000000;
+const GUI_WIN2_ADDR: u64 = 0x7100000;
+
+/// Demo window dimensions.
+const GUI_WIN1_W: u32 = 400;
+const GUI_WIN1_H: u32 = 250;
+const GUI_WIN2_W: u32 = 320;
+const GUI_WIN2_H: u32 = 200;
+
+/// Allocate physical frames and map them at a fixed virtual address range.
+unsafe fn map_gui_buffer(base: u64, pages: u64) {
+    for i in 0..pages {
+        let frame_cap = match sys::frame_alloc() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let vaddr = base + i * 0x1000;
+        let _ = sys::map(vaddr, frame_cap, 0x7); // PRESENT | WRITABLE | USER
+    }
+}
+
+/// Initialize the GUI compositor: create demo windows with gradient content.
+/// Call after fb_init() and after boot messages have been printed.
+pub(crate) unsafe fn gui_compositor_init() {
+    if FB_PTR == 0 || FB_WIDTH == 0 || FB_HEIGHT == 0 { return; }
+
+    // Allocate pixel buffers for two demo windows.
+    let win1_bytes = (GUI_WIN1_W * GUI_WIN1_H * 4) as u64;
+    let win1_pages = (win1_bytes + 0xFFF) / 0x1000;
+    map_gui_buffer(GUI_WIN1_ADDR, win1_pages);
+
+    let win2_bytes = (GUI_WIN2_W * GUI_WIN2_H * 4) as u64;
+    let win2_pages = (win2_bytes + 0xFFF) / 0x1000;
+    map_gui_buffer(GUI_WIN2_ADDR, win2_pages);
+
+    // Fill window buffers with gradient content.
+    sotos_gui::draw_gradient_into(
+        GUI_WIN1_ADDR as *mut u32, GUI_WIN1_W, GUI_WIN1_H,
+        50, 20, 120,    // deep blue top
+        200, 80, 40,    // warm orange bottom
+    );
+    sotos_gui::draw_gradient_into(
+        GUI_WIN2_ADDR as *mut u32, GUI_WIN2_W, GUI_WIN2_H,
+        20, 100, 60,    // forest green top
+        60, 200, 180,   // teal bottom
+    );
+
+    // Draw text labels into window buffers using the built-in 8x8 font.
+    sotos_gui::draw_string_fb(
+        GUI_WIN1_ADDR as *mut u32, GUI_WIN1_W, GUI_WIN1_W, GUI_WIN1_H,
+        10, 10, b"Hello from sotOS!", sotos_gui::COLOR_WHITE,
+    );
+    sotos_gui::draw_string_fb(
+        GUI_WIN1_ADDR as *mut u32, GUI_WIN1_W, GUI_WIN1_W, GUI_WIN1_H,
+        10, 24, b"Drag this window!", sotos_gui::COLOR_WHITE,
+    );
+    sotos_gui::draw_string_fb(
+        GUI_WIN2_ADDR as *mut u32, GUI_WIN2_W, GUI_WIN2_W, GUI_WIN2_H,
+        10, 10, b"Window 2", sotos_gui::COLOR_WHITE,
+    );
+
+    // Create the window manager with the screen framebuffer.
+    let fb = FB_PTR as *mut u32;
+    let stride = FB_PITCH / 4;
+    let mut wm = sotos_gui::WindowManager::new(fb, FB_WIDTH, FB_HEIGHT, stride);
+
+    // Create two demo windows at different positions.
+    let w1_x = (FB_WIDTH / 6) as i32;
+    let w1_y = (FB_HEIGHT / 6) as i32;
+    wm.create_window(w1_x, w1_y, GUI_WIN1_W, GUI_WIN1_H,
+        b"Hello World", GUI_WIN1_ADDR as *mut u32);
+
+    let w2_x = (FB_WIDTH / 3 + 50) as i32;
+    let w2_y = (FB_HEIGHT / 3 + 30) as i32;
+    wm.create_window(w2_x, w2_y, GUI_WIN2_W, GUI_WIN2_H,
+        b"Demo Window", GUI_WIN2_ADDR as *mut u32);
+
+    // Initial composite render.
+    wm.composite();
+
+    WM = Some(wm);
+    COMPOSITOR_ACTIVE = true;
+}
+
+/// Poll mouse when compositor is active — routes events through the WindowManager.
+unsafe fn poll_mouse_compositor() {
+    let mring = MOUSE_RING_ADDR as *mut u32;
+
+    let wm = match WM.as_mut() {
+        Some(w) => w,
+        None => return,
+    };
+
+    let mut any_input = false;
+
+    loop {
+        let write_idx = core::ptr::read_volatile(mring);
+        if MOUSE_READ_IDX == write_idx { break; }
+
+        let idx = (MOUSE_READ_IDX & 63) as usize;
+        let base = MOUSE_RING_ADDR + 8 + (idx * 4) as u64;
+        let dx = *(base as *const i8) as i32;
+        let dy = -(*((base + 1) as *const i8) as i32); // PS/2 Y inverted
+        let buttons = *((base + 2) as *const u8);
+
+        wm.on_mouse_input(dx, dy, buttons);
+        MOUSE_READ_IDX = (MOUSE_READ_IDX.wrapping_add(1)) & 63;
+        any_input = true;
+    }
+
+    if any_input && wm.dirty {
+        wm.composite();
     }
 }
 

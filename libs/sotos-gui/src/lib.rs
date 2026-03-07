@@ -363,6 +363,15 @@ pub struct WindowManager {
     pub cursor_y: i32,
     /// Whether cursor is visible.
     pub cursor_visible: bool,
+    /// Index of the window being dragged (usize::MAX = none).
+    pub drag_idx: usize,
+    /// Cursor offset from the dragged window's top-left corner.
+    pub drag_off_x: i32,
+    pub drag_off_y: i32,
+    /// Previous mouse button state (for edge detection).
+    pub prev_buttons: u8,
+    /// Whether the compositor needs to re-render.
+    pub dirty: bool,
 }
 
 impl WindowManager {
@@ -383,6 +392,11 @@ impl WindowManager {
             cursor_x: (w / 2) as i32,
             cursor_y: (h / 2) as i32,
             cursor_visible: true,
+            drag_idx: usize::MAX,
+            drag_off_x: 0,
+            drag_off_y: 0,
+            prev_buttons: 0,
+            dirty: true,
         }
     }
 
@@ -557,22 +571,84 @@ impl WindowManager {
         self.cursor_y = y.max(0).min(self.screen_height as i32 - 1);
     }
 
+    /// Process mouse input: cursor movement, drag start/stop, button presses.
+    /// `dx`/`dy` are relative motion deltas, `buttons` is the button bitmask
+    /// (bit 0 = left, bit 1 = right, bit 2 = middle).
+    pub fn on_mouse_input(&mut self, dx: i32, dy: i32, buttons: u8) {
+        // Update cursor position.
+        self.cursor_x = (self.cursor_x + dx).max(0).min(self.screen_width as i32 - 1);
+        self.cursor_y = (self.cursor_y + dy).max(0).min(self.screen_height as i32 - 1);
+
+        let left_now = buttons & 1 != 0;
+        let left_prev = self.prev_buttons & 1 != 0;
+
+        if left_now && !left_prev {
+            // Left button just pressed — find topmost window under cursor.
+            let mut best_idx = usize::MAX;
+            let mut best_z = 0u32;
+            for i in 0..self.window_count {
+                let w = &self.windows[i];
+                if w.visible && !w.minimized && w.contains(self.cursor_x, self.cursor_y) {
+                    if best_idx == usize::MAX || w.z_order > best_z {
+                        best_idx = i;
+                        best_z = w.z_order;
+                    }
+                }
+            }
+
+            if best_idx != usize::MAX {
+                // Focus clicked window.
+                self.focus_window(best_idx);
+
+                // Check if in title bar → start drag.
+                if self.windows[best_idx].in_title_bar(self.cursor_x, self.cursor_y)
+                    && !self.windows[best_idx].in_close_button(self.cursor_x, self.cursor_y)
+                    && !self.windows[best_idx].in_minimize_button(self.cursor_x, self.cursor_y)
+                {
+                    self.drag_idx = best_idx;
+                    self.drag_off_x = self.cursor_x - self.windows[best_idx].x;
+                    self.drag_off_y = self.cursor_y - self.windows[best_idx].y;
+                }
+            }
+        } else if !left_now && left_prev {
+            // Left button released — stop drag.
+            self.drag_idx = usize::MAX;
+        }
+
+        // If dragging, update window position.
+        if left_now && self.drag_idx != usize::MAX && self.drag_idx < self.window_count {
+            self.windows[self.drag_idx].x = self.cursor_x - self.drag_off_x;
+            self.windows[self.drag_idx].y = self.cursor_y - self.drag_off_y;
+        }
+
+        self.prev_buttons = buttons;
+        self.dirty = true;
+    }
+
     /// Composite all visible windows to the screen framebuffer.
     pub fn composite(&mut self) {
         if self.screen_fb.is_null() {
             return;
         }
 
-        // Fill desktop background.
-        fill_rect_fb(
-            self.screen_fb,
-            self.screen_stride,
-            0,
-            0,
-            self.screen_width,
-            self.screen_height,
-            COLOR_DESKTOP,
+        // Fill desktop background with vertical gradient (Tokyo Night).
+        gradient_fill_fb(
+            self.screen_fb, self.screen_stride,
+            0, 0, self.screen_width, self.screen_height,
+            26, 27, 38, 16, 16, 28,
         );
+
+        // Draw taskbar at bottom.
+        let tb_h = 36u32;
+        let tb_y = self.screen_height.saturating_sub(tb_h);
+        fill_rect_fb(self.screen_fb, self.screen_stride, 0, tb_y, self.screen_width, tb_h,
+            bgra(30, 30, 46, 255));
+        // Taskbar top border.
+        fill_rect_fb(self.screen_fb, self.screen_stride, 0, tb_y, self.screen_width, 1,
+            bgra(65, 72, 104, 255));
+        // "sotOS" branding in taskbar.
+        draw_string_fb(self.screen_fb, self.screen_stride, self.screen_width, self.screen_height,
+            12, tb_y as i32 + 10, b"sotOS", bgra(122, 162, 247, 255));
 
         // Build z-order sorted index list (ascending = back to front).
         let mut sorted: [usize; MAX_WINDOWS] = [0; MAX_WINDOWS];
@@ -725,6 +801,8 @@ impl WindowManager {
                 self.cursor_y,
             );
         }
+
+        self.dirty = false;
     }
 }
 

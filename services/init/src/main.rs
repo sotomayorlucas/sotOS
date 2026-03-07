@@ -71,7 +71,7 @@ mod lucas_handler;
 mod boot_tests;
 
 use framebuffer::{print, print_u64, print_hex64, print_hex, fb_init,
-                  fb_draw_cursor, fb_save_under_cursor};
+                  fb_draw_cursor, fb_save_under_cursor, gui_compositor_init};
 use exec::MAP_WRITABLE;
 use boot_tests::{test_dynamic_linking, run_linux_test, run_musl_test,
                  run_dynamic_test, run_busybox_test, producer,
@@ -188,6 +188,8 @@ pub extern "C" fn _start() -> ! {
             fb_init(boot_info);
             fb_save_under_cursor();
             fb_draw_cursor();
+            // Activate the live compositor with demo windows.
+            gui_compositor_init();
         }
         print(b"[DESKTOP OK]\n");
     }
