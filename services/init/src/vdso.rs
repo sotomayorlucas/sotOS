@@ -21,6 +21,8 @@ const VERDEF_OFF: usize = 0x350; // .gnu.version_d (verdef)
 const TEXT_OFF: usize = 0x600; // .text (machine code)
 const SIGNAL_TRAMPOLINE_OFF: usize = 0x100; // signal trampoline (within .text)
 const SIGRETURN_RESTORER_OFF: usize = 0x110; // rt_sigreturn restorer (within .text)
+const FORK_RESTORE_OFF: usize = 0x120; // fork callee-saved register restore trampoline
+const EXIT_STUB_OFF: usize = 0x130; // exit_group(rdi) stub
 const DATA_OFF: usize = 0xE00; // boot_tsc storage
 
 /// Virtual address of the signal trampoline (for SYS_SIGNAL_ENTRY).
@@ -30,6 +32,13 @@ pub const SIGNAL_TRAMPOLINE_ADDR: u64 = VDSO_BASE + (TEXT_OFF + SIGNAL_TRAMPOLIN
 /// Used as sa_restorer when no user-provided restorer is available,
 /// and to resume a thread after an async signal trampoline with no pending signal.
 pub const SIGRETURN_RESTORER_ADDR: u64 = VDSO_BASE + (TEXT_OFF + SIGRETURN_RESTORER_OFF) as u64;
+
+/// Fork restore trampoline: pop rbx, rbp, r12-r15, then ret to fork return point.
+pub const FORK_RESTORE_ADDR: u64 = VDSO_BASE + (TEXT_OFF + FORK_RESTORE_OFF) as u64;
+
+/// Exit stub: mov eax, 231 (exit_group); syscall; hlt
+/// RDI = exit code (set via SIG_REDIRECT_TAG regs[1])
+pub const EXIT_STUB_ADDR: u64 = VDSO_BASE + (TEXT_OFF + EXIT_STUB_OFF) as u64;
 
 // Number of symbols (including STN_UNDEF)
 const NUM_SYMS: usize = 5;
@@ -404,4 +413,42 @@ pub fn forge(page: &mut [u8], boot_tsc: u64) {
     page[r + 6] = 0x05;
     page[r + 7] = 0x0F;  // ud2
     page[r + 8] = 0x0B;
+
+    // ---- Fork restore trampoline (at TEXT_OFF + FORK_RESTORE_OFF) ----
+    // Restores callee-saved registers pushed onto the stack by the fork handler,
+    // then returns to the fork return point (address is on the stack).
+    //   pop rbx    → 5B
+    //   pop rbp    → 5D
+    //   pop r12    → 41 5C
+    //   pop r13    → 41 5D
+    //   pop r14    → 41 5E
+    //   pop r15    → 41 5F
+    //   ret        → C3
+    let f = TEXT_OFF + FORK_RESTORE_OFF;
+    page[f]      = 0x5B;  // pop rbx
+    page[f + 1]  = 0x5D;  // pop rbp
+    page[f + 2]  = 0x41;  // pop r12
+    page[f + 3]  = 0x5C;
+    page[f + 4]  = 0x41;  // pop r13
+    page[f + 5]  = 0x5D;
+    page[f + 6]  = 0x41;  // pop r14
+    page[f + 7]  = 0x5E;
+    page[f + 8]  = 0x41;  // pop r15
+    page[f + 9]  = 0x5F;
+    page[f + 10] = 0xC3;  // ret
+
+    // ---- Exit stub (at TEXT_OFF + EXIT_STUB_OFF) ----
+    // RDI already set via SIG_REDIRECT_TAG (regs[1] → rdi)
+    //   mov eax, 231   → B8 E7 00 00 00
+    //   syscall         → 0F 05
+    //   hlt             → F4
+    let e = TEXT_OFF + EXIT_STUB_OFF;
+    page[e]     = 0xB8;  // mov eax, imm32
+    page[e + 1] = 0xE7;  // 231 = exit_group
+    page[e + 2] = 0x00;
+    page[e + 3] = 0x00;
+    page[e + 4] = 0x00;
+    page[e + 5] = 0x0F;  // syscall
+    page[e + 6] = 0x05;
+    page[e + 7] = 0xF4;  // hlt
 }

@@ -46,6 +46,10 @@ const CMD_UDP_BIND: u64 = 8;       // arg0 = port → result = 0
 const CMD_UDP_SENDTO: u64 = 9;     // arg0 = dst_ip, arg1 = dst_port, arg2 = src_port, arg3 = len, data in IPC_DATA_BUF
 const CMD_UDP_RECV: u64 = 10;      // arg0 = port, arg1 = max_len → result = bytes_read, data in IPC_DATA_BUF
 const CMD_TCP_STATUS: u64 = 11;    // arg0 = conn_id → result[0] = recv_avail, result[1] = connected
+const CMD_NET_MIRROR: u64 = 12;   // arg0 = 0/1 → toggle packet mirroring
+
+/// Packet mirror flag: when non-zero, log packet summaries to serial.
+static NET_MIRROR: AtomicU64 = AtomicU64::new(0);
 
 // IPC command queue (atomic, single-slot producer-consumer).
 // The IPC handler thread writes cmd + args, then spins on IPC_RESULT.
@@ -369,6 +373,43 @@ pub extern "C" fn _start() -> ! {
             let frame = unsafe { core::slice::from_raw_parts(frame_ptr, frame_len) };
 
             if let Some((eth_hdr, eth_payload)) = sotos_net::eth::parse(frame) {
+                // Phase 5: Packet mirroring — log packet summaries to serial
+                if NET_MIRROR.load(Ordering::Relaxed) != 0 {
+                    if eth_hdr.ethertype == sotos_net::eth::ETHERTYPE_IPV4 {
+                        if let Some((ip_hdr, ip_payload)) = sotos_net::ip::parse(eth_payload) {
+                            print(b"[MIRROR] ");
+                            let proto = match ip_hdr.protocol {
+                                sotos_net::ip::PROTO_TCP => b"TCP" as &[u8],
+                                sotos_net::ip::PROTO_UDP => b"UDP",
+                                sotos_net::ip::PROTO_ICMP => b"ICMP",
+                                _ => b"???",
+                            };
+                            print(proto);
+                            print(b" ");
+                            print_ip(ip_hdr.src);
+                            print(b" -> ");
+                            print_ip(ip_hdr.dst);
+                            if ip_hdr.protocol == sotos_net::ip::PROTO_TCP || ip_hdr.protocol == sotos_net::ip::PROTO_UDP {
+                                if ip_payload.len() >= 4 {
+                                    let src_port = u16::from_be_bytes([ip_payload[0], ip_payload[1]]);
+                                    let dst_port = u16::from_be_bytes([ip_payload[2], ip_payload[3]]);
+                                    print(b" :");
+                                    print_u32(src_port as u32);
+                                    print(b"->:");
+                                    print_u32(dst_port as u32);
+                                }
+                            }
+                            print(b" len=");
+                            print_u32(frame_len as u32);
+                            print(b"\n");
+                        }
+                    } else if eth_hdr.ethertype == sotos_net::eth::ETHERTYPE_ARP {
+                        print(b"[MIRROR] ARP len=");
+                        print_u32(frame_len as u32);
+                        print(b"\n");
+                    }
+                }
+
                 match eth_hdr.ethertype {
                     sotos_net::eth::ETHERTYPE_ARP => {
                         handle_arp(&mut net, arp_table, &mac, eth_payload, &mut ip_id);
@@ -859,6 +900,16 @@ pub extern "C" fn _start() -> ! {
                         // Use a special encoding: result = recv_avail | (connected << 32)
                         recv_avail | (connected << 32)
                     }
+                }
+                CMD_NET_MIRROR => {
+                    // Toggle packet mirroring
+                    NET_MIRROR.store(arg0, Ordering::Release);
+                    if arg0 != 0 {
+                        print(b"NET: packet mirroring ENABLED\n");
+                    } else {
+                        print(b"NET: packet mirroring DISABLED\n");
+                    }
+                    0u64
                 }
                 _ => (-1i64) as u64,
             };

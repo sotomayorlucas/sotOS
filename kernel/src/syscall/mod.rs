@@ -279,7 +279,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
                     frame.rsi = reply.regs[2]; // arg1 = &siginfo (or 0)
                     frame.rdx = reply.regs[3]; // arg2 = &ucontext (or 0)
                     saved_user_rsp = reply.regs[4]; // new user RSP (below signal frame)
-                    frame.rax = 0;
+                    frame.rax = reply.regs[5]; // custom RAX (0 for signals, child_pid for fork)
                     frame.r11 = 0x202; // RFLAGS with IF=1
                     kdebug!("SIG_REDIRECT: handler={:#x} signo={} rsp={:#x}", reply.regs[0], reply.regs[1], reply.regs[4]);
                 } else {
