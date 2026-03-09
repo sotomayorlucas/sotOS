@@ -1,0 +1,403 @@
+// ---------------------------------------------------------------------------
+// Time, system info, scheduling, resource limits, and misc stubs.
+// Extracted from child_handler.rs
+// ---------------------------------------------------------------------------
+
+use sotos_common::sys;
+use sotos_common::linux_abi::*;
+use sotos_common::IpcMsg;
+use core::sync::atomic::Ordering;
+use crate::exec::{reply_val, rdtsc};
+use crate::process::*;
+use crate::fd::*;
+use super::context::SyscallContext;
+
+// ─── Time syscalls ──────────────────────────────────────────────
+
+/// SYS_CLOCK_GETTIME (228): return monotonic/realtime clock.
+pub(crate) fn sys_clock_gettime(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let tp_ptr = msg.regs[1];
+    if tp_ptr != 0 && tp_ptr < 0x0000_8000_0000_0000 {
+        let tsc = rdtsc();
+        let boot_tsc = BOOT_TSC.load(Ordering::Acquire);
+        let elapsed_ns = if tsc > boot_tsc { (tsc - boot_tsc) / 2 } else { 0 };
+        let total_ns = elapsed_ns + UPTIME_OFFSET_NS;
+        let tp = unsafe { core::slice::from_raw_parts_mut(tp_ptr as *mut u8, 16) };
+        tp[0..8].copy_from_slice(&((total_ns / 1_000_000_000) as i64).to_le_bytes());
+        tp[8..16].copy_from_slice(&((total_ns % 1_000_000_000) as i64).to_le_bytes());
+    }
+    reply_val(ctx.ep_cap, 0);
+}
+
+/// SYS_GETTIMEOFDAY (96): return time of day.
+pub(crate) fn sys_gettimeofday(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let tv = msg.regs[0] as *mut u64;
+    if !tv.is_null() {
+        let tsc = rdtsc();
+        let boot_tsc = BOOT_TSC.load(Ordering::Acquire);
+        let elapsed_us = if tsc > boot_tsc { (tsc - boot_tsc) / 2000 } else { 0 };
+        let total_secs = elapsed_us / 1_000_000 + UPTIME_OFFSET_SECS;
+        let usecs = elapsed_us % 1_000_000;
+        unsafe { *tv = total_secs; *tv.add(1) = usecs; }
+    }
+    reply_val(ctx.ep_cap, 0);
+}
+
+/// SYS_NANOSLEEP (35): stub returning 0.
+pub(crate) fn sys_nanosleep(ctx: &mut SyscallContext, _msg: &IpcMsg) {
+    reply_val(ctx.ep_cap, 0);
+}
+
+/// SYS_CLOCK_GETRES (229): return 1ns resolution.
+pub(crate) fn sys_clock_getres(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let tp = msg.regs[1];
+    if tp != 0 {
+        unsafe {
+            *(tp as *mut u64) = 0;       // tv_sec = 0
+            *((tp + 8) as *mut u64) = 1;  // tv_nsec = 1 (1ns resolution)
+        }
+    }
+    reply_val(ctx.ep_cap, 0);
+}
+
+/// SYS_CLOCK_NANOSLEEP (230): sleep stub (yield a few times).
+pub(crate) fn sys_clock_nanosleep(ctx: &mut SyscallContext, _msg: &IpcMsg) {
+    for _ in 0..10 { sys::yield_now(); }
+    reply_val(ctx.ep_cap, 0);
+}
+
+/// SYS_TIMES (100): return process times.
+pub(crate) fn sys_times(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let buf = msg.regs[0];
+    if buf != 0 {
+        // struct tms = 4 * i64 = 32 bytes (clock_t = i64 on x86_64)
+        unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 32); }
+    }
+    // Return clock ticks since boot
+    let tsc = rdtsc();
+    reply_val(ctx.ep_cap, (tsc / 20_000_000) as i64); // ~100 Hz ticks
+}
+
+/// SYS_GETITIMER (36) / SYS_SETITIMER (38): timer stubs.
+pub(crate) fn sys_getitimer(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let buf = msg.regs[1];
+    if buf != 0 { unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 32); } }
+    reply_val(ctx.ep_cap, 0);
+}
+
+pub(crate) fn sys_setitimer(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let old = msg.regs[2];
+    if old != 0 { unsafe { core::ptr::write_bytes(old as *mut u8, 0, 32); } }
+    reply_val(ctx.ep_cap, 0);
+}
+
+// ─── System info ────────────────────────────────────────────────
+
+/// SYS_SYSINFO (99): return system info struct.
+pub(crate) fn sys_sysinfo(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let buf = msg.regs[0] as *mut u8;
+    if !buf.is_null() {
+        unsafe { core::ptr::write_bytes(buf, 0, 128); }
+        let tsc = rdtsc();
+        let boot_tsc = BOOT_TSC.load(Ordering::Acquire);
+        let secs = if tsc > boot_tsc { (tsc - boot_tsc) / 2_000_000_000 } else { 0 };
+        unsafe { *(buf as *mut u64) = secs + UPTIME_OFFSET_SECS; } // uptime with offset
+    }
+    reply_val(ctx.ep_cap, 0);
+}
+
+/// SYS_GETRUSAGE (98): return zeroed rusage.
+pub(crate) fn sys_getrusage(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let buf = msg.regs[1];
+    if buf != 0 {
+        unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 144); }
+    }
+    reply_val(ctx.ep_cap, 0);
+}
+
+// ─── Resource limits ────────────────────────────────────────────
+
+/// SYS_PRLIMIT64 (302): query/set resource limits.
+pub(crate) fn sys_prlimit64(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let new_limit = msg.regs[2];
+    let old_limit = msg.regs[3];
+    if old_limit != 0 && old_limit < 0x0000_8000_0000_0000 {
+        let buf = unsafe { core::slice::from_raw_parts_mut(old_limit as *mut u8, 16) };
+        let big: u64 = 0x7FFF_FFFF_FFFF_FFFF;
+        buf[0..8].copy_from_slice(&big.to_le_bytes()); // rlim_cur
+        buf[8..16].copy_from_slice(&big.to_le_bytes()); // rlim_max
+    }
+    let _ = new_limit;
+    reply_val(ctx.ep_cap, 0);
+}
+
+/// SYS_GETRLIMIT (97): return generous resource limits.
+pub(crate) fn sys_getrlimit(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let rlim_ptr = msg.regs[1];
+    if rlim_ptr != 0 {
+        unsafe {
+            *(rlim_ptr as *mut u64) = 0x7FFF_FFFF_FFFF_FFFF; // rlim_cur
+            *((rlim_ptr + 8) as *mut u64) = 0x7FFF_FFFF_FFFF_FFFF; // rlim_max
+        }
+    }
+    reply_val(ctx.ep_cap, 0);
+}
+
+// ─── Scheduling ─────────────────────────────────────────────────
+
+/// SYS_SCHED_YIELD (24): yield CPU.
+pub(crate) fn sys_sched_yield(ctx: &mut SyscallContext, _msg: &IpcMsg) {
+    sys::yield_now();
+    reply_val(ctx.ep_cap, 0);
+}
+
+/// SYS_SCHED_GETAFFINITY (204): return CPU mask.
+pub(crate) fn sys_sched_getaffinity(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let mask_ptr = msg.regs[2] as *mut u8;
+    let len = msg.regs[1] as usize;
+    if !mask_ptr.is_null() && len > 0 {
+        unsafe {
+            core::ptr::write_bytes(mask_ptr, 0, len.min(128));
+            *mask_ptr = 1; // CPU 0
+        }
+    }
+    reply_val(ctx.ep_cap, len.min(128) as i64);
+}
+
+/// SYS_SCHED_GETPARAM (143): return sched priority.
+pub(crate) fn sys_sched_getparam(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let buf = msg.regs[1];
+    if buf != 0 { unsafe { *(buf as *mut i32) = 0; } } // sched_priority = 0
+    reply_val(ctx.ep_cap, 0);
+}
+
+/// SYS_GETRANDOM (318): fill buffer with random bytes.
+pub(crate) fn sys_getrandom(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let buf_ptr = msg.regs[0] as *mut u8;
+    let buflen = msg.regs[1] as usize;
+    let dst = unsafe { core::slice::from_raw_parts_mut(buf_ptr, buflen) };
+    crate::child_handler::fill_random(dst);
+    reply_val(ctx.ep_cap, buflen as i64);
+}
+
+// ─── Process control ────────────────────────────────────────────
+
+/// SYS_PRCTL (157): process control operations.
+pub(crate) fn sys_prctl(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let option = msg.regs[0] as u32;
+    match option {
+        15 => { // PR_SET_NAME: ignore
+            reply_val(ctx.ep_cap, 0);
+        }
+        16 => { // PR_GET_NAME: return "program"
+            let buf = msg.regs[1];
+            if buf != 0 {
+                let name = b"program\0\0\0\0\0\0\0\0\0";
+                unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), buf as *mut u8, 16); }
+            }
+            reply_val(ctx.ep_cap, 0);
+        }
+        38 => reply_val(ctx.ep_cap, 0), // PR_SET_NO_NEW_PRIVS
+        _ => reply_val(ctx.ep_cap, -EINVAL),
+    }
+}
+
+// ─── Futex ──────────────────────────────────────────────────────
+
+/// SYS_FUTEX (202): fast userspace locking.
+pub(crate) fn sys_futex(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let uaddr = msg.regs[0];
+    let op = (msg.regs[1] & 0x7F) as u32; // mask off FUTEX_PRIVATE_FLAG
+    let val = msg.regs[2] as u32;
+    match op {
+        0 => { // FUTEX_WAIT
+            let result = futex_wait(uaddr, val);
+            reply_val(ctx.ep_cap, result);
+        }
+        1 => { // FUTEX_WAKE
+            let result = futex_wake(uaddr, val);
+            reply_val(ctx.ep_cap, result);
+        }
+        _ => reply_val(ctx.ep_cap, 0), // other ops: stub
+    }
+}
+
+// ─── Identity / credential stubs ────────────────────────────────
+
+/// SYS_GETRESUID (118) / SYS_GETRESGID (120): return all-root.
+pub(crate) fn sys_getresuid(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let (r, e, s) = (msg.regs[0], msg.regs[1], msg.regs[2]);
+    if r != 0 { unsafe { *(r as *mut u32) = 0; } }
+    if e != 0 { unsafe { *(e as *mut u32) = 0; } }
+    if s != 0 { unsafe { *(s as *mut u32) = 0; } }
+    reply_val(ctx.ep_cap, 0);
+}
+
+/// SYS_CAPGET (125): return empty capabilities.
+pub(crate) fn sys_capget(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let data = msg.regs[1];
+    if data != 0 {
+        unsafe { core::ptr::write_bytes(data as *mut u8, 0, 24); }
+    }
+    reply_val(ctx.ep_cap, 0);
+}
+
+// ─── Event subsystems (eventfd, timerfd, memfd) ─────────────────
+
+/// SYS_EVENTFD (284) / SYS_EVENTFD2 (290): create eventfd.
+pub(crate) fn sys_eventfd(ctx: &mut SyscallContext, msg: &IpcMsg, syscall_nr: u64) {
+    let initval = msg.regs[0];
+    let flags = if syscall_nr == SYS_EVENTFD2 { msg.regs[1] as u32 } else { 0 };
+    let mut fd = None;
+    for i in 3..GRP_MAX_FDS { if ctx.child_fds[i] == 0 { fd = Some(i); break; } }
+    let mut slot = None;
+    for i in 0..super::context::MAX_EVENTFDS { if ctx.eventfd_slot_fd[i] == usize::MAX { slot = Some(i); break; } }
+    if let (Some(f), Some(s)) = (fd, slot) {
+        ctx.child_fds[f] = 22;
+        ctx.eventfd_slot_fd[s] = f;
+        ctx.eventfd_counter[s] = initval;
+        ctx.eventfd_flags[s] = flags;
+        reply_val(ctx.ep_cap, f as i64);
+    } else { reply_val(ctx.ep_cap, -EMFILE); }
+}
+
+/// SYS_TIMERFD_CREATE (283): create timerfd.
+pub(crate) fn sys_timerfd_create(ctx: &mut SyscallContext, _msg: &IpcMsg) {
+    let mut fd = None;
+    for i in 3..GRP_MAX_FDS { if ctx.child_fds[i] == 0 { fd = Some(i); break; } }
+    let mut slot = None;
+    for i in 0..super::context::MAX_TIMERFDS { if ctx.timerfd_slot_fd[i] == usize::MAX { slot = Some(i); break; } }
+    if let (Some(f), Some(s)) = (fd, slot) {
+        ctx.child_fds[f] = 23;
+        ctx.timerfd_slot_fd[s] = f;
+        ctx.timerfd_expiry_tsc[s] = 0;
+        ctx.timerfd_interval_ns[s] = 0;
+        reply_val(ctx.ep_cap, f as i64);
+    } else { reply_val(ctx.ep_cap, -EMFILE); }
+}
+
+/// SYS_TIMERFD_SETTIME (286): arm/disarm timer.
+pub(crate) fn sys_timerfd_settime(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let fd = msg.regs[0] as usize;
+    let _flags = msg.regs[1] as u32;
+    let new_value_ptr = msg.regs[2];
+    let old_value_ptr = msg.regs[3];
+    if fd < GRP_MAX_FDS && ctx.child_fds[fd] == 23 {
+        if let Some(slot) = ctx.timerfd_slot_fd.iter().position(|&x| x == fd) {
+            if old_value_ptr != 0 {
+                unsafe { core::ptr::write_bytes(old_value_ptr as *mut u8, 0, 32); }
+            }
+            if new_value_ptr != 0 {
+                let int_sec = unsafe { *(new_value_ptr as *const u64) };
+                let int_ns = unsafe { *((new_value_ptr + 8) as *const u64) };
+                let val_sec = unsafe { *((new_value_ptr + 16) as *const u64) };
+                let val_ns = unsafe { *((new_value_ptr + 24) as *const u64) };
+                let interval_ns = int_sec * 1_000_000_000 + int_ns;
+                let value_ns = val_sec * 1_000_000_000 + val_ns;
+                ctx.timerfd_interval_ns[slot] = interval_ns;
+                if value_ns == 0 {
+                    ctx.timerfd_expiry_tsc[slot] = 0; // disarm
+                } else {
+                    ctx.timerfd_expiry_tsc[slot] = rdtsc() + value_ns * 2; // ~2GHz TSC
+                }
+            }
+            reply_val(ctx.ep_cap, 0);
+        } else { reply_val(ctx.ep_cap, -EBADF); }
+    } else { reply_val(ctx.ep_cap, -EBADF); }
+}
+
+/// SYS_TIMERFD_GETTIME (287): query timer state.
+pub(crate) fn sys_timerfd_gettime(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let fd = msg.regs[0] as usize;
+    let buf = msg.regs[1];
+    if fd < GRP_MAX_FDS && ctx.child_fds[fd] == 23 {
+        if let Some(slot) = ctx.timerfd_slot_fd.iter().position(|&x| x == fd) {
+            if buf != 0 {
+                unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 32); }
+                let now = rdtsc();
+                let exp = ctx.timerfd_expiry_tsc[slot];
+                if exp > now {
+                    let remaining_ns = (exp - now) / 2;
+                    unsafe {
+                        *((buf + 16) as *mut u64) = remaining_ns / 1_000_000_000;
+                        *((buf + 24) as *mut u64) = remaining_ns % 1_000_000_000;
+                    }
+                }
+                let int_ns = ctx.timerfd_interval_ns[slot];
+                if int_ns != 0 {
+                    unsafe {
+                        *(buf as *mut u64) = int_ns / 1_000_000_000;
+                        *((buf + 8) as *mut u64) = int_ns % 1_000_000_000;
+                    }
+                }
+            }
+            reply_val(ctx.ep_cap, 0);
+        } else { reply_val(ctx.ep_cap, -EBADF); }
+    } else { reply_val(ctx.ep_cap, -EBADF); }
+}
+
+/// SYS_MEMFD_CREATE (319): create anonymous memory-backed fd.
+pub(crate) fn sys_memfd_create(ctx: &mut SyscallContext, _msg: &IpcMsg) {
+    const MAP_WRITABLE: u64 = 2;
+    let mut fd = None;
+    for i in 3..GRP_MAX_FDS { if ctx.child_fds[i] == 0 { fd = Some(i); break; } }
+    let mut slot = None;
+    for i in 0..super::context::MAX_MEMFDS { if ctx.memfd_slot_fd[i] == usize::MAX { slot = Some(i); break; } }
+    let mut vslot = None;
+    for s in 0..GRP_MAX_VFS { if ctx.vfs_files[s][0] == 0 { vslot = Some(s); break; } }
+    if let (Some(f), Some(s), Some(vs)) = (fd, slot, vslot) {
+        const MEMFD_INIT_PAGES: u64 = 16;
+        let base = *ctx.mmap_next;
+        *ctx.mmap_next += MEMFD_INIT_PAGES * 0x1000;
+        let mut ok = true;
+        for p in 0..MEMFD_INIT_PAGES {
+            if let Ok(frame) = sys::frame_alloc() {
+                if sys::map(base + p * 0x1000, frame, MAP_WRITABLE).is_err() { ok = false; break; }
+            } else { ok = false; break; }
+        }
+        if ok {
+            unsafe { core::ptr::write_bytes(base as *mut u8, 0, (MEMFD_INIT_PAGES * 0x1000) as usize); }
+            ctx.child_fds[f] = 25;
+            ctx.memfd_slot_fd[s] = f;
+            ctx.memfd_base[s] = base;
+            ctx.memfd_size[s] = 0;
+            ctx.memfd_cap[s] = MEMFD_INIT_PAGES * 0x1000;
+            ctx.vfs_files[vs] = [0xFEFD, 0, 0, f as u64]; // sentinel OID, offset tracking
+            reply_val(ctx.ep_cap, f as i64);
+        } else { reply_val(ctx.ep_cap, -ENOMEM); }
+    } else { reply_val(ctx.ep_cap, -EMFILE); }
+}
+
+// ─── Notification / IPC stubs ───────────────────────────────────
+
+/// SYS_INOTIFY_INIT1 (294): return fake fd.
+pub(crate) fn sys_inotify_init1(ctx: &mut SyscallContext, _msg: &IpcMsg) {
+    let mut fd = None;
+    for i in 3..GRP_MAX_FDS { if ctx.child_fds[i] == 0 { fd = Some(i); break; } }
+    if let Some(f) = fd {
+        ctx.child_fds[f] = 8;
+        reply_val(ctx.ep_cap, f as i64);
+    } else { reply_val(ctx.ep_cap, -EMFILE); }
+}
+
+/// SYS_SIGNALFD (282) / SYS_SIGNALFD4 (289): return dummy fd.
+pub(crate) fn sys_signalfd(ctx: &mut SyscallContext, _msg: &IpcMsg) {
+    let mut fd = None;
+    for i in 3..GRP_MAX_FDS { if ctx.child_fds[i] == 0 { fd = Some(i); break; } }
+    if let Some(f) = fd {
+        ctx.child_fds[f] = 8;
+        reply_val(ctx.ep_cap, f as i64);
+    } else { reply_val(ctx.ep_cap, -EMFILE); }
+}
+
+// ─── Simple one-liner stubs (batch) ─────────────────────────────
+
+/// Batch stubs that return 0: personality, alarm, setuid/gid/etc, unshare, etc.
+pub(crate) fn sys_identity_stubs(ctx: &mut SyscallContext, _msg: &IpcMsg) {
+    reply_val(ctx.ep_cap, 0);
+}
+
+/// SYS_PAUSE (29): return -EINTR.
+pub(crate) fn sys_pause(ctx: &mut SyscallContext, _msg: &IpcMsg) {
+    reply_val(ctx.ep_cap, -EINTR);
+}
