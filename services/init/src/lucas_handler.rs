@@ -2780,6 +2780,12 @@ pub(crate) extern "C" fn lucas_handler() -> ! {
             // SYS_pselect6 = 270
             SYS_SELECT | SYS_PSELECT6 => reply_val(ep_cap, 0),
 
+            // SYS_set_robust_list(273) — glibc pthread stub
+            SYS_SET_ROBUST_LIST => reply_val(ep_cap, 0),
+
+            // SYS_rseq(334) — restartable sequences stub
+            SYS_RSEQ => reply_val(ep_cap, -ENOSYS),
+
             // Unknown Linux syscall → -ENOSYS (with logging)
             _ => {
                 print(b"LUCAS: unhandled syscall ");

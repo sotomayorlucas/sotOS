@@ -59,6 +59,15 @@ fn parse_elf_goblin(data: &[u8]) -> Result<(ElfInfo, [LoadSegment; MAX_LOAD_SEGM
 
 /// Spinlock for serializing execve ELF loading (shared temp buffer).
 pub(crate) static EXEC_LOCK: AtomicU64 = AtomicU64::new(0);
+/// Last exec's stack base (set by exec_loaded_elf, read by caller under EXEC_LOCK).
+pub(crate) static LAST_EXEC_STACK_BASE: AtomicU64 = AtomicU64::new(0);
+/// Last exec's stack page count.
+pub(crate) static LAST_EXEC_STACK_PAGES: AtomicU64 = AtomicU64::new(0);
+/// Last exec's ELF load range [lo, hi) (page-aligned).
+pub(crate) static LAST_EXEC_ELF_LO: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LAST_EXEC_ELF_HI: AtomicU64 = AtomicU64::new(0);
+/// Whether last exec used a dynamic interpreter.
+pub(crate) static LAST_EXEC_HAS_INTERP: AtomicU64 = AtomicU64::new(0);
 /// Temp buffer for execve ELF loading (separate from SPAWN/DL buffers).
 pub(crate) const EXEC_BUF_BASE: u64 = 0x5400000;
 pub(crate) const EXEC_BUF_PAGES: u64 = 1280; // 5 MiB (links is ~4.9 MiB)
@@ -364,6 +373,28 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
 
     let main_base: u64 = if elf_info.elf_type == 3 { 0x400000 } else { 0 };
 
+    // Unmap previous binary's ELF pages (leftover from prior exec)
+    // Scan segments to determine the full range and free it
+    {
+        let mut range_lo = u64::MAX;
+        let mut range_hi = 0u64;
+        for si in 0..seg_count {
+            let seg = &segments[si];
+            if seg.memsz == 0 { continue; }
+            let lo = (main_base + seg.vaddr) & !0xFFF;
+            let hi = ((main_base + seg.vaddr + seg.memsz as u64) + 0xFFF) & !0xFFF;
+            if lo < range_lo { range_lo = lo; }
+            if hi > range_hi { range_hi = hi; }
+        }
+        if range_lo < range_hi {
+            let mut pg = range_lo;
+            while pg < range_hi {
+                let _ = sys::unmap_free(pg);
+                pg += 0x1000;
+            }
+        }
+    }
+
     if let Err(e) = map_elf_segments(EXEC_BUF_BASE, &elf_info, &segments, seg_count, main_base) {
         unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
         return Err(e);
@@ -429,6 +460,7 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
         };
 
         let interp_data = unsafe { core::slice::from_raw_parts(INTERP_BUF_BASE as *const u8, interp_size) };
+
         let (interp_elf, interp_segs, interp_seg_count, _) = match parse_elf_goblin(interp_data) {
             Ok(parsed) => parsed,
             Err(_) => {
@@ -601,8 +633,14 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
         if sys::map(PRE_TLS_ADDR, f, MAP_WRITABLE).is_ok() {
             unsafe {
                 core::ptr::write_bytes(PRE_TLS_ADDR as *mut u8, 0, 4096);
-                // Copy the canary from AT_RANDOM to TLS+0x28
-                let canary = core::ptr::read(random_addr as *const u64);
+                // Copy the canary from AT_RANDOM to TLS+0x28.
+                // glibc masks off the LSB (& ~0xFF) for string-termination safety
+                // in _dl_setup_stack_chk_guard(). We must match this so the canary
+                // saved by stack-protector-enabled functions in ld-linux before
+                // arch_prctl matches the canary glibc writes to the final TLS.
+                // musl doesn't read fs:0x28 before its own TLS setup, so the mask
+                // is harmless for musl dynamic binaries.
+                let canary = core::ptr::read(random_addr as *const u64) & !0xFF_u64;
                 core::ptr::write((PRE_TLS_ADDR + 0x28) as *mut u64, canary);
             }
         }
@@ -616,6 +654,8 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
     //   mov rax, <exec_entry>
     //   jmp rax
     const TRAMPOLINE_ADDR: u64 = 0xB80740;
+    // Make vDSO page writable before updating trampoline (may be RX from previous exec)
+    let _ = sys::protect(TRAMPOLINE_ADDR & !0xFFF, MAP_WRITABLE); // 2 = writable
     unsafe {
         let p = TRAMPOLINE_ADDR as *mut u8;
         // mov edi, 0x1002 (5 bytes: BF 02 10 00 00)
@@ -654,6 +694,26 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
         }
     };
     let _ = sys::signal_entry(new_thread, vdso::SIGNAL_TRAMPOLINE_ADDR);
+
+    // Record page info for per-process cleanup on exit
+    LAST_EXEC_STACK_BASE.store(stack_addr, Ordering::Release);
+    LAST_EXEC_STACK_PAGES.store(CHILD_STACK_PAGES, Ordering::Release);
+    // Compute full ELF segment range
+    {
+        let mut elf_lo = u64::MAX;
+        let mut elf_hi = 0u64;
+        for si in 0..seg_count {
+            let seg = &segments[si];
+            if seg.memsz == 0 { continue; }
+            let lo = (main_base + seg.vaddr) & !0xFFF;
+            let hi = ((main_base + seg.vaddr + seg.memsz as u64) + 0xFFF) & !0xFFF;
+            if lo < elf_lo { elf_lo = lo; }
+            if hi > elf_hi { elf_hi = hi; }
+        }
+        LAST_EXEC_ELF_LO.store(elf_lo, Ordering::Release);
+        LAST_EXEC_ELF_HI.store(elf_hi, Ordering::Release);
+    }
+    LAST_EXEC_HAS_INTERP.store(if is_dynamic { 1 } else { 0 }, Ordering::Release);
 
     unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
     Ok((new_ep, new_thread))

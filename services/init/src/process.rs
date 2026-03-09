@@ -119,6 +119,51 @@ pub(crate) static PROC_CLEAR_TID: [AtomicU64; MAX_PROCS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
     [INIT; MAX_PROCS]
 };
+/// Per-process stack base (for freeing on exit).
+pub(crate) static PROC_STACK_BASE: [AtomicU64; MAX_PROCS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_PROCS]
+};
+/// Per-process stack page count.
+pub(crate) static PROC_STACK_PAGES: [AtomicU64; MAX_PROCS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_PROCS]
+};
+/// Per-process ELF load range low address (page-aligned).
+pub(crate) static PROC_ELF_LO: [AtomicU64; MAX_PROCS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_PROCS]
+};
+/// Per-process ELF load range high address (page-aligned, exclusive).
+pub(crate) static PROC_ELF_HI: [AtomicU64; MAX_PROCS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_PROCS]
+};
+/// Whether the process used a dynamic interpreter (INTERP_LOAD_BASE).
+pub(crate) static PROC_HAS_INTERP: [AtomicU64; MAX_PROCS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_PROCS]
+};
+/// Per-process brk base address (start of brk region).
+pub(crate) static PROC_BRK_BASE: [AtomicU64; MAX_PROCS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_PROCS]
+};
+/// Per-process current brk address (end of allocated brk region).
+pub(crate) static PROC_BRK_CURRENT: [AtomicU64; MAX_PROCS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_PROCS]
+};
+/// Per-process mmap base address (start of mmap region).
+pub(crate) static PROC_MMAP_BASE: [AtomicU64; MAX_PROCS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_PROCS]
+};
+/// Per-process mmap next address (end of allocated mmap region).
+pub(crate) static PROC_MMAP_NEXT: [AtomicU64; MAX_PROCS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_PROCS]
+};
 
 // ---------------------------------------------------------------------------
 // Futex wait queue (Phase 4)

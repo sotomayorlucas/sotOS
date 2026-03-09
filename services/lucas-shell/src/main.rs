@@ -1761,9 +1761,8 @@ fn dispatch_command(line: &[u8]) {
             print(b"bye!\n");
             linux_exit(0);
         } else {
-            print(b"unknown command: ");
-            print(line);
-            print(b"\n");
+            // Try auto-exec: treat first word as initrd binary name
+            cmd_exec(line);
         }
 }
 
@@ -3157,20 +3156,43 @@ fn cmd_exec(line: &[u8]) {
         spos += 1;
         argc += 1;
 
-        // Remaining arguments
+        // Remaining arguments (handles single and double quotes)
         if prog_end < line.len() {
             let args = &line[prog_end + 1..];
             let mut i = 0;
             while i < args.len() && argc < 16 {
+                // Skip whitespace
                 while i < args.len() && args[i] == b' ' { i += 1; }
                 if i >= args.len() { break; }
-                let word_start = i;
-                while i < args.len() && args[i] != b' ' { i += 1; }
-                let wlen = i - word_start;
-                if spos + wlen + 1 > 512 { break; }
+
+                // Parse one argument, stripping quotes
+                let arg_start = spos;
                 EXEC_ARGV_PTRS[argc] = EXEC_ARGV_STRS.as_ptr().add(spos) as u64;
-                EXEC_ARGV_STRS[spos..spos + wlen].copy_from_slice(&args[word_start..i]);
-                spos += wlen;
+
+                if args[i] == b'\'' || args[i] == b'"' {
+                    // Quoted argument: collect until matching close quote
+                    let quote = args[i];
+                    i += 1; // skip opening quote
+                    while i < args.len() && args[i] != quote {
+                        if spos < 511 {
+                            EXEC_ARGV_STRS[spos] = args[i];
+                            spos += 1;
+                        }
+                        i += 1;
+                    }
+                    if i < args.len() { i += 1; } // skip closing quote
+                } else {
+                    // Unquoted argument: collect until space
+                    while i < args.len() && args[i] != b' ' {
+                        if spos < 511 {
+                            EXEC_ARGV_STRS[spos] = args[i];
+                            spos += 1;
+                        }
+                        i += 1;
+                    }
+                }
+
+                if spos == arg_start { continue; } // empty arg, skip
                 EXEC_ARGV_STRS[spos] = 0;
                 spos += 1;
                 argc += 1;

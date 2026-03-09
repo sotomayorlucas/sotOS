@@ -618,15 +618,15 @@ impl ObjectStore {
         Ok(())
     }
 
-    /// List entries in a directory. Returns count written.
+    /// List entries in a directory. Returns count written (clamped to out.len()).
     pub fn list_dir(&self, parent_oid: u64, out: &mut [DirEntry]) -> usize {
         let mut n = 0;
         for entry in &self.dir {
             if !entry.is_free() && entry.parent_oid == parent_oid && entry.oid != parent_oid {
                 if n < out.len() {
                     out[n] = *entry;
+                    n += 1;
                 }
-                n += 1;
             }
         }
         n

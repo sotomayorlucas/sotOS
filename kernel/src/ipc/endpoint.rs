@@ -361,6 +361,87 @@ pub fn recv(ep_handle: PoolHandle) -> Result<Message, SysError> {
     }
 }
 
+/// Synchronous receive with timeout: block until a sender is ready or timeout expires.
+pub fn recv_timeout(ep_handle: PoolHandle, timeout_ticks: u64) -> Result<Message, SysError> {
+    let raw = ep_handle.raw();
+    let (core_id, local) = decode_handle(raw);
+
+    let action = {
+        let mut pool = PER_CORE_ENDPOINTS[core_id].lock();
+        let ep = pool.get_mut(local).ok_or(SysError::NotFound)?;
+
+        match ep.state {
+            EndpointState::SendWait => {
+                let raw_tid = ep.dequeue_sender().unwrap();
+                let is_caller = raw_tid & CALLER_BIT != 0;
+                let send_tid = raw_tid & !CALLER_BIT;
+
+                if is_caller {
+                    ep.caller = Some(send_tid);
+                    if ep.send_queue_len == 0 {
+                        ep.state = EndpointState::Idle;
+                    }
+                    RecvAction::RendezvousCaller(send_tid)
+                } else {
+                    if ep.send_queue_len == 0 {
+                        ep.state = EndpointState::Idle;
+                    }
+                    RecvAction::Rendezvous(send_tid)
+                }
+            }
+            EndpointState::Idle => {
+                let my_tid = sched::current_tid().ok_or(SysError::InvalidArg)?;
+                ep.receiver = Some(my_tid.0);
+                ep.state = EndpointState::RecvWait;
+                RecvAction::Block
+            }
+            EndpointState::RecvWait => {
+                return Err(SysError::OutOfResources);
+            }
+        }
+    };
+    // Core pool lock dropped here.
+
+    let deadline = sched::global_ticks() + timeout_ticks;
+
+    match action {
+        RecvAction::Rendezvous(send_tid) => {
+            let msg = sched::read_ipc_msg(sched::ThreadId(send_tid));
+            sched::wake(sched::ThreadId(send_tid));
+            Ok(msg)
+        }
+        RecvAction::RendezvousCaller(send_tid) => {
+            let msg = sched::read_ipc_msg(sched::ThreadId(send_tid));
+            Ok(msg)
+        }
+        RecvAction::Block => {
+            sched::set_current_ipc(ep_handle.raw(), sched::IpcRole::Receiver, Message::empty());
+            sched::set_current_ipc_timeout(deadline);
+            sched::block_current();
+            if sched::check_and_clear_ipc_timeout() {
+                cancel_receiver(raw);
+                sched::clear_current_ipc();
+                return Err(SysError::Timeout);
+            }
+            let msg = sched::current_ipc_msg();
+            sched::clear_current_ipc();
+            Ok(msg)
+        }
+    }
+}
+
+/// Remove a timed-out receiver from an endpoint's state.
+fn cancel_receiver(ep_raw: u32) {
+    let (core_id, local) = decode_handle(ep_raw);
+    let mut pool = PER_CORE_ENDPOINTS[core_id].lock();
+    if let Some(ep) = pool.get_mut(local) {
+        ep.receiver = None;
+        if ep.state == EndpointState::RecvWait {
+            ep.state = EndpointState::Idle;
+        }
+    }
+}
+
 /// Synchronous call: send a message, then wait for a reply on the same endpoint.
 pub fn call(ep_handle: PoolHandle, msg: Message) -> Result<Message, SysError> {
     let my_tid = sched::current_tid().ok_or(SysError::InvalidArg)?;

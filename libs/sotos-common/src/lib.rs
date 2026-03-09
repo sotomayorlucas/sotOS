@@ -154,6 +154,8 @@ pub enum Syscall {
     ThreadCount = 142,
     /// Combined send+receive with timeout (ticks in extra reg).
     CallTimeout = 135,
+    /// Receive with timeout (ep_cap in rdi[31:0], timeout in rdi[63:32]).
+    RecvTimeout = 136,
     /// Write a single byte to serial (COM1).
     DebugPrint = 255,
     /// Non-blocking serial read (returns byte or u64::MAX if none).
@@ -671,6 +673,38 @@ pub mod sys {
                 inlateout("r13") msg.regs[5] => r5,
                 inlateout("r14") msg.regs[6] => r6,
                 inlateout("r15") msg.regs[7] => r7,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
+        check_val(ret).map(|_| super::IpcMsg { tag, regs: [r0, r1, r2, r3, r4, r5, r6, r7] })
+    }
+
+    /// Receive with timeout on a synchronous IPC endpoint.
+    /// `timeout_ticks` is relative (number of scheduler ticks; 100 ticks ~= 1s at 100Hz).
+    /// Returns `Err(-7)` on timeout (SysError::Timeout).
+    #[inline(always)]
+    pub fn recv_timeout(ep_cap: u64, timeout_ticks: u32) -> Result<super::IpcMsg, i64> {
+        let rdi_val = (ep_cap & 0xFFFFFFFF) | ((timeout_ticks as u64) << 32);
+        let ret: u64;
+        let tag: u64;
+        let r0: u64; let r1: u64; let r2: u64; let r3: u64;
+        let r4: u64; let r5: u64; let r6: u64; let r7: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") super::Syscall::RecvTimeout as u64 => ret,
+                in("rdi") rdi_val,
+                lateout("rsi") tag,
+                lateout("rdx") r0,
+                lateout("r8") r1,
+                lateout("r9") r2,
+                lateout("r10") r3,
+                lateout("r12") r4,
+                lateout("r13") r5,
+                lateout("r14") r6,
+                lateout("r15") r7,
                 lateout("rcx") _,
                 lateout("r11") _,
                 options(nostack),

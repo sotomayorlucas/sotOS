@@ -41,18 +41,41 @@ pub extern "C" fn _start() -> ! {
 
     print(b"VMM: registered for init faults\n");
 
+    // Track last fault per thread to detect infinite loops.
+    // [tid % 16] -> (last_addr, repeat_count)
+    let mut fault_track: [(u64, u32); 16] = [(0, 0); 16];
+
     // Fault handling loop.
     loop {
         sys::notify_wait(notify_cap);
         loop {
             match sys::fault_recv() {
                 Ok(fault) => {
+                    let vaddr_raw = fault.addr & !0xFFF;
+                    let code = fault.code;
+                    let slot = (fault.tid as usize) % 16;
+
+                    // Guard: NX violation (instruction fetch on NX page).
+                    // Mapping a new writable frame would get NX again (W^X) -> infinite loop.
+                    if code & 0x11 == 0x11 {
+                        continue; // leave thread suspended
+                    }
+
+                    // Guard: Infinite loop detection (same address > 4 times).
+                    if fault_track[slot].0 == vaddr_raw {
+                        fault_track[slot].1 += 1;
+                        if fault_track[slot].1 > 4 {
+                            continue; // leave thread suspended
+                        }
+                    } else {
+                        fault_track[slot] = (vaddr_raw, 1);
+                    }
+
                     let frame = sys::frame_alloc().unwrap_or_else(|_| {
-                        print(b"VMM: frame_alloc failed!\n");
+                        print(b"VMM: OOM\n");
                         loop { sys::yield_now(); }
                     });
-                    let vaddr = fault.addr & !0xFFF;
-                    sys::map_into(init_as_cap, vaddr, frame, MAP_WRITABLE).unwrap_or_else(|_| {
+                    sys::map_into(init_as_cap, vaddr_raw, frame, MAP_WRITABLE).unwrap_or_else(|_| {
                         print(b"VMM: map_into failed!\n");
                         loop { sys::yield_now(); }
                     });

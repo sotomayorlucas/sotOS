@@ -174,9 +174,14 @@ pub(crate) fn alloc_fd(fds: &[FdEntry; MAX_FDS], from: usize) -> Option<usize> {
 // ---------------------------------------------------------------------------
 
 /// Write a Linux stat struct (144 bytes) into guest memory.
-pub(crate) fn write_linux_stat(stat_ptr: u64, oid: u64, size: u64, is_dir: bool) {
+/// Write a Linux stat structure to user memory.
+/// `oid` is used as st_ino, `dev` as st_dev (default 0).
+/// Different st_dev values prevent inode collisions across source types
+/// (e.g., initrd vs VFS vs directory stubs).
+pub(crate) fn write_linux_stat_dev(stat_ptr: u64, dev: u64, oid: u64, size: u64, is_dir: bool) {
     use sotos_common::linux_abi::{Stat, S_IFREG, S_IFDIR};
     let mut st = Stat::zeroed();
+    st.st_dev = dev;
     st.st_ino = oid;
     st.st_nlink = 1;
     st.st_mode = if is_dir { S_IFDIR | 0o755 } else { S_IFREG | 0o644 };
@@ -184,6 +189,11 @@ pub(crate) fn write_linux_stat(stat_ptr: u64, oid: u64, size: u64, is_dir: bool)
     st.st_blksize = 512;
     st.st_blocks = ((size + 511) / 512) as i64;
     unsafe { st.write_to(stat_ptr); }
+}
+
+/// Convenience wrapper with st_dev=0 (backward compat for stubs/misc).
+pub(crate) fn write_linux_stat(stat_ptr: u64, oid: u64, size: u64, is_dir: bool) {
+    write_linux_stat_dev(stat_ptr, 0, oid, size, is_dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +206,7 @@ pub(crate) fn write_linux_stat(stat_ptr: u64, oid: u64, size: u64, is_dir: bool)
 
 pub(crate) const GRP_MAX_FDS: usize = 32;
 pub(crate) const GRP_MAX_INITRD: usize = 8;
-pub(crate) const GRP_MAX_VFS: usize = 8;
+pub(crate) const GRP_MAX_VFS: usize = 16;
 
 /// FD kind per slot: 0=free, 1=stdin, 2=stdout, 8=devnull, 9=devzero, 12=initrd, 13=vfs, 14=vfsdir.
 pub(crate) static mut GRP_FDS: [[u8; GRP_MAX_FDS]; MAX_PROCS] = [[0; GRP_MAX_FDS]; MAX_PROCS];
@@ -205,7 +215,7 @@ pub(crate) static mut GRP_INITRD: [[[u64; 4]; GRP_MAX_INITRD]; MAX_PROCS] = [[[0
 /// VFS file tracking per group: [oid, size, position, fd_index].
 pub(crate) static mut GRP_VFS: [[[u64; 4]; GRP_MAX_VFS]; MAX_PROCS] = [[[0; 4]; GRP_MAX_VFS]; MAX_PROCS];
 /// Directory listing buffer per group.
-pub(crate) static mut GRP_DIR_BUF: [[u8; 1024]; MAX_PROCS] = [[0; 1024]; MAX_PROCS];
+pub(crate) static mut GRP_DIR_BUF: [[u8; 4096]; MAX_PROCS] = [[0; 4096]; MAX_PROCS];
 /// Directory listing length per group.
 pub(crate) static mut GRP_DIR_LEN: [usize; MAX_PROCS] = [0; MAX_PROCS];
 /// Directory listing position per group.
@@ -249,7 +259,7 @@ pub(crate) fn fd_grp_init(g: usize) {
         GRP_FDS[g][2] = 2; // stderr
         GRP_INITRD[g] = [[0; 4]; GRP_MAX_INITRD];
         GRP_VFS[g] = [[0; 4]; GRP_MAX_VFS];
-        GRP_DIR_BUF[g] = [0; 1024];
+        GRP_DIR_BUF[g] = [0; 4096];
         GRP_DIR_LEN[g] = 0;
         GRP_DIR_POS[g] = 0;
     }

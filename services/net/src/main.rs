@@ -957,7 +957,7 @@ fn process_ipc_cmd(
             let local_port = NEXT_EPHEMERAL_PORT.fetch_add(1, Ordering::Relaxed) as u16;
 
             if let Some(slot) = alloc_tcp_slot() {
-                let rx = tcp::SocketBuffer::new(alloc::vec![0u8; 4096]);
+                let rx = tcp::SocketBuffer::new(alloc::vec![0u8; 16384]);
                 let tx = tcp::SocketBuffer::new(alloc::vec![0u8; 4096]);
                 let tcp_sock = tcp::Socket::new(rx, tx);
                 let handle = sockets.add(tcp_sock);
@@ -976,8 +976,8 @@ fn process_ipc_cmd(
                     TCP_SLOTS[slot] = Some(handle);
                 }
 
-                // Wait for connection
-                for _ in 0..500 {
+                // Wait for connection (up to ~5 seconds for real internet)
+                for _ in 0..5000u32 {
                     iface.poll(now(), device, sockets);
                     let sock = sockets.get_mut::<tcp::Socket>(handle);
                     if sock.is_active() && sock.may_send() {
@@ -1028,7 +1028,7 @@ fn process_ipc_cmd(
 
         CMD_TCP_RECV => {
             let conn_id = arg0 as usize;
-            let max_len = (arg1 as usize).min(4096);
+            let max_len = (arg1 as usize).min(64); // IPC limit: 8 regs × 8 bytes = 64
             if conn_id >= MAX_TCP {
                 return 0;
             }
@@ -1037,7 +1037,23 @@ fn process_ipc_cmd(
                 None => return 0,
             };
 
-            for _ in 0..300 {
+            // Try immediate read (data may already be buffered)
+            {
+                let sock = sockets.get_mut::<tcp::Socket>(handle);
+                if sock.can_recv() {
+                    let ipc_buf = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            core::ptr::addr_of_mut!(IPC_DATA_BUF) as *mut u8,
+                            max_len,
+                        )
+                    };
+                    if let Ok(n) = sock.recv_slice(ipc_buf) {
+                        if n > 0 { return n as u64; }
+                    }
+                }
+            }
+            // Poll for incoming data
+            for _ in 0..1000u32 {
                 iface.poll(now(), device, sockets);
                 let sock = sockets.get_mut::<tcp::Socket>(handle);
                 if sock.can_recv() {
@@ -1048,9 +1064,7 @@ fn process_ipc_cmd(
                         )
                     };
                     if let Ok(n) = sock.recv_slice(ipc_buf) {
-                        if n > 0 {
-                            return n as u64;
-                        }
+                        if n > 0 { return n as u64; }
                     }
                 }
                 if !sock.is_active() {
@@ -1190,11 +1204,13 @@ fn process_ipc_cmd(
 
         CMD_UDP_RECV => {
             let port = arg0 as u16;
-            let max_len = (arg1 as usize).min(512);
+            // Always read full datagrams (up to 512B) to avoid smoltcp Truncated error.
+            // IPC handler clamps result to 64 bytes for transport.
+            let max_len = 512usize;
 
             let slot = match find_udp_slot(port) {
                 Some(s) => s,
-                None => return 0,
+                None => { return 0; },
             };
             let handle = unsafe { UDP_SLOTS[slot].0.unwrap() };
 
@@ -1208,14 +1224,14 @@ fn process_ipc_cmd(
                             max_len,
                         )
                     };
-                    if let Ok((n, _)) = sock.recv_slice(ipc_buf) {
+                    if let Ok((n, _ep)) = sock.recv_slice(ipc_buf) {
                         return n as u64;
                     }
                 }
             }
 
-            // Poll for new data
-            for _ in 0..100 {
+            // Poll for new data (500 iters for SLIRP DNS latency)
+            for _iter in 0..500u32 {
                 sys::yield_now();
                 iface.poll(now(), device, sockets);
                 let sock = sockets.get_mut::<udp::Socket>(handle);
@@ -1226,7 +1242,7 @@ fn process_ipc_cmd(
                             max_len,
                         )
                     };
-                    if let Ok((n, _)) = sock.recv_slice(ipc_buf) {
+                    if let Ok((n, _ep)) = sock.recv_slice(ipc_buf) {
                         return n as u64;
                     }
                 }
@@ -1342,9 +1358,8 @@ pub extern "C" fn ipc_handler_thread() -> ! {
 
         // TCP_RECV / UDP_RECV: copy data into reply regs
         if (cmd == CMD_TCP_RECV || cmd == CMD_UDP_RECV) && result > 0 {
-            reply.tag = result;
-            reply.regs[0] = result;
             let n = (result as usize).min(64);
+            reply.tag = n as u64; // clamp to IPC transport limit
             unsafe {
                 let dst = &mut reply.regs[0] as *mut u64 as *mut u8;
                 core::ptr::copy_nonoverlapping(

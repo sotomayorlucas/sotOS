@@ -11,7 +11,7 @@ use sotos_common::sys;
 mod bump_alloc {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    const HEAP_SIZE: usize = 128 * 1024;
+    const HEAP_SIZE: usize = 512 * 1024;
     static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
     static HEAP_POS: AtomicUsize = AtomicUsize::new(0);
 

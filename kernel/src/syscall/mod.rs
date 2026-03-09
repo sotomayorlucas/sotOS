@@ -104,6 +104,8 @@ const SYS_UNMAP_FREE: u64 = 24;
 
 /// Syscall number — IPC call with timeout.
 const SYS_CALL_TIMEOUT: u64 = 135;
+/// Syscall number — IPC recv with timeout.
+const SYS_RECV_TIMEOUT: u64 = 136;
 
 /// Syscall number — set FS_BASE for current thread (TLS support).
 const SYS_SET_FSBASE: u64 = 160;
@@ -376,6 +378,26 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
                         Ok(reply) => {
                             frame.rax = 0;
                             msg_to_frame(frame, &reply);
+                        }
+                        Err(e) => frame.rax = e as i64 as u64,
+                    }
+                }
+                Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
+                Err(e) => frame.rax = e as i64 as u64,
+            }
+        }
+
+        // SYS_RECV_TIMEOUT — recv with timeout (ep_cap in rdi[31:0], timeout in rdi[63:32])
+        SYS_RECV_TIMEOUT => {
+            let ep_cap = (frame.rdi & 0xFFFFFFFF) as u32;
+            let timeout_ticks = (frame.rdi >> 32) as u64;
+            match cap::validate(ep_cap, Rights::READ) {
+                Ok(CapObject::Endpoint { id }) => {
+                    let timeout = if timeout_ticks == 0 { u64::MAX } else { timeout_ticks };
+                    match endpoint::recv_timeout(PoolHandle::from_raw(id), timeout) {
+                        Ok(msg) => {
+                            frame.rax = 0;
+                            msg_to_frame(frame, &msg);
                         }
                         Err(e) => frame.rax = e as i64 as u64,
                     }
