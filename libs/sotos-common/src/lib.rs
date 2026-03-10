@@ -128,6 +128,17 @@ pub enum Syscall {
     ThreadCreateIn = 122,
     /// Unmap a page from a target address space.
     UnmapFrom = 123,
+    /// Clone an address space with Copy-on-Write semantics.
+    AddrSpaceClone = 125,
+    /// Copy 4KiB from a page in src AS to a frame cap (via kernel HHDM).
+    FrameCopy = 126,
+    /// Read PTE (phys + flags) for a vaddr in an AS.
+    PteRead = 127,
+    /// Read bytes from a target address space into caller's buffer.
+    VmRead = 128,
+    /// Write bytes from caller's buffer into a target address space.
+    /// Handles CoW: if the target page is read-only (CoW), allocates a new frame.
+    VmWrite = 129,
     /// Register a service name → endpoint mapping.
     SvcRegister = 130,
     /// Look up a service by name, returns a derived endpoint cap.
@@ -227,6 +238,9 @@ pub struct BootInfo {
     pub fb_bpp: u32,
     /// Randomized stack top address (0 = default 0x904000).
     pub stack_top: u64,
+    /// Capability ID for init's own address space (for CoW fork cloning).
+    /// 0 = not available.
+    pub self_as_cap: u64,
 }
 
 impl BootInfo {
@@ -242,6 +256,7 @@ impl BootInfo {
             fb_pitch: 0,
             fb_bpp: 0,
             stack_top: 0,
+            self_as_cap: 0,
         }
     }
 
@@ -277,6 +292,9 @@ pub struct FaultInfo {
     pub tid: u32,
     /// CR3 of the faulting address space (0 if not provided).
     pub cr3: u64,
+    /// AS capability ID for the faulting address space (0 = unknown).
+    /// Used by VMM to call map_into for CoW faults on child address spaces.
+    pub as_cap_id: u64,
 }
 
 // ---------------------------------------------------------------
@@ -286,6 +304,13 @@ pub struct FaultInfo {
 /// Magic tag in IPC reply that tells the kernel to redirect the child
 /// thread to a signal handler instead of returning normally from the syscall.
 pub const SIG_REDIRECT_TAG: u64 = 0x5349_4700; // "SIG\0"
+
+/// Magic tag in IPC reply that tells the kernel to yield and re-send
+/// the syscall to init. Used for non-blocking pipe reads: init can't
+/// block in a spin-wait (it would stall all children), so it tells the
+/// kernel to retry after yielding, giving other children a chance to
+/// write data into the pipe.
+pub const PIPE_RETRY_TAG: u64 = 0x5049_5045; // "PIPE"
 
 /// Signal frame pushed onto the user stack during signal delivery.
 /// Both the kernel (rt_sigreturn) and LUCAS (frame construction) use
@@ -860,6 +885,7 @@ pub mod sys {
         let code: u64;
         let tid: u64;
         let cr3: u64;
+        let as_cap_id: u64;
         unsafe {
             core::arch::asm!(
                 "syscall",
@@ -868,12 +894,13 @@ pub mod sys {
                 lateout("rsi") code,
                 lateout("rdx") tid,
                 lateout("r8") cr3,
+                lateout("r9") as_cap_id,
                 lateout("rcx") _,
                 lateout("r11") _,
                 options(nostack),
             );
         }
-        check_val(ret).map(|_| super::FaultInfo { addr, code, tid: tid as u32, cr3 })
+        check_val(ret).map(|_| super::FaultInfo { addr, code, tid: tid as u32, cr3, as_cap_id })
     }
 
     // ---------------------------------------------------------------
@@ -987,15 +1014,90 @@ pub mod sys {
     }
 
     /// Create a thread in a target address space. Returns thread cap ID.
+    /// `redirect_ep_cap` = 0 means no redirect; non-zero = endpoint cap for syscall redirect.
     #[inline(always)]
-    pub fn thread_create_in(as_cap: u64, rip: u64, rsp: u64) -> Result<u64, i64> {
-        check_val(syscall3(super::Syscall::ThreadCreateIn as u64, as_cap, rip, rsp))
+    pub fn thread_create_in(as_cap: u64, rip: u64, rsp: u64, redirect_ep_cap: u64) -> Result<u64, i64> {
+        check_val(syscall4(super::Syscall::ThreadCreateIn as u64, as_cap, rip, rsp, redirect_ep_cap))
     }
 
     /// Unmap a page from a target address space.
     #[inline(always)]
     pub fn unmap_from(as_cap: u64, vaddr: u64) -> Result<(), i64> {
         check_unit(syscall2(super::Syscall::UnmapFrom as u64, as_cap, vaddr))
+    }
+
+    /// Clone an address space with Copy-on-Write semantics.
+    /// Returns the new AS cap ID.
+    #[inline(always)]
+    pub fn addr_space_clone(src_as_cap: u64) -> Result<u64, i64> {
+        check_val(syscall1(super::Syscall::AddrSpaceClone as u64, src_as_cap))
+    }
+
+    /// Set FS_BASE on a target thread (by thread cap). For CoW fork child init.
+    #[inline(always)]
+    pub fn set_thread_fs_base(thread_cap: u64, fs_base: u64) -> Result<(), i64> {
+        check_unit(syscall2(162, thread_cap, fs_base))
+    }
+
+    /// Copy 4KiB from a page in src AS to a frame cap (via kernel HHDM).
+    #[inline(always)]
+    pub fn frame_copy(dst_frame_cap: u64, src_as_cap: u64, vaddr: u64) -> Result<(), i64> {
+        check_unit(syscall3(super::Syscall::FrameCopy as u64, dst_frame_cap, src_as_cap, vaddr))
+    }
+
+    /// Read PTE (phys + flags) for a vaddr in an AS.
+    /// Returns (phys_addr, flags) on success.
+    /// Kernel returns: rax = phys, rdi = flags.
+    #[inline(always)]
+    pub fn pte_read(as_cap: u64, vaddr: u64) -> Result<(u64, u64), i64> {
+        let phys_or_err: u64;
+        let flags: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") super::Syscall::PteRead as u64 => phys_or_err,
+                inlateout("rdi") as_cap => flags,
+                in("rsi") vaddr,
+                lateout("rcx") _,
+                lateout("r11") _,
+                lateout("rdx") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r10") _,
+                lateout("r12") _,
+                lateout("r13") _,
+                lateout("r14") _,
+                lateout("r15") _,
+                options(nostack),
+            );
+        }
+        if (phys_or_err as i64) < 0 { Err(phys_or_err as i64) } else { Ok((phys_or_err, flags)) }
+    }
+
+    // ---------------------------------------------------------------
+    // Cross-AS memory access (for CoW fork handler)
+    // ---------------------------------------------------------------
+
+    /// Read bytes from a target address space into caller's buffer.
+    /// as_cap: AddrSpace capability for the target AS.
+    /// remote_vaddr: virtual address in the target AS to read from.
+    /// local_buf: pointer in caller's AS to write into.
+    /// len: number of bytes to read (max 4096).
+    #[inline(always)]
+    pub fn vm_read(as_cap: u64, remote_vaddr: u64, local_buf: u64, len: u64) -> Result<(), i64> {
+        check_unit(syscall4(super::Syscall::VmRead as u64, as_cap, remote_vaddr, local_buf, len))
+    }
+
+    /// Write bytes from caller's buffer into a target address space.
+    /// Handles CoW: if the target page is read-only, allocates a new frame,
+    /// copies old content, updates PTE, then writes the data.
+    /// as_cap: AddrSpace capability for the target AS.
+    /// remote_vaddr: virtual address in the target AS to write to.
+    /// local_buf: pointer in caller's AS to read from.
+    /// len: number of bytes to write (max 4096).
+    #[inline(always)]
+    pub fn vm_write(as_cap: u64, remote_vaddr: u64, local_buf: u64, len: u64) -> Result<(), i64> {
+        check_unit(syscall4(super::Syscall::VmWrite as u64, as_cap, remote_vaddr, local_buf, len))
     }
 
     // ---------------------------------------------------------------

@@ -158,7 +158,7 @@ pub(crate) fn sys_wait4(ctx: &mut SyscallContext, msg: &IpcMsg) {
             while PROC_STATE[idx].load(Ordering::Acquire) != 2 {
                 sys::yield_now();
                 spins += 1;
-                if spins > 50_000 { break; }
+                if spins > 50_000_000 { break; }
             }
             if PROC_STATE[idx].load(Ordering::Acquire) == 2 {
                 let exit_status = PROC_EXIT[idx].load(Ordering::Acquire) as u32;
@@ -187,79 +187,94 @@ pub(crate) fn sys_waitid(ctx: &mut SyscallContext, _msg: &IpcMsg) {
 /// Shared cleanup for SYS_EXIT and SYS_EXIT_GROUP.
 fn exit_cleanup(ctx: &mut SyscallContext, status: u64) {
     let pid = ctx.pid;
+    if pid == 0 || pid > MAX_PROCS { return; }
     let memg = PROC_MEM_GROUP[pid - 1].load(Ordering::Acquire) as usize;
-    if pid > 0 && pid <= MAX_PROCS {
-        // CLONE_CHILD_CLEARTID: write 0 to *clear_child_tid + futex_wake
-        let ctid_ptr = PROC_CLEAR_TID[pid - 1].load(Ordering::Acquire);
-        if ctid_ptr != 0 {
-            unsafe { core::ptr::write_volatile(ctid_ptr as *mut u32, 0); }
-            futex_wake(ctid_ptr, 1);
+    crate::framebuffer::print(b"EXIT pid=");
+    crate::framebuffer::print_u64(pid as u64);
+    crate::framebuffer::print(b" status=");
+    crate::framebuffer::print_u64(status);
+    crate::framebuffer::print(b"\n");
+    if memg >= MAX_PROCS { return; }
+
+    // CLONE_CHILD_CLEARTID: write 0 to *clear_child_tid + futex_wake
+    let ctid_ptr = PROC_CLEAR_TID[pid - 1].load(Ordering::Acquire);
+    if ctid_ptr != 0 && ctid_ptr < 0x0000_8000_0000_0000 {
+        unsafe { core::ptr::write_volatile(ctid_ptr as *mut u32, 0); }
+        futex_wake(ctid_ptr, 1);
+    }
+
+    // Free initrd file buffer pages
+    for s in 0..GRP_MAX_INITRD {
+        if ctx.initrd_files[s][0] != 0 {
+            let buf = ctx.initrd_files[s][0];
+            let sz = ctx.initrd_files[s][1];
+            let pages = sz.saturating_add(0xFFF) / 0x1000;
+            let pages = if pages > 1024 { 1024 } else { pages };
+            for p in 0..pages { let _ = sys::unmap_free(buf.wrapping_add(p * 0x1000)); }
+            ctx.initrd_files[s] = [0; 4];
         }
-        // Free initrd file buffer pages
-        for s in 0..GRP_MAX_INITRD {
-            if ctx.initrd_files[s][0] != 0 {
-                let buf = ctx.initrd_files[s][0];
-                let sz = ctx.initrd_files[s][1];
-                let pages = (sz + 0xFFF) / 0x1000;
-                for p in 0..pages { let _ = sys::unmap_free(buf + p * 0x1000); }
-                ctx.initrd_files[s] = [0; 4];
-            }
+    }
+
+    // Free child stack pages (skip unmap — child thread may still reference these)
+    let sbase = PROC_STACK_BASE[pid - 1].load(Ordering::Acquire);
+    let spages = PROC_STACK_PAGES[pid - 1].load(Ordering::Acquire);
+    if sbase != 0 && spages != 0 && spages <= 256 {
+        PROC_STACK_BASE[pid - 1].store(0, Ordering::Release);
+        PROC_STACK_PAGES[pid - 1].store(0, Ordering::Release);
+    }
+
+    // Free ELF segment pages
+    let elf_lo = PROC_ELF_LO[pid - 1].load(Ordering::Acquire);
+    let elf_hi = PROC_ELF_HI[pid - 1].load(Ordering::Acquire);
+    if elf_lo < elf_hi && elf_hi.wrapping_sub(elf_lo) < 0x1000000 {
+        let mut pg = elf_lo;
+        while pg < elf_hi { let _ = sys::unmap_free(pg); pg = pg.wrapping_add(0x1000); }
+        PROC_ELF_LO[pid - 1].store(0, Ordering::Release);
+        PROC_ELF_HI[pid - 1].store(0, Ordering::Release);
+    }
+
+    // Free interpreter pages if dynamic binary
+    if PROC_HAS_INTERP[pid - 1].load(Ordering::Acquire) != 0 {
+        for pg in 0..0x110u64 {
+            let _ = sys::unmap_free(crate::exec::INTERP_LOAD_BASE + pg * 0x1000);
         }
-        // Free child stack pages
-        let sbase = PROC_STACK_BASE[pid - 1].load(Ordering::Acquire);
-        let spages = PROC_STACK_PAGES[pid - 1].load(Ordering::Acquire);
-        if sbase != 0 && spages != 0 {
-            for p in 0..spages { let _ = sys::unmap_free(sbase + p * 0x1000); }
-            PROC_STACK_BASE[pid - 1].store(0, Ordering::Release);
-            PROC_STACK_PAGES[pid - 1].store(0, Ordering::Release);
-        }
-        // Free ELF segment pages
-        let elf_lo = PROC_ELF_LO[pid - 1].load(Ordering::Acquire);
-        let elf_hi = PROC_ELF_HI[pid - 1].load(Ordering::Acquire);
-        if elf_lo < elf_hi {
-            let mut pg = elf_lo;
-            while pg < elf_hi { let _ = sys::unmap_free(pg); pg += 0x1000; }
-            PROC_ELF_LO[pid - 1].store(0, Ordering::Release);
-            PROC_ELF_HI[pid - 1].store(0, Ordering::Release);
-        }
-        // Free interpreter pages if dynamic binary
-        if PROC_HAS_INTERP[pid - 1].load(Ordering::Acquire) != 0 {
-            for pg in 0..0x110u64 {
-                let _ = sys::unmap_free(crate::exec::INTERP_LOAD_BASE + pg * 0x1000);
-            }
-            PROC_HAS_INTERP[pid - 1].store(0, Ordering::Release);
-        }
-        // Free pre-TLS page
-        let _ = sys::unmap_free(0xB70000);
-        // Free brk pages
-        let brk_lo = PROC_BRK_BASE[pid - 1].load(Ordering::Acquire);
-        let brk_hi = PROC_BRK_CURRENT[pid - 1].load(Ordering::Acquire);
-        if brk_lo != 0 && brk_hi > brk_lo {
-            let mut pg = brk_lo;
-            while pg < brk_hi { let _ = sys::unmap_free(pg); pg += 0x1000; }
-        }
-        // Free mmap pages
-        let mmap_lo = PROC_MMAP_BASE[pid - 1].load(Ordering::Acquire);
-        let mmap_hi = PROC_MMAP_NEXT[pid - 1].load(Ordering::Acquire);
-        if mmap_lo != 0 && mmap_hi > mmap_lo {
-            let mut pg = mmap_lo;
-            while pg < mmap_hi { let _ = sys::unmap_free(pg); pg += 0x1000; }
-        }
-        PROC_BRK_BASE[pid - 1].store(0, Ordering::Release);
-        PROC_BRK_CURRENT[pid - 1].store(0, Ordering::Release);
-        PROC_MMAP_BASE[pid - 1].store(0, Ordering::Release);
-        PROC_MMAP_NEXT[pid - 1].store(0, Ordering::Release);
-        // Reset brk/mmap state
+        PROC_HAS_INTERP[pid - 1].store(0, Ordering::Release);
+    }
+
+    // Free pre-TLS page
+    let _ = sys::unmap_free(0xB70000);
+
+    // Free brk pages
+    let brk_lo = PROC_BRK_BASE[pid - 1].load(Ordering::Acquire);
+    let brk_hi = PROC_BRK_CURRENT[pid - 1].load(Ordering::Acquire);
+    if brk_lo != 0 && brk_hi > brk_lo && brk_hi.wrapping_sub(brk_lo) < 0x1000000 {
+        let mut pg = brk_lo;
+        while pg < brk_hi { let _ = sys::unmap_free(pg); pg = pg.wrapping_add(0x1000); }
+    }
+
+    // Free mmap pages
+    let mmap_lo = PROC_MMAP_BASE[pid - 1].load(Ordering::Acquire);
+    let mmap_hi = PROC_MMAP_NEXT[pid - 1].load(Ordering::Acquire);
+    if mmap_lo != 0 && mmap_hi > mmap_lo && mmap_hi.wrapping_sub(mmap_lo) < 0x10000000 {
+        let mut pg = mmap_lo;
+        while pg < mmap_hi { let _ = sys::unmap_free(pg); pg = pg.wrapping_add(0x1000); }
+    }
+
+    PROC_BRK_BASE[pid - 1].store(0, Ordering::Release);
+    PROC_BRK_CURRENT[pid - 1].store(0, Ordering::Release);
+    PROC_MMAP_BASE[pid - 1].store(0, Ordering::Release);
+    PROC_MMAP_NEXT[pid - 1].store(0, Ordering::Release);
+    if memg < MAX_PROCS {
         unsafe { GRP_BRK[memg] = 0; GRP_MMAP_NEXT[memg] = 0; }
-        for f in 0..GRP_MAX_FDS { ctx.child_fds[f] = 0; }
-        for s in 0..GRP_MAX_VFS { ctx.vfs_files[s] = [0; 4]; }
-        PROC_EXIT[pid - 1].store(status, Ordering::Release);
-        PROC_STATE[pid - 1].store(2, Ordering::Release);
-        // Deliver SIGCHLD to parent
-        let ppid = PROC_PARENT[pid - 1].load(Ordering::Acquire) as usize;
-        if ppid > 0 && ppid <= MAX_PROCS {
-            sig_send(ppid, SIGCHLD as u64);
-        }
+    }
+    for f in 0..GRP_MAX_FDS { ctx.child_fds[f] = 0; }
+    for s in 0..GRP_MAX_VFS { ctx.vfs_files[s] = [0; 4]; }
+    PROC_EXIT[pid - 1].store(status, Ordering::Release);
+    PROC_STATE[pid - 1].store(2, Ordering::Release);
+    // Deliver SIGCHLD to parent
+    let ppid = PROC_PARENT[pid - 1].load(Ordering::Acquire) as usize;
+    if ppid > 0 && ppid <= MAX_PROCS {
+        sig_send(ppid, SIGCHLD as u64);
     }
 }
 

@@ -79,7 +79,7 @@ fn syscall6(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i6
 #[allow(dead_code)] #[inline(always)] fn linux_brk(addr: u64) -> i64 { syscall1(12, addr) }
 #[inline(always)] fn linux_getpid() -> i64 { syscall0(39) }
 #[inline(always)] fn linux_clone(child_fn: u64) -> i64 { syscall2(56, child_fn, 0) }
-#[inline(always)] fn linux_execve(path: *const u8, argv: *const u64) -> i64 { syscall3(59, path as u64, argv as u64, 0) }
+#[inline(always)] fn linux_execve(path: *const u8, argv: *const u64, envp: *const u64) -> i64 { syscall3(59, path as u64, argv as u64, envp as u64) }
 #[inline(always)] fn linux_waitpid(pid: u64) -> i64 { syscall2(61, pid, 0) }
 #[inline(always)] fn linux_kill(pid: u64, sig: u64) -> i64 { syscall2(62, pid, sig) }
 #[inline(always)] fn linux_getcwd(buf: *mut u8, size: u64) -> i64 { syscall2(79, buf as u64, size) }
@@ -640,6 +640,13 @@ fn shell_loop() {
     env_set(b"SHELL", b"lucas");
     env_set(b"OS", b"sotOS");
     env_set(b"VERSION", b"0.1.0");
+
+    // --- Auto-run: test CoW fork via busybox sh pipe ---
+    {
+        print(b"AUTORUN: busybox sh -c 'echo cowfork-ok | cat'\n");
+        cmd_exec(b"busybox sh -c 'echo cowfork-ok | cat'");
+        print(b"AUTORUN: done\n");
+    }
 
     loop {
         // Reap finished background jobs
@@ -3105,12 +3112,17 @@ static mut EXEC_NAME_LEN: usize = 0;
 static mut EXEC_ARGV_STRS: [u8; 512] = [0u8; 512];
 /// Argv pointer array (u64 pointers + NULL terminator).
 static mut EXEC_ARGV_PTRS: [u64; 17] = [0u64; 17];
+/// Envp string storage (null-separated).
+static mut EXEC_ENVP_STRS: [u8; 512] = [0u8; 512];
+/// Envp pointer array (u64 pointers + NULL terminator).
+static mut EXEC_ENVP_PTRS: [u64; 17] = [0u64; 17];
 
 /// Child function that immediately calls execve with the name in EXEC_NAME_BUF.
 extern "C" fn child_exec_main() -> ! {
     let name = unsafe { &EXEC_NAME_BUF[..EXEC_NAME_LEN + 1] }; // includes NUL
     let argv = unsafe { EXEC_ARGV_PTRS.as_ptr() };
-    let ret = linux_execve(name.as_ptr(), argv);
+    let envp = unsafe { EXEC_ENVP_PTRS.as_ptr() };
+    let ret = linux_execve(name.as_ptr(), argv, envp);
     // execve failed — print error and exit
     print(b"exec: failed (errno=");
     print_u64((-ret) as u64);
@@ -3118,23 +3130,78 @@ extern "C" fn child_exec_main() -> ! {
     linux_exit(1);
 }
 
-fn cmd_exec(line: &[u8]) {
-    // Parse: first word = program name, remaining words = arguments
-    // e.g., "busybox wget http://example.com" -> prog="busybox", argv=["busybox","wget","http://..."]
-    let mut prog_end = line.len();
-    for i in 0..line.len() {
-        if line[i] == b' ' { prog_end = i; break; }
+/// Check if a word looks like VAR=value (contains '=' and starts with a letter/underscore).
+fn is_env_assignment(word: &[u8]) -> bool {
+    if word.is_empty() { return false; }
+    // Must start with letter or underscore
+    let c = word[0];
+    if !((c >= b'A' && c <= b'Z') || (c >= b'a' && c <= b'z') || c == b'_') { return false; }
+    // Must contain '=' before any space
+    for i in 1..word.len() {
+        if word[i] == b'=' { return true; }
+        if word[i] == b' ' { return false; }
     }
-    let prog_name = &line[..prog_end];
+    false
+}
 
-    // Build path into EXEC_NAME_BUF: absolute paths pass through, relative get /bin/ prefix
-    let is_absolute = !prog_name.is_empty() && prog_name[0] == b'/';
-    let total = if is_absolute { prog_name.len() } else { 5 + prog_name.len() };
-    if total >= 63 {
-        print(b"exec: name too long\n");
-        return;
-    }
+fn cmd_exec(line: &[u8]) {
+    // Parse leading VAR=value tokens, then command + arguments.
+    // e.g., "HOME=/tmp PATH=/bin git init" -> envp=["HOME=/tmp","PATH=/bin"], prog="git", argv=["git","init"]
+    let mut pos: usize = 0;
+
     unsafe {
+        // Parse envp: leading VAR=value words
+        let mut epos: usize = 0; // position in EXEC_ENVP_STRS
+        let mut envc: usize = 0;
+        loop {
+            // Skip whitespace
+            while pos < line.len() && line[pos] == b' ' { pos += 1; }
+            if pos >= line.len() { break; }
+
+            // Find end of this word
+            let word_start = pos;
+            while pos < line.len() && line[pos] != b' ' { pos += 1; }
+            let word = &line[word_start..pos];
+
+            if is_env_assignment(word) && envc < 16 {
+                // Store as env var
+                EXEC_ENVP_PTRS[envc] = EXEC_ENVP_STRS.as_ptr().add(epos) as u64;
+                if epos + word.len() < 511 {
+                    EXEC_ENVP_STRS[epos..epos + word.len()].copy_from_slice(word);
+                    epos += word.len();
+                    EXEC_ENVP_STRS[epos] = 0;
+                    epos += 1;
+                }
+                envc += 1;
+            } else {
+                // Not an env assignment — this is the command. Rewind.
+                pos = word_start;
+                break;
+            }
+        }
+        EXEC_ENVP_PTRS[envc] = 0; // NULL terminator
+
+        // Remaining line is the actual command + args
+        let cmd_line = &line[pos..];
+
+        // Parse: first word = program name
+        let mut prog_end = cmd_line.len();
+        for i in 0..cmd_line.len() {
+            if cmd_line[i] == b' ' { prog_end = i; break; }
+        }
+        let prog_name = &cmd_line[..prog_end];
+        if prog_name.is_empty() {
+            // Only env assignments, no command — nothing to exec
+            return;
+        }
+
+        // Build path into EXEC_NAME_BUF: absolute paths pass through, relative get /bin/ prefix
+        let is_absolute = prog_name[0] == b'/';
+        let total = if is_absolute { prog_name.len() } else { 5 + prog_name.len() };
+        if total >= 63 {
+            print(b"exec: name too long\n");
+            return;
+        }
         if is_absolute {
             EXEC_NAME_BUF[..prog_name.len()].copy_from_slice(prog_name);
         } else {
@@ -3144,7 +3211,7 @@ fn cmd_exec(line: &[u8]) {
         EXEC_NAME_BUF[total] = 0;
         EXEC_NAME_LEN = total;
 
-        // Build argv: split line on spaces
+        // Build argv: split remaining line on spaces
         let mut spos: usize = 0;
         let mut argc: usize = 0;
 
@@ -3157,8 +3224,8 @@ fn cmd_exec(line: &[u8]) {
         argc += 1;
 
         // Remaining arguments (handles single and double quotes)
-        if prog_end < line.len() {
-            let args = &line[prog_end + 1..];
+        if prog_end < cmd_line.len() {
+            let args = &cmd_line[prog_end + 1..];
             let mut i = 0;
             while i < args.len() && argc < 16 {
                 // Skip whitespace

@@ -23,6 +23,7 @@ const SIGNAL_TRAMPOLINE_OFF: usize = 0x100; // signal trampoline (within .text)
 const SIGRETURN_RESTORER_OFF: usize = 0x110; // rt_sigreturn restorer (within .text)
 const FORK_RESTORE_OFF: usize = 0x120; // fork callee-saved register restore trampoline
 const EXIT_STUB_OFF: usize = 0x130; // exit_group(rdi) stub
+const COW_FORK_RESTORE_OFF: usize = 0x140; // CoW fork child restore: xor eax + pop regs + ret
 const DATA_OFF: usize = 0xE00; // boot_tsc storage
 
 /// Virtual address of the signal trampoline (for SYS_SIGNAL_ENTRY).
@@ -39,6 +40,10 @@ pub const FORK_RESTORE_ADDR: u64 = VDSO_BASE + (TEXT_OFF + FORK_RESTORE_OFF) as 
 /// Exit stub: mov eax, 231 (exit_group); syscall; hlt
 /// RDI = exit code (set via SIG_REDIRECT_TAG regs[1])
 pub const EXIT_STUB_ADDR: u64 = VDSO_BASE + (TEXT_OFF + EXIT_STUB_OFF) as u64;
+
+/// CoW fork child restore trampoline: xor eax,eax + pop callee-saved + ret.
+/// Child returns from fork() with RAX=0.
+pub const COW_FORK_RESTORE_ADDR: u64 = VDSO_BASE + (TEXT_OFF + COW_FORK_RESTORE_OFF) as u64;
 
 // Number of symbols (including STN_UNDEF)
 const NUM_SYMS: usize = 5;
@@ -451,4 +456,29 @@ pub fn forge(page: &mut [u8], boot_tsc: u64) {
     page[e + 5] = 0x0F;  // syscall
     page[e + 6] = 0x05;
     page[e + 7] = 0xF4;  // hlt
+
+    // ---- CoW fork child restore trampoline (at TEXT_OFF + COW_FORK_RESTORE_OFF) ----
+    // Like FORK_RESTORE but zeroes RAX first (child fork returns 0).
+    //   xor eax, eax → 31 C0
+    //   pop rbx      → 5B
+    //   pop rbp      → 5D
+    //   pop r12      → 41 5C
+    //   pop r13      → 41 5D
+    //   pop r14      → 41 5E
+    //   pop r15      → 41 5F
+    //   ret          → C3
+    let c = TEXT_OFF + COW_FORK_RESTORE_OFF;
+    page[c]      = 0x31;  // xor eax, eax
+    page[c + 1]  = 0xC0;
+    page[c + 2]  = 0x5B;  // pop rbx
+    page[c + 3]  = 0x5D;  // pop rbp
+    page[c + 4]  = 0x41;  // pop r12
+    page[c + 5]  = 0x5C;
+    page[c + 6]  = 0x41;  // pop r13
+    page[c + 7]  = 0x5D;
+    page[c + 8]  = 0x41;  // pop r14
+    page[c + 9]  = 0x5E;
+    page[c + 10] = 0x41;  // pop r15
+    page[c + 11] = 0x5F;
+    page[c + 12] = 0xC3;  // ret
 }

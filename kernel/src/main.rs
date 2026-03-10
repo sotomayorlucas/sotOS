@@ -633,8 +633,13 @@ fn load_initrd(cr3: u64) {
 
     let stack_top = allocate_user_stack(&addr_space, 4, "init");
 
+    // Create an AddrSpace cap for init's own AS (for CoW fork cloning).
+    let init_as_cap = cap::insert(cap::CapObject::AddrSpace { cr3 }, cap::Rights::ALL, None)
+        .expect("failed to create init self-AS cap");
+    kdebug!("  init self-AS cap: {} (cr3={:#x})", init_as_cap.raw(), cr3);
+
     // Write BootInfo page at 0xB00000 (read-only for userspace).
-    write_boot_info(cr3, &addr_space, stack_top);
+    write_boot_info(cr3, &addr_space, stack_top, init_as_cap.raw() as u64);
 
     // --- Load "vmm" as a separate process BEFORE spawning init ---
     // VMM must be in the run queue first so it registers for faults
@@ -676,6 +681,7 @@ fn write_boot_info(
     _cr3: u64,
     addr_space: &mm::paging::AddressSpace,
     stack_top: u64,
+    self_as_cap: u64,
 ) {
     use mm::paging::{PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER, PAGE_CACHE_DISABLE, PAGE_WRITE_THROUGH};
     use sotos_common::{BOOT_INFO_ADDR, BOOT_INFO_MAGIC, BootInfo};
@@ -731,6 +737,7 @@ fn write_boot_info(
     }
 
     info.stack_top = stack_top;
+    info.self_as_cap = self_as_cap;
 
     write_bootinfo(phys, &info);
     kdebug!("  bootinfo: {} caps at {:#x}", count, BOOT_INFO_ADDR);

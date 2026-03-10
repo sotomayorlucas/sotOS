@@ -25,6 +25,67 @@ use crate::syscalls::task as syscalls_task;
 
 const MAP_WRITABLE: u64 = 2;
 
+/// Per-pid retry counters to suppress repeated pipe-retry log lines.
+/// Index by pid (0..MAX_PROCS). Incremented when PIPE_RETRY_TAG sent,
+/// cleared when a non-retry syscall is processed for that pid.
+pub(crate) static mut RETRY_COUNT: [u64; 16] = [0; 16];
+
+pub(crate) fn mark_pipe_retry(pid: usize) {
+    if pid < 16 { unsafe { RETRY_COUNT[pid] += 1; } }
+}
+pub(crate) fn clear_pipe_retry(pid: usize) {
+    if pid < 16 { unsafe { RETRY_COUNT[pid] = 0; } }
+}
+
+/// Stack region save buffer for fork — child runs on parent's stack and corrupts
+/// caller frames + envp strings in the setup area above initial RSP.
+/// 32KB covers deep call chains (git clone → transport → start_command → fork).
+const FORK_STACK_SAVE_SIZE: usize = 32768;
+static mut FORK_STACK_BUF: [[u8; FORK_STACK_SAVE_SIZE]; MAX_PROCS] = [[0u8; FORK_STACK_SAVE_SIZE]; MAX_PROCS];
+
+/// Heap (brk region) save buffer for fork — vfork child's malloc/setenv/etc.
+/// modify the parent's brk heap in-place (free-list metadata, environ array).
+/// We save up to 128KB of brk pages and restore after fork-child phase.
+const FORK_HEAP_SAVE_SIZE: usize = 131072;
+static mut FORK_HEAP_BUF: [[u8; FORK_HEAP_SAVE_SIZE]; MAX_PROCS] = [[0u8; FORK_HEAP_SAVE_SIZE]; MAX_PROCS];
+static mut FORK_HEAP_USED: [usize; MAX_PROCS] = [0; MAX_PROCS];
+
+/// Read a u64 from either saved FORK_STACK_BUF or live memory.
+/// When the address falls within the saved [fork_rsp, fork_rsp + SAVE_SIZE) range,
+/// reads from the pre-corruption snapshot in FORK_STACK_BUF.
+#[inline]
+unsafe fn read_u64_saved(addr: u64, fork_rsp: u64, pid: usize) -> u64 {
+    let off = addr.wrapping_sub(fork_rsp) as usize;
+    if off + 8 <= FORK_STACK_SAVE_SIZE {
+        let ptr = FORK_STACK_BUF[pid - 1].as_ptr().add(off) as *const u64;
+        core::ptr::read_unaligned(ptr)
+    } else {
+        *(addr as *const u64)
+    }
+}
+
+/// Copy a null-terminated string from either saved FORK_STACK_BUF or live memory.
+/// String bytes within [fork_rsp, fork_rsp + SAVE_SIZE) come from the saved snapshot.
+#[inline]
+unsafe fn copy_guest_path_saved(guest_ptr: u64, out: &mut [u8], fork_rsp: u64, pid: usize) -> usize {
+    let max = out.len() - 1;
+    let mut i = 0;
+    while i < max {
+        let addr = guest_ptr + i as u64;
+        let off = addr.wrapping_sub(fork_rsp) as usize;
+        let b = if off < FORK_STACK_SAVE_SIZE {
+            FORK_STACK_BUF[pid - 1][off]
+        } else {
+            *(addr as *const u8)
+        };
+        if b == 0 { break; }
+        out[i] = b;
+        i += 1;
+    }
+    out[i] = 0;
+    i
+}
+
 /// Open a virtual file (/etc/*, /proc/*, /sys/*). Returns Some(content_len) or None.
 pub(crate) fn open_virtual_file(name: &[u8], dir_buf: &mut [u8]) -> Option<usize> {
     if starts_with(name, b"/etc/") {
@@ -172,6 +233,7 @@ pub(crate) extern "C" fn child_handler() -> ! {
     let mut ep_cap = CHILD_SETUP_EP.load(Ordering::Acquire);
     let pid = CHILD_SETUP_PID.load(Ordering::Acquire) as usize;
     let clone_flags = CHILD_SETUP_FLAGS.load(Ordering::Acquire);
+    let child_as_cap = CHILD_SETUP_AS_CAP.load(Ordering::Acquire);
     // Signal that we consumed the setup
     CHILD_SETUP_READY.store(0, Ordering::Release);
 
@@ -279,7 +341,7 @@ pub(crate) extern "C" fn child_handler() -> ! {
     macro_rules! make_ctx {
         () => {
             SyscallContext {
-                pid, ep_cap,
+                pid, ep_cap, child_as_cap,
                 current_brk: &mut *current_brk,
                 mmap_next: &mut *mmap_next,
                 my_brk_base, my_mmap_base,
@@ -340,17 +402,59 @@ pub(crate) extern "C" fn child_handler() -> ! {
         let syscall_nr = msg.tag;
         // Phase 5: Syscall shadow logging (record every child syscall)
         syscall_log_record(pid as u16, syscall_nr as u16, msg.regs[0], 0);
-        // TRACE: key syscalls for git debugging (temporary)
-        if pid > 1 {
-            // Only trace important syscalls to reduce noise
-            let trace_nr = syscall_nr;
-            if trace_nr == 83 || trace_nr == 82 || trace_nr == 87
-                || trace_nr == 59 || trace_nr == 56 || trace_nr == 57
-                || trace_nr == 22 || trace_nr == 41 || trace_nr == 42
-                || trace_nr == 231 || trace_nr == 60 {
-                print(b"[P"); print_u64(pid as u64); print(b" S"); print_u64(trace_nr); print(b"]\n");
+        // DIAG: trace ALL syscalls for P3 (git clone), I/O for P4+
+        // Suppress repeated pipe-retry logging to avoid serial flooding
+        let retry_n = if pid < 16 { unsafe { RETRY_COUNT[pid] } } else { 0 };
+        if pid == 3 {
+            if retry_n == 0 {
+                print(b"[P3 S"); print_u64(syscall_nr);
+                print(b" a0="); print_u64(msg.regs[0]);
+                print(b" a1="); print_u64(msg.regs[1]);
+                print(b"]\n");
+            } else if retry_n % 50000 == 0 {
+                print(b"[P3 retry #"); print_u64(retry_n); print(b"]\n");
+            }
+        } else if pid >= 4 {
+            let p_retry = if pid < 16 { unsafe { RETRY_COUNT[pid] } } else { 0 };
+            // Log ALL P5 syscalls to trace its startup & crash
+            if pid == 5 && p_retry == 0 {
+                print(b"[P5 S"); print_u64(syscall_nr);
+                print(b" a0="); print_u64(msg.regs[0]);
+                print(b" a1="); print_u64(msg.regs[1]);
+                print(b"]\n");
+            } else if p_retry == 0 {
+                match syscall_nr {
+                    SYS_READ | SYS_WRITE | SYS_READV | SYS_WRITEV | SYS_CLOSE
+                    | SYS_DUP | SYS_DUP2 | SYS_PIPE | SYS_FCNTL
+                    | SYS_CLONE | SYS_FORK | SYS_VFORK | SYS_EXECVE
+                    | SYS_EXIT | SYS_EXIT_GROUP | SYS_WAIT4
+                    | SYS_POLL | SYS_SELECT | SYS_PSELECT6
+                    | SYS_SOCKET | SYS_CONNECT | SYS_BIND => {
+                        print(b"[P"); print_u64(pid as u64);
+                        print(b" S"); print_u64(syscall_nr);
+                        print(b" a0="); print_u64(msg.regs[0]);
+                        print(b"]\n");
+                    }
+                    _ => {}
+                }
+            }
+        } else if pid > 1 {
+            match syscall_nr {
+                SYS_SOCKET | SYS_CONNECT | SYS_BIND | SYS_POLL
+                | SYS_CLONE | SYS_FORK | SYS_VFORK | SYS_EXECVE
+                | SYS_EXIT | SYS_EXIT_GROUP | SYS_WAIT4 => {
+                    print(b"[P"); print_u64(pid as u64);
+                    print(b" S"); print_u64(syscall_nr);
+                    print(b" a0="); print_u64(msg.regs[0]);
+                    print(b"]\n");
+                }
+                _ => {}
             }
         }
+        // Clear retry state before dispatch. If the handler sends
+        // PIPE_RETRY_TAG it will re-increment via mark_pipe_retry().
+        clear_pipe_retry(pid);
+
         match syscall_nr {
             // SYS_read(fd, buf, len)
             SYS_READ => {
@@ -506,6 +610,11 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 let name = &path[..path_len];
                 let bin_name = if path_len > 5 && starts_with(name, b"/bin/") { &name[5..] } else { name };
 
+                // Serial-only trace to avoid fb_putchar scroll delays
+                for &b in b"EXECVE: " { sys::debug_print(b); }
+                for &b in bin_name { sys::debug_print(b); }
+                sys::debug_print(b'\n');
+
                 let is_shell = bin_name == b"shell" || bin_name == b"sh";
                 if is_shell {
                     let boot_info = unsafe { &*(BOOT_INFO_ADDR as *const BootInfo) };
@@ -572,6 +681,7 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 };
                 match result {
                     Ok((new_ep, _tc)) => {
+                        for &b in b"EXECVE: ok\n" { sys::debug_print(b); }
                         // Record page info for cleanup on exit
                         if pid > 0 && pid <= MAX_PROCS {
                             use crate::exec::{LAST_EXEC_STACK_BASE, LAST_EXEC_STACK_PAGES,
@@ -586,7 +696,10 @@ pub(crate) extern "C" fn child_handler() -> ! {
                         ep_cap = new_ep;
                         continue;
                     }
-                    Err(errno) => { EXEC_LOCK.store(0, Ordering::Release); reply_val(ep_cap, errno); continue; }
+                    Err(errno) => {
+                        for &b in b"EXECVE: fail\n" { sys::debug_print(b); }
+                        EXEC_LOCK.store(0, Ordering::Release); reply_val(ep_cap, errno); continue;
+                    }
                 }
             }
 
@@ -619,310 +732,121 @@ pub(crate) extern "C" fn child_handler() -> ! {
 
                 // Fork-style clone: no CLONE_VM means fork, not thread creation.
                 // musl's fork() calls clone(SIGCHLD, 0, ...).
-                // Route to vfork emulation (same as SYS_FORK).
+                // Real CoW fork via addr_space_clone (same as SYS_FORK).
                 if flags & CLONE_VM == 0 {
-                    // Fall through to the SYS_FORK handler below
+                    // CoW fork via clone(SIGCHLD, 0) — same as SYS_FORK
                     let fork_cpid = NEXT_PID.fetch_add(1, Ordering::SeqCst) as usize;
                     if fork_cpid > MAX_PROCS {
                         reply_val(ep_cap, -ENOMEM);
                         continue;
                     }
 
-                    // Save parent's register state for later restore
+                    let self_as_cap = INIT_SELF_AS_CAP.load(Ordering::Acquire);
+                    if self_as_cap == 0 {
+                        reply_val(ep_cap, -ENOSYS);
+                        continue;
+                    }
+
                     let parent_tid = msg.regs[6];
                     let fork_rsp = msg.regs[7];
                     let mut saved_regs = [0u64; 18];
                     let _ = sys::get_thread_regs(parent_tid, &mut saved_regs);
-                    let fork_rip = saved_regs[2]; // RCX = user RIP after SYSCALL
+                    let fork_rip = saved_regs[2];
                     let fork_rbx = saved_regs[1];
                     let fork_rbp = saved_regs[6];
                     let fork_r12 = saved_regs[11];
                     let fork_r13 = saved_regs[12];
                     let fork_r14 = saved_regs[13];
                     let fork_r15 = saved_regs[14];
+                    let fork_fsbase = saved_regs[16];
 
-                    // Save parent's FD + socket state
-                    let fork_saved_fds = *child_fds;
-                    let fork_saved_vfs = *vfs_files;
-                    let fork_saved_initrd = *initrd_files;
-                    let fork_saved_sock_conn = sock_conn_id;
-                    let fork_saved_sock_lp = sock_udp_local_port;
-                    let fork_saved_sock_rip = sock_udp_remote_ip;
-                    let fork_saved_sock_rport = sock_udp_remote_port;
+                    let frame_rsp = fork_rsp - 56;
+                    unsafe {
+                        *((frame_rsp) as *mut u64) = fork_rbx;
+                        *((frame_rsp + 8) as *mut u64) = fork_rbp;
+                        *((frame_rsp + 16) as *mut u64) = fork_r12;
+                        *((frame_rsp + 24) as *mut u64) = fork_r13;
+                        *((frame_rsp + 32) as *mut u64) = fork_r14;
+                        *((frame_rsp + 40) as *mut u64) = fork_r15;
+                        *((frame_rsp + 48) as *mut u64) = fork_rip;
+                    }
 
-                    // Process state for fork child
+                    let child_as_cap = match sys::addr_space_clone(self_as_cap) {
+                        Ok(cap) => cap,
+                        Err(_) => { reply_val(ep_cap, -ENOMEM); continue; }
+                    };
+
+                    let child_ep = match sys::endpoint_create() {
+                        Ok(e) => e,
+                        Err(_) => { reply_val(ep_cap, -ENOMEM); continue; }
+                    };
+
+                    let child_thread = match sys::thread_create_in(
+                        child_as_cap, vdso::COW_FORK_RESTORE_ADDR, frame_rsp, child_ep,
+                    ) {
+                        Ok(t) => t,
+                        Err(_) => { reply_val(ep_cap, -ENOMEM); continue; }
+                    };
+
+                    if fork_fsbase != 0 {
+                        let _ = sys::set_thread_fs_base(child_thread, fork_fsbase);
+                    }
+                    let _ = sys::signal_entry(child_thread, vdso::SIGNAL_TRAMPOLINE_ADDR);
+
                     let cidx = fork_cpid - 1;
                     PROC_PARENT[cidx].store(pid as u64, Ordering::Release);
-                    PROC_STATE[cidx].store(0, Ordering::Release);
-                    PROC_EXIT[cidx].store(0, Ordering::Release);
-                    PROC_KERNEL_TID[cidx].store(parent_tid, Ordering::Release);
+                    proc_group_init(fork_cpid);
 
-                    print(b"FORK: clone-fork cpid=");
-                    print_u64(fork_cpid as u64);
-                    print(b" flags=0x");
-                    print_u64(flags);
-                    print(b"\n");
+                    unsafe {
+                        GRP_FDS[cidx] = *child_fds;
+                        GRP_VFS[cidx] = *vfs_files;
+                        GRP_INITRD[cidx] = *initrd_files;
+                        GRP_CWD[cidx] = *cwd;
+                    }
 
-                    // Reply 0 to "child" (parent thread now acts as child)
-                    reply_val(ep_cap, 0);
+                    for cfd in 0..GRP_MAX_FDS {
+                        let k = child_fds[cfd];
+                        let p = sock_conn_id[cfd] as usize;
+                        if k == 11 && p < MAX_PIPES { PIPE_WRITE_REFS[p].fetch_add(1, Ordering::AcqRel); }
+                        else if k == 10 && p < MAX_PIPES { PIPE_READ_REFS[p].fetch_add(1, Ordering::AcqRel); }
+                    }
 
-                    // Enter fork-child syscall loop
-                    let mut fork_child_exit: u64 = 0;
-                    let mut fork_child_did_exec = false;
-                    let mut fork_exec_ep: u64 = 0;
-                    'clone_fork_child: loop {
-                        let cmsg = match sys::call(ep_cap, &sotos_common::IpcMsg::empty()) {
-                            Ok(m) => m,
-                            Err(_) => { fork_child_exit = 127; break 'clone_fork_child; }
-                        };
-                        let csys = cmsg.tag;
-                        match csys {
-                            SYS_CLOSE => {
-                                let cfd = cmsg.regs[0] as usize;
-                                if cfd < CHILD_MAX_FDS && child_fds[cfd] != 0 {
-                                    child_fds[cfd] = 0;
-                                    reply_val(ep_cap, 0);
-                                } else {
-                                    reply_val(ep_cap, -EBADF);
-                                }
-                            }
-                            SYS_DUP2 | 292 => { // dup2(33) / dup3(292)
-                                let old = cmsg.regs[0] as usize;
-                                let new = cmsg.regs[1] as usize;
-                                if old >= CHILD_MAX_FDS || new >= CHILD_MAX_FDS || child_fds[old] == 0 {
-                                    reply_val(ep_cap, -EBADF);
-                                } else {
-                                    child_fds[new] = child_fds[old];
-                                    // Copy VFS/initrd tracking
-                                    vfs_files[new] = vfs_files[old];
-                                    initrd_files[new] = initrd_files[old];
-                                    // Copy socket metadata
-                                    sock_conn_id[new] = sock_conn_id[old];
-                                    sock_udp_local_port[new] = sock_udp_local_port[old];
-                                    sock_udp_remote_ip[new] = sock_udp_remote_ip[old];
-                                    sock_udp_remote_port[new] = sock_udp_remote_port[old];
-                                    reply_val(ep_cap, new as i64);
-                                }
-                            }
-                            SYS_FCNTL => {
-                                let cfd = cmsg.regs[0] as usize;
-                                let cmd = cmsg.regs[1];
-                                match cmd {
-                                    0 | 1030 => { // F_DUPFD / F_DUPFD_CLOEXEC
-                                        let from = cmsg.regs[2] as usize;
-                                        let mut nfd = CHILD_MAX_FDS;
-                                        for i in from..CHILD_MAX_FDS {
-                                            if child_fds[i] == 0 { nfd = i; break; }
-                                        }
-                                        if nfd < CHILD_MAX_FDS && cfd < CHILD_MAX_FDS && child_fds[cfd] != 0 {
-                                            child_fds[nfd] = child_fds[cfd];
-                                            reply_val(ep_cap, nfd as i64);
-                                        } else {
-                                            reply_val(ep_cap, -EBADF);
-                                        }
-                                    }
-                                    1 => reply_val(ep_cap, 0), // F_GETFD
-                                    2 => reply_val(ep_cap, 0), // F_SETFD
-                                    3 => reply_val(ep_cap, 0), // F_GETFL
-                                    4 => reply_val(ep_cap, 0), // F_SETFL
-                                    _ => reply_val(ep_cap, 0),
-                                }
-                            }
-                            SYS_RT_SIGACTION => reply_val(ep_cap, 0),
-                            SYS_RT_SIGPROCMASK => reply_val(ep_cap, 0),
-                            324 => reply_val(ep_cap, 0), // membarrier
-                            SYS_GETPID => reply_val(ep_cap, fork_cpid as i64),
-                            SYS_GETPPID => reply_val(ep_cap, pid as i64),
-                            SYS_WRITE => {
-                                let wfd = cmsg.regs[0] as usize;
-                                let wbuf = cmsg.regs[1];
-                                let wlen = cmsg.regs[2] as usize;
-                                if wfd < CHILD_MAX_FDS && child_fds[wfd] == 2 {
-                                    let wn = wlen.min(512);
-                                    for i in 0..wn {
-                                        let ch = unsafe { *((wbuf + i as u64) as *const u8) };
-                                        unsafe { fb_putchar(ch); }
-                                    }
-                                    reply_val(ep_cap, wn as i64);
-                                } else {
-                                    reply_val(ep_cap, wlen as i64);
-                                }
-                            }
-                            SYS_EXECVE => {
-                                print(b"FC-EXECVE-HIT-CLONE\n");
-                                let path_ptr = cmsg.regs[0];
-                                let argv_ptr = cmsg.regs[1];
-                                let envp_ptr = cmsg.regs[2];
+                    unsafe {
+                        FORK_SOCK_CONN = sock_conn_id;
+                        FORK_SOCK_UDP_LPORT = sock_udp_local_port;
+                        FORK_SOCK_UDP_RIP = sock_udp_remote_ip;
+                        FORK_SOCK_UDP_RPORT = sock_udp_remote_port;
+                    }
 
-                                let mut name = [0u8; 256];
-                                copy_guest_path(path_ptr, &mut name);
-                                let path_len = name.iter().position(|&b| b == 0).unwrap_or(256);
-                                let name = &name[..path_len];
-
-                                // Parse argv
-                                let mut exec_argv = [[0u8; MAX_EXEC_ARG_LEN]; MAX_EXEC_ARGS];
-                                let mut exec_argc: usize = 0;
-                                if argv_ptr != 0 {
-                                    let mut ap = argv_ptr;
-                                    while exec_argc < MAX_EXEC_ARGS {
-                                        let str_ptr = unsafe { *(ap as *const u64) };
-                                        if str_ptr == 0 { break; }
-                                        copy_guest_path(str_ptr, &mut exec_argv[exec_argc]);
-                                        exec_argc += 1;
-                                        ap += 8;
-                                    }
-                                }
-
-                                // Parse envp
-                                let mut exec_envp = [[0u8; MAX_EXEC_ARG_LEN]; MAX_EXEC_ENVS];
-                                let mut exec_envc: usize = 0;
-                                if envp_ptr != 0 {
-                                    let mut ep2 = envp_ptr;
-                                    while exec_envc < MAX_EXEC_ENVS {
-                                        let str_ptr = unsafe { *(ep2 as *const u64) };
-                                        if str_ptr == 0 { break; }
-                                        copy_guest_path(str_ptr, &mut exec_envp[exec_envc]);
-                                        exec_envc += 1;
-                                        ep2 += 8;
-                                    }
-                                }
-
-                                print(b"FORK-EXEC: ");
-                                print(name);
-                                print(b"\n");
-
-                                // Set up child process state BEFORE spawning
-                                proc_group_init(fork_cpid);
-
-                                // Copy current FD state (post close/dup2) to child's FD group
-                                unsafe {
-                                    GRP_FDS[cidx] = *child_fds;
-                                    GRP_VFS[cidx] = *vfs_files;
-                                    GRP_INITRD[cidx] = *initrd_files;
-                                    GRP_CWD[cidx] = *cwd;
-                                }
-
-                                // Copy socket state for child handler
-                                unsafe {
-                                    FORK_SOCK_CONN = sock_conn_id;
-                                    FORK_SOCK_UDP_LPORT = sock_udp_local_port;
-                                    FORK_SOCK_UDP_RIP = sock_udp_remote_ip;
-                                    FORK_SOCK_UDP_RPORT = sock_udp_remote_port;
-                                }
-
-                                // Now restore parent's original FD state
-                                *child_fds = fork_saved_fds;
-                                *vfs_files = fork_saved_vfs;
-                                *initrd_files = fork_saved_initrd;
-                                sock_conn_id = fork_saved_sock_conn;
-                                sock_udp_local_port = fork_saved_sock_lp;
-                                sock_udp_remote_ip = fork_saved_sock_rip;
-                                sock_udp_remote_port = fork_saved_sock_rport;
-
-                                // Spawn the binary as a real process
-                                while EXEC_LOCK.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed).is_err() { sys::yield_now(); }
-                                let bin_name = if path_len > 5 && starts_with(name, b"/bin/") { &name[5..] }
-                                          else if path_len > 9 && starts_with(name, b"/usr/bin/") { &name[9..] }
-                                          else { name };
-                                let envp_slice = &exec_envp[..exec_envc];
-                                let result = exec_from_initrd_argv(bin_name, &exec_argv[..exec_argc], envp_slice)
-                                    .or_else(|_| crate::exec::exec_from_vfs_argv(name, &exec_argv[..exec_argc], envp_slice));
-
-                                match result {
-                                    Ok((new_ep, new_thread)) => {
-                                        use crate::exec::{LAST_EXEC_STACK_BASE, LAST_EXEC_STACK_PAGES,
-                                                          LAST_EXEC_ELF_LO, LAST_EXEC_ELF_HI, LAST_EXEC_HAS_INTERP};
-                                        PROC_STACK_BASE[cidx].store(LAST_EXEC_STACK_BASE.load(Ordering::Acquire), Ordering::Release);
-                                        PROC_STACK_PAGES[cidx].store(LAST_EXEC_STACK_PAGES.load(Ordering::Acquire), Ordering::Release);
-                                        PROC_ELF_LO[cidx].store(LAST_EXEC_ELF_LO.load(Ordering::Acquire), Ordering::Release);
-                                        PROC_ELF_HI[cidx].store(LAST_EXEC_ELF_HI.load(Ordering::Acquire), Ordering::Release);
-                                        PROC_HAS_INTERP[cidx].store(LAST_EXEC_HAS_INTERP.load(Ordering::Acquire), Ordering::Release);
-                                        EXEC_LOCK.store(0, Ordering::Release);
-
-                                        // Create child handler thread
-                                        let handler_stack_base = NEXT_CHILD_STACK.fetch_add(0x8000, Ordering::SeqCst);
-                                        for hp in 0..8u64 {
-                                            if let Ok(f) = sys::frame_alloc() {
-                                                let _ = sys::map(handler_stack_base + hp * 0x1000, f, MAP_WRITABLE);
-                                            }
-                                        }
-
-                                        while CHILD_SETUP_READY.load(Ordering::Acquire) != 0 { sys::yield_now(); }
-                                        CHILD_SETUP_EP.store(new_ep, Ordering::Release);
-                                        CHILD_SETUP_PID.store(fork_cpid as u64, Ordering::Release);
-                                        CHILD_SETUP_FLAGS.store(0, Ordering::Release);
-                                        FORK_SOCK_READY.store(1, Ordering::Release);
-                                        CHILD_SETUP_READY.store(1, Ordering::Release);
-
-                                        let _ = sys::thread_create(
-                                            child_handler as *const () as u64,
-                                            handler_stack_base + 0x8000,
-                                        );
-
-                                        while CHILD_SETUP_READY.load(Ordering::Acquire) != 0 { sys::yield_now(); }
-
-                                        PROC_STATE[cidx].store(1, Ordering::Release);
-                                        fork_child_did_exec = true;
-                                        fork_exec_ep = new_ep;
-                                    }
-                                    Err(errno) => {
-                                        EXEC_LOCK.store(0, Ordering::Release);
-                                        print(b"FORK-EXEC: failed errno=");
-                                        print_u64((-errno) as u64);
-                                        print(b"\n");
-                                        // Restore parent's FD state since exec failed
-                                        *child_fds = fork_saved_fds;
-                                        *vfs_files = fork_saved_vfs;
-                                        *initrd_files = fork_saved_initrd;
-                                        sock_conn_id = fork_saved_sock_conn;
-                                        sock_udp_local_port = fork_saved_sock_lp;
-                                        sock_udp_remote_ip = fork_saved_sock_rip;
-                                        sock_udp_remote_port = fork_saved_sock_rport;
-                                        // Return error to child — it will print error + exit
-                                        reply_val(ep_cap, errno);
-                                        // Don't break — let child write error msg + call exit
-                                    }
-                                }
-                                if fork_child_did_exec { break 'clone_fork_child; }
-                            }
-                            SYS_EXIT | SYS_EXIT_GROUP => {
-                                fork_child_exit = cmsg.regs[0];
-                                break 'clone_fork_child;
-                            }
-                            _ => {
-                                print(b"FORK-CHILD: unhandled syscall ");
-                                print_u64(csys);
-                                print(b"\n");
-                                reply_val(ep_cap, 0);
-                            }
+                    let handler_stack_base = NEXT_CHILD_STACK.fetch_add(0x20000, Ordering::SeqCst);
+                    for hp in 0..32u64 {
+                        if let Ok(f) = sys::frame_alloc() {
+                            let _ = sys::map(handler_stack_base + hp * 0x1000, f, MAP_WRITABLE);
                         }
                     }
 
-                    // Fork child loop done — restore parent
-                    if !fork_child_did_exec {
-                        PROC_STATE[cidx].store(2, Ordering::Release);
-                        PROC_EXIT[cidx].store(fork_child_exit, Ordering::Release);
-                    }
+                    while CHILD_SETUP_READY.load(Ordering::Acquire) != 0 { sys::yield_now(); }
+                    CHILD_SETUP_EP.store(child_ep, Ordering::Release);
+                    CHILD_SETUP_PID.store(fork_cpid as u64, Ordering::Release);
+                    CHILD_SETUP_FLAGS.store(0, Ordering::Release);
+                    CHILD_SETUP_AS_CAP.store(0, Ordering::Release);
+                    FORK_SOCK_READY.store(1, Ordering::Release);
+                    CHILD_SETUP_READY.store(1, Ordering::Release);
 
-                    // Build restore frame on parent's stack
-                    let restore_rsp = fork_rsp - 56; // 7 qwords: rbx, rbp, r12-r15, rip
-                    unsafe {
-                        core::ptr::write_volatile((restore_rsp) as *mut u64, fork_rbx);
-                        core::ptr::write_volatile((restore_rsp + 8) as *mut u64, fork_rbp);
-                        core::ptr::write_volatile((restore_rsp + 16) as *mut u64, fork_r12);
-                        core::ptr::write_volatile((restore_rsp + 24) as *mut u64, fork_r13);
-                        core::ptr::write_volatile((restore_rsp + 32) as *mut u64, fork_r14);
-                        core::ptr::write_volatile((restore_rsp + 40) as *mut u64, fork_r15);
-                        core::ptr::write_volatile((restore_rsp + 48) as *mut u64, fork_rip);
-                    }
+                    let _ = sys::thread_create(
+                        child_handler as *const () as u64,
+                        handler_stack_base + 0x20000,
+                    );
 
-                    // Redirect parent back via SIG_REDIRECT_TAG
-                    let mut rmsg = sotos_common::IpcMsg::empty();
-                    rmsg.tag = sotos_common::SIG_REDIRECT_TAG;
-                    rmsg.regs[0] = vdso::FORK_RESTORE_ADDR;
-                    rmsg.regs[4] = restore_rsp;
-                    rmsg.regs[5] = fork_cpid as u64; // RAX = child pid
-                    let _ = sys::send(ep_cap, &rmsg);
+                    while CHILD_SETUP_READY.load(Ordering::Acquire) != 0 { sys::yield_now(); }
+
+                    PROC_STATE[cidx].store(1, Ordering::Release);
+
+                    print(b"COW-CLONE-FORK: cpid=");
+                    print_u64(fork_cpid as u64);
+                    print(b"\n");
+
+                    reply_val(ep_cap, fork_cpid as i64);
                     continue;
                 }
 
@@ -970,10 +894,10 @@ pub(crate) extern "C" fn child_handler() -> ! {
                     core::ptr::write_volatile((child_sp + 16) as *mut u64, tls);      // [rsp+16] → tls
                 }
 
-                // Allocate handler stack (4 pages)
-                let handler_stack_base = NEXT_CHILD_STACK.fetch_add(0x8000, Ordering::SeqCst);
+                // Allocate handler stack (32 pages = 128KB)
+                let handler_stack_base = NEXT_CHILD_STACK.fetch_add(0x20000, Ordering::SeqCst);
                 let mut hok = true;
-                for hp in 0..8u64 {
+                for hp in 0..32u64 {
                     let hf = match sys::frame_alloc() {
                         Ok(f) => f,
                         Err(_) => { hok = false; break; }
@@ -998,12 +922,13 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 CHILD_SETUP_EP.store(child_ep, Ordering::Release);
                 CHILD_SETUP_PID.store(child_pid as u64, Ordering::Release);
                 CHILD_SETUP_FLAGS.store(flags, Ordering::Release);
+                CHILD_SETUP_AS_CAP.store(0, Ordering::Release);
                 CHILD_SETUP_READY.store(1, Ordering::Release);
 
                 // Spawn child handler thread
                 if sys::thread_create(
                     child_handler as *const () as u64,
-                    handler_stack_base + 0x8000,
+                    handler_stack_base + 0x20000,
                 ).is_err() {
                     CHILD_SETUP_READY.store(0, Ordering::Release);
                     reply_val(ep_cap, -ENOMEM);
@@ -1033,21 +958,36 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 reply_val(ep_cap, child_pid as i64);
             }
 
-            // SYS_fork(57) / SYS_vfork(58) — vfork emulation
-            // Parent thread becomes "child" (returns 0), executes child code path.
-            // On exec: spawn real process, restore parent with child_pid.
+            // SYS_fork(57) / SYS_vfork(58) — real CoW fork via addr_space_clone
+            // 1. Clone AS (all pages CoW)
+            // 2. Build restore frame below fork_rsp (before clone, so child has it)
+            // 3. Create child thread in cloned AS at COW_FORK_RESTORE trampoline
+            // 4. Reply to parent with child_pid
             SYS_FORK | SYS_VFORK => {
+                print(b"FORK: step1 pid="); print_u64(pid as u64); print(b"\n");
                 let fork_cpid = NEXT_PID.fetch_add(1, Ordering::SeqCst) as usize;
                 if fork_cpid > MAX_PROCS {
                     reply_val(ep_cap, -ENOMEM);
                     continue;
                 }
 
-                // Save parent's register state for later restore
+                let self_as_cap = INIT_SELF_AS_CAP.load(Ordering::Acquire);
+                if self_as_cap == 0 {
+                    print(b"FORK: no self_as_cap!\n");
+                    reply_val(ep_cap, -ENOSYS);
+                    continue;
+                }
+
+                // Get parent's register state
                 let parent_tid = msg.regs[6];
                 let fork_rsp = msg.regs[7];
+                print(b"FORK: tid="); print_u64(parent_tid);
+                print(b" rsp="); print_u64(fork_rsp); print(b"\n");
                 let mut saved_regs = [0u64; 18];
-                let _ = sys::get_thread_regs(parent_tid, &mut saved_regs);
+                match sys::get_thread_regs(parent_tid, &mut saved_regs) {
+                    Ok(()) => print(b"FORK: get_regs ok\n"),
+                    Err(e) => { print(b"FORK: get_regs err="); print_u64((-e) as u64); print(b"\n"); }
+                }
                 let fork_rip = saved_regs[2];   // RCX = user RIP after SYSCALL
                 let fork_rbx = saved_regs[1];
                 let fork_rbp = saved_regs[6];
@@ -1055,358 +995,152 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 let fork_r13 = saved_regs[12];
                 let fork_r14 = saved_regs[13];
                 let fork_r15 = saved_regs[14];
+                let fork_fsbase = saved_regs[16];
+                print(b"FORK: rip="); print_u64(fork_rip);
+                print(b" rbp="); print_u64(fork_rbp); print(b"\n");
 
-                // Save parent's FD + socket state (child's close/dup2 will modify these)
-                let fork_saved_fds: [u8; GRP_MAX_FDS] = *child_fds;
-                let fork_saved_vfs: [[u64; 4]; GRP_MAX_VFS] = *vfs_files;
-                let fork_saved_initrd: [[u64; 4]; GRP_MAX_INITRD] = *initrd_files;
-                let fork_saved_sock_conn: [u32; GRP_MAX_FDS] = sock_conn_id;
-                let fork_saved_sock_lp: [u16; GRP_MAX_FDS] = sock_udp_local_port;
-                let fork_saved_sock_rip: [u32; GRP_MAX_FDS] = sock_udp_remote_ip;
-                let fork_saved_sock_rport: [u16; GRP_MAX_FDS] = sock_udp_remote_port;
-
-                print(b"FORK: pid=");
-                print_u64(pid as u64);
-                print(b" child=");
-                print_u64(fork_cpid as u64);
-                print(b"\n");
-
-                // Reply with 0 (child return value) — parent thread now executes child path
-                reply_val(ep_cap, 0);
-
-                // Process child's syscalls until exec or exit
-                let mut fork_child_exit: u64 = 0;
-                let mut fork_child_did_exec = false;
-                let mut fork_exec_ep: u64 = 0;
-
-                'fork_child: loop {
-                    let cmsg = match sys::recv_timeout(ep_cap, 500) {
-                        Ok(m) => m,
-                        Err(_) => { print(b"FORK-TIMEOUT\n"); fork_child_exit = 127; break 'fork_child; }
-                    };
-
-                    let kernel_tid_c = cmsg.regs[6];
-                    if kernel_tid_c != 0 {
-                        PROC_KERNEL_TID[pid - 1].store(kernel_tid_c, Ordering::Release);
-                    }
-
-                    let nr = cmsg.tag;
-                    // Hard check: is SYS_EXIT actually 60?
-                    if nr == 60 || nr == 231 || nr == 59 {
-                        print(b"FC-KEY: nr="); print_u64(nr);
-                        print(b" SYS_EXIT="); print_u64(SYS_EXIT);
-                        print(b" SYS_EXIT_GROUP="); print_u64(SYS_EXIT_GROUP);
-                        print(b" SYS_EXECVE="); print_u64(SYS_EXECVE);
-                        print(b"\n");
-                    }
-                    match nr {
-                        SYS_CLOSE => {
-                            let cfd = cmsg.regs[0] as usize;
-                            if cfd < CHILD_MAX_FDS && child_fds[cfd] != 0 {
-                                child_fds[cfd] = 0;
-                                sock_conn_id[cfd] = 0xFFFF;
-                                reply_val(ep_cap, 0);
-                            } else {
-                                reply_val(ep_cap, -EBADF);
-                            }
-                        }
-                        SYS_DUP2 => {
-                            let ofd = cmsg.regs[0] as usize;
-                            let nfd = cmsg.regs[1] as usize;
-                            if ofd < CHILD_MAX_FDS && child_fds[ofd] != 0 && nfd < CHILD_MAX_FDS {
-                                child_fds[nfd] = child_fds[ofd];
-                                sock_conn_id[nfd] = sock_conn_id[ofd];
-                                sock_udp_local_port[nfd] = sock_udp_local_port[ofd];
-                                sock_udp_remote_ip[nfd] = sock_udp_remote_ip[ofd];
-                                sock_udp_remote_port[nfd] = sock_udp_remote_port[ofd];
-                                // Also copy VFS tracking
-                                for s in 0..MAX_VFS_FILES {
-                                    if vfs_files[s][3] == ofd as u64 && vfs_files[s][0] != 0 {
-                                        // Find free VFS slot for the new fd
-                                        for t in 0..MAX_VFS_FILES {
-                                            if vfs_files[t][0] == 0 || vfs_files[t][3] == nfd as u64 {
-                                                vfs_files[t] = [vfs_files[s][0], vfs_files[s][1], vfs_files[s][2], nfd as u64];
-                                                break;
-                                            }
-                                        }
-                                        break;
-                                    }
-                                }
-                                reply_val(ep_cap, nfd as i64);
-                            } else {
-                                reply_val(ep_cap, -EBADF);
-                            }
-                        }
-                        SYS_DUP3 => {
-                            let ofd = cmsg.regs[0] as usize;
-                            let nfd = cmsg.regs[1] as usize;
-                            if ofd < CHILD_MAX_FDS && child_fds[ofd] != 0 && nfd < CHILD_MAX_FDS {
-                                child_fds[nfd] = child_fds[ofd];
-                                sock_conn_id[nfd] = sock_conn_id[ofd];
-                                sock_udp_local_port[nfd] = sock_udp_local_port[ofd];
-                                sock_udp_remote_ip[nfd] = sock_udp_remote_ip[ofd];
-                                sock_udp_remote_port[nfd] = sock_udp_remote_port[ofd];
-                                reply_val(ep_cap, nfd as i64);
-                            } else {
-                                reply_val(ep_cap, -EBADF);
-                            }
-                        }
-                        SYS_FCNTL => {
-                            let ffd = cmsg.regs[0] as usize;
-                            let cmd = cmsg.regs[1] as u32;
-                            if ffd >= CHILD_MAX_FDS || child_fds[ffd] == 0 {
-                                reply_val(ep_cap, -EBADF);
-                            } else {
-                                match cmd {
-                                    0 | 1030 => { // F_DUPFD, F_DUPFD_CLOEXEC
-                                        let min = cmsg.regs[2] as usize;
-                                        let mut nfd = None;
-                                        for i in min..CHILD_MAX_FDS {
-                                            if child_fds[i] == 0 { nfd = Some(i); break; }
-                                        }
-                                        if let Some(n) = nfd {
-                                            child_fds[n] = child_fds[ffd];
-                                            sock_conn_id[n] = sock_conn_id[ffd];
-                                            reply_val(ep_cap, n as i64);
-                                        } else {
-                                            reply_val(ep_cap, -EMFILE);
-                                        }
-                                    }
-                                    1 | 3 => reply_val(ep_cap, 0), // F_GETFD, F_GETFL
-                                    2 | 4 => reply_val(ep_cap, 0), // F_SETFD, F_SETFL
-                                    _ => reply_val(ep_cap, 0),
-                                }
-                            }
-                        }
-                        SYS_RT_SIGACTION => reply_val(ep_cap, 0),
-                        SYS_RT_SIGPROCMASK => reply_val(ep_cap, 0),
-                        SYS_GETPID => {
-                            // In child path, getpid should return fork_cpid
-                            reply_val(ep_cap, fork_cpid as i64);
-                        }
-                        SYS_GETPPID => reply_val(ep_cap, pid as i64),
-                        SYS_SET_TID_ADDRESS => reply_val(ep_cap, fork_cpid as i64),
-                        324 => reply_val(ep_cap, 0), // membarrier
-                        SYS_EXECVE => {
-                            print(b"FC-EXECVE-HIT\n");
-                            // Child called exec — spawn real process
-                            let path_ptr = cmsg.regs[0];
-                            let argv_ptr = cmsg.regs[1];
-                            let envp_ptr = cmsg.regs[2];
-                            let mut path = [0u8; 128];
-                            let path_len = copy_guest_path(path_ptr, &mut path);
-                            let name = &path[..path_len];
-
-                            // Read argv
-                            let mut exec_argv = [[0u8; MAX_EXEC_ARG_LEN]; MAX_EXEC_ARGS];
-                            let mut exec_argc: usize = 0;
-                            if argv_ptr != 0 {
-                                let mut ap = argv_ptr;
-                                while exec_argc < MAX_EXEC_ARGS {
-                                    let str_ptr = unsafe { *(ap as *const u64) };
-                                    if str_ptr == 0 { break; }
-                                    copy_guest_path(str_ptr, &mut exec_argv[exec_argc]);
-                                    exec_argc += 1;
-                                    ap += 8;
-                                }
-                            }
-
-                            // Read envp
-                            let mut exec_envp = [[0u8; MAX_EXEC_ARG_LEN]; MAX_EXEC_ENVS];
-                            let mut exec_envc: usize = 0;
-                            if envp_ptr != 0 {
-                                let mut ep2 = envp_ptr;
-                                while exec_envc < MAX_EXEC_ENVS {
-                                    let str_ptr = unsafe { *(ep2 as *const u64) };
-                                    if str_ptr == 0 { break; }
-                                    copy_guest_path(str_ptr, &mut exec_envp[exec_envc]);
-                                    exec_envc += 1;
-                                    ep2 += 8;
-                                }
-                            }
-
-                            print(b"FORK-EXEC: ");
-                            print(name);
-                            print(b"\n");
-
-                            // Set up child process state BEFORE spawning
-                            let cidx = fork_cpid - 1;
-                            PROC_PARENT[cidx].store(pid as u64, Ordering::Release);
-                            proc_group_init(fork_cpid);
-
-                            // Copy current FD state (post close/dup2) to child's FD group
-                            unsafe {
-                                GRP_FDS[cidx] = *child_fds;
-                                GRP_VFS[cidx] = *vfs_files;
-                                GRP_INITRD[cidx] = *initrd_files;
-                                GRP_CWD[cidx] = *cwd;
-                            }
-
-                            // Copy socket state for child handler
-                            unsafe {
-                                FORK_SOCK_CONN = sock_conn_id;
-                                FORK_SOCK_UDP_LPORT = sock_udp_local_port;
-                                FORK_SOCK_UDP_RIP = sock_udp_remote_ip;
-                                FORK_SOCK_UDP_RPORT = sock_udp_remote_port;
-                            }
-
-                            // Now restore parent's original FD state
-                            *child_fds = fork_saved_fds;
-                            *vfs_files = fork_saved_vfs;
-                            *initrd_files = fork_saved_initrd;
-                            sock_conn_id = fork_saved_sock_conn;
-                            sock_udp_local_port = fork_saved_sock_lp;
-                            sock_udp_remote_ip = fork_saved_sock_rip;
-                            sock_udp_remote_port = fork_saved_sock_rport;
-
-                            // Spawn the binary as a real process
-                            while EXEC_LOCK.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed).is_err() { sys::yield_now(); }
-                            let bin_name = if path_len > 5 && starts_with(name, b"/bin/") { &name[5..] }
-                                      else if path_len > 9 && starts_with(name, b"/usr/bin/") { &name[9..] }
-                                      else { name };
-                            let envp_slice = &exec_envp[..exec_envc];
-                            let result = exec_from_initrd_argv(bin_name, &exec_argv[..exec_argc], envp_slice)
-                                .or_else(|_| crate::exec::exec_from_vfs_argv(name, &exec_argv[..exec_argc], envp_slice));
-
-                            match result {
-                                Ok((new_ep, new_thread)) => {
-                                    // Record child process page info
-                                    use crate::exec::{LAST_EXEC_STACK_BASE, LAST_EXEC_STACK_PAGES,
-                                                      LAST_EXEC_ELF_LO, LAST_EXEC_ELF_HI, LAST_EXEC_HAS_INTERP};
-                                    PROC_STACK_BASE[cidx].store(LAST_EXEC_STACK_BASE.load(Ordering::Acquire), Ordering::Release);
-                                    PROC_STACK_PAGES[cidx].store(LAST_EXEC_STACK_PAGES.load(Ordering::Acquire), Ordering::Release);
-                                    PROC_ELF_LO[cidx].store(LAST_EXEC_ELF_LO.load(Ordering::Acquire), Ordering::Release);
-                                    PROC_ELF_HI[cidx].store(LAST_EXEC_ELF_HI.load(Ordering::Acquire), Ordering::Release);
-                                    PROC_HAS_INTERP[cidx].store(LAST_EXEC_HAS_INTERP.load(Ordering::Acquire), Ordering::Release);
-                                    EXEC_LOCK.store(0, Ordering::Release);
-
-                                    // Create child handler thread for the spawned process
-                                    let handler_stack_base = NEXT_CHILD_STACK.fetch_add(0x8000, Ordering::SeqCst);
-                                    for hp in 0..8u64 {
-                                        if let Ok(f) = sys::frame_alloc() {
-                                            let _ = sys::map(handler_stack_base + hp * 0x1000, f, MAP_WRITABLE);
-                                        }
-                                    }
-
-                                    while CHILD_SETUP_READY.load(Ordering::Acquire) != 0 { sys::yield_now(); }
-                                    CHILD_SETUP_EP.store(new_ep, Ordering::Release);
-                                    CHILD_SETUP_PID.store(fork_cpid as u64, Ordering::Release);
-                                    CHILD_SETUP_FLAGS.store(0, Ordering::Release);
-                                    FORK_SOCK_READY.store(1, Ordering::Release);
-                                    CHILD_SETUP_READY.store(1, Ordering::Release);
-
-                                    let _ = sys::thread_create(
-                                        child_handler as *const () as u64,
-                                        handler_stack_base + 0x8000,
-                                    );
-
-                                    while CHILD_SETUP_READY.load(Ordering::Acquire) != 0 { sys::yield_now(); }
-
-                                    PROC_STATE[cidx].store(1, Ordering::Release);
-                                    fork_child_did_exec = true;
-                                    fork_exec_ep = new_ep;
-                                }
-                                Err(errno) => {
-                                    EXEC_LOCK.store(0, Ordering::Release);
-                                    print(b"FORK-EXEC: failed errno=");
-                                    print_u64((-errno) as u64);
-                                    print(b"\n");
-                                    // Restore parent FD state since exec failed
-                                    *child_fds = fork_saved_fds;
-                                    *vfs_files = fork_saved_vfs;
-                                    *initrd_files = fork_saved_initrd;
-                                    sock_conn_id = fork_saved_sock_conn;
-                                    sock_udp_local_port = fork_saved_sock_lp;
-                                    sock_udp_remote_ip = fork_saved_sock_rip;
-                                    sock_udp_remote_port = fork_saved_sock_rport;
-                                    // Return error to child — let it print error + exit
-                                    reply_val(ep_cap, errno);
-                                }
-                            }
-                            if fork_child_did_exec { break 'fork_child; }
-                            // On exec failure, continue loop to let child write error + exit
-                        }
-                        SYS_EXIT | SYS_EXIT_GROUP => {
-                            fork_child_exit = cmsg.regs[0];
-                            break 'fork_child;
-                        }
-                        // Pass through other syscalls that child might make before exec
-                        SYS_WRITE => {
-                            let wfd = cmsg.regs[0] as usize;
-                            let wbuf = cmsg.regs[1];
-                            let wlen = cmsg.regs[2] as usize;
-                            if wfd < CHILD_MAX_FDS && child_fds[wfd] == 2 {
-                                // stdout/stderr: write to serial
-                                let wn = wlen.min(512);
-                                for i in 0..wn {
-                                    let ch = unsafe { *((wbuf + i as u64) as *const u8) };
-                                    unsafe { fb_putchar(ch); }
-                                }
-                                reply_val(ep_cap, wn as i64);
-                            } else {
-                                reply_val(ep_cap, wlen as i64);
-                            }
-                        }
-                        _ => {
-                            if nr == 60 || nr == 231 {
-                                print(b"FC-EXIT-CATCH! SYS_EXIT=");
-                                print_u64(SYS_EXIT);
-                                print(b" nr=");
-                                print_u64(nr);
-                                print(b"\n");
-                            }
-                            // Stub: return 0 for unhandled syscalls during fork-child phase
-                            print(b"FORK-CHILD: unhandled syscall ");
-                            print_u64(nr);
-                            print(b"\n");
-                            reply_val(ep_cap, 0);
-                        }
-                    }
-                }
-
-                // Fork-child phase ended. Redirect parent back to fork return point.
-                if !fork_child_did_exec {
-                    // Child exited without exec — record as zombie
-                    let cidx = fork_cpid - 1;
-                    PROC_PARENT[cidx].store(pid as u64, Ordering::Release);
-                    PROC_EXIT[cidx].store(fork_child_exit, Ordering::Release);
-                    PROC_STATE[cidx].store(2, Ordering::Release); // Zombie
-
-                    // Restore parent's FD state (child may have modified)
-                    *child_fds = fork_saved_fds;
-                    *vfs_files = fork_saved_vfs;
-                    *initrd_files = fork_saved_initrd;
-                    sock_conn_id = fork_saved_sock_conn;
-                    sock_udp_local_port = fork_saved_sock_lp;
-                    sock_udp_remote_ip = fork_saved_sock_rip;
-                    sock_udp_remote_port = fork_saved_sock_rport;
-                }
-
-                // Build restore frame on parent's stack
-                // Push callee-saved regs + return address for fork-restore trampoline (0xB80720)
+                // Build restore frame below fork_rsp BEFORE cloning.
+                // Stack layout (grows down):
+                //   [fork_rsp - 56] = rbx
+                //   [fork_rsp - 48] = rbp
+                //   [fork_rsp - 40] = r12
+                //   [fork_rsp - 32] = r13
+                //   [fork_rsp - 24] = r14
+                //   [fork_rsp - 16] = r15
+                //   [fork_rsp - 8]  = fork_rip (return address)
+                // COW_FORK_RESTORE_ADDR: xor eax,eax; pop rbx..r15; ret
+                let frame_rsp = fork_rsp - 56;
+                print(b"FORK: writing restore frame at "); print_u64(frame_rsp); print(b"\n");
                 unsafe {
-                    let mut rsp = fork_rsp;
-                    rsp -= 8; *(rsp as *mut u64) = fork_rip;   // return address
-                    rsp -= 8; *(rsp as *mut u64) = fork_r15;
-                    rsp -= 8; *(rsp as *mut u64) = fork_r14;
-                    rsp -= 8; *(rsp as *mut u64) = fork_r13;
-                    rsp -= 8; *(rsp as *mut u64) = fork_r12;
-                    rsp -= 8; *(rsp as *mut u64) = fork_rbp;
-                    rsp -= 8; *(rsp as *mut u64) = fork_rbx;
-
-                    // Redirect parent to fork-restore trampoline with RAX = child_pid
-                    let redirect = sotos_common::IpcMsg {
-                        tag: sotos_common::SIG_REDIRECT_TAG,
-                        regs: [
-                            vdso::FORK_RESTORE_ADDR,   // RIP = trampoline (pop rbx..r15, ret)
-                            0, 0, 0,
-                            rsp,                        // RSP
-                            fork_cpid as u64,           // RAX = child_pid
-                            0, 0,
-                        ],
-                    };
-                    let _ = sys::send(ep_cap, &redirect);
+                    *((frame_rsp) as *mut u64) = fork_rbx;
+                    *((frame_rsp + 8) as *mut u64) = fork_rbp;
+                    *((frame_rsp + 16) as *mut u64) = fork_r12;
+                    *((frame_rsp + 24) as *mut u64) = fork_r13;
+                    *((frame_rsp + 32) as *mut u64) = fork_r14;
+                    *((frame_rsp + 40) as *mut u64) = fork_r15;
+                    *((frame_rsp + 48) as *mut u64) = fork_rip;
                 }
+                print(b"FORK: restore frame written\n");
+
+                // Clone the address space with CoW semantics
+                print(b"FORK: cloning AS (cap="); print_u64(self_as_cap); print(b")...\n");
+                let child_as_cap = match sys::addr_space_clone(self_as_cap) {
+                    Ok(cap) => {
+                        print(b"FORK: AS cloned, child_as_cap="); print_u64(cap); print(b"\n");
+                        cap
+                    }
+                    Err(e) => {
+                        print(b"FORK: addr_space_clone failed err=");
+                        print_u64((-e) as u64);
+                        print(b"\n");
+                        reply_val(ep_cap, -ENOMEM);
+                        continue;
+                    }
+                };
+
+                // Create endpoint for child process
+                let child_ep = match sys::endpoint_create() {
+                    Ok(e) => {
+                        print(b"FORK: child_ep="); print_u64(e); print(b"\n");
+                        e
+                    }
+                    Err(_) => { reply_val(ep_cap, -ENOMEM); continue; }
+                };
+
+                // Create child thread in the cloned AS at the COW_FORK_RESTORE trampoline.
+                // Redirect syscalls to child_ep. Child will xor eax + pop regs + ret to fork_rip.
+                print(b"FORK: thread_create_in rip="); print_u64(vdso::COW_FORK_RESTORE_ADDR);
+                print(b" rsp="); print_u64(frame_rsp); print(b"\n");
+                let child_thread = match sys::thread_create_in(
+                    child_as_cap,
+                    vdso::COW_FORK_RESTORE_ADDR,
+                    frame_rsp,
+                    child_ep,
+                ) {
+                    Ok(t) => {
+                        print(b"FORK: child_thread="); print_u64(t); print(b"\n");
+                        t
+                    }
+                    Err(e) => {
+                        print(b"FORK: thread_create_in failed err=");
+                        print_u64((-e) as u64);
+                        print(b"\n");
+                        reply_val(ep_cap, -ENOMEM);
+                        continue;
+                    }
+                };
+
+                // Set child's FS_BASE (TLS) from parent's saved state
+                if fork_fsbase != 0 {
+                    let _ = sys::set_thread_fs_base(child_thread, fork_fsbase);
+                }
+                // Set signal trampoline for the child thread
+                let _ = sys::signal_entry(child_thread, vdso::SIGNAL_TRAMPOLINE_ADDR);
+
+                // Set up child process metadata
+                let cidx = fork_cpid - 1;
+                PROC_PARENT[cidx].store(pid as u64, Ordering::Release);
+                PROC_KERNEL_TID[cidx].store(0, Ordering::Release);
+                proc_group_init(fork_cpid);
+
+                // Copy parent's FD state to child
+                unsafe {
+                    GRP_FDS[cidx] = *child_fds;
+                    GRP_VFS[cidx] = *vfs_files;
+                    GRP_INITRD[cidx] = *initrd_files;
+                    GRP_CWD[cidx] = *cwd;
+                }
+
+                // Increment pipe refcounts for fds inherited by child
+                for cfd in 0..GRP_MAX_FDS {
+                    let k = child_fds[cfd];
+                    let p = sock_conn_id[cfd] as usize;
+                    if k == 11 && p < MAX_PIPES {
+                        PIPE_WRITE_REFS[p].fetch_add(1, Ordering::AcqRel);
+                    } else if k == 10 && p < MAX_PIPES {
+                        PIPE_READ_REFS[p].fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+
+                // Copy socket state for child handler
+                unsafe {
+                    FORK_SOCK_CONN = sock_conn_id;
+                    FORK_SOCK_UDP_LPORT = sock_udp_local_port;
+                    FORK_SOCK_UDP_RIP = sock_udp_remote_ip;
+                    FORK_SOCK_UDP_RPORT = sock_udp_remote_port;
+                }
+
+                // Allocate handler stack (32 pages = 128KB) for child handler thread
+                let handler_stack_base = NEXT_CHILD_STACK.fetch_add(0x20000, Ordering::SeqCst);
+                for hp in 0..32u64 {
+                    if let Ok(f) = sys::frame_alloc() {
+                        let _ = sys::map(handler_stack_base + hp * 0x1000, f, MAP_WRITABLE);
+                    }
+                }
+
+                // Pass setup info to child handler
+                while CHILD_SETUP_READY.load(Ordering::Acquire) != 0 { sys::yield_now(); }
+                CHILD_SETUP_EP.store(child_ep, Ordering::Release);
+                CHILD_SETUP_PID.store(fork_cpid as u64, Ordering::Release);
+                CHILD_SETUP_FLAGS.store(0, Ordering::Release);
+                CHILD_SETUP_AS_CAP.store(child_as_cap, Ordering::Release);
+                FORK_SOCK_READY.store(1, Ordering::Release);
+                CHILD_SETUP_READY.store(1, Ordering::Release);
+
+                let _ = sys::thread_create(
+                    child_handler as *const () as u64,
+                    handler_stack_base + 0x20000,
+                );
+
+                while CHILD_SETUP_READY.load(Ordering::Acquire) != 0 { sys::yield_now(); }
+
+                PROC_STATE[cidx].store(1, Ordering::Release);
+
+                // Serial-only to avoid fb_putchar scroll delays
+                for &b in b"COW-FORK: ok\n" { sys::debug_print(b); }
+
+                // Reply to parent with child_pid (parent's RAX = child_pid)
+                reply_val(ep_cap, fork_cpid as i64);
             }
 
             // SYS_wait4(61) — wait for child process

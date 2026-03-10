@@ -16,6 +16,10 @@ use crate::fd::fd_grp_init;
 
 pub(crate) const MAX_PROCS: usize = 16;
 
+/// Init's own address space capability (from BootInfo.self_as_cap).
+/// Set once at startup, read by child_handler for CoW fork.
+pub(crate) static INIT_SELF_AS_CAP: AtomicU64 = AtomicU64::new(0);
+
 /// Process state: 0=Free, 1=Running, 2=Zombie.
 pub(crate) static PROC_STATE: [AtomicU64; MAX_PROCS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
@@ -85,6 +89,8 @@ pub(crate) static CHILD_SETUP_EP: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CHILD_SETUP_PID: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CHILD_SETUP_READY: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CHILD_SETUP_FLAGS: AtomicU64 = AtomicU64::new(0);
+/// AS cap for fork-children (0 for same-AS children).
+pub(crate) static CHILD_SETUP_AS_CAP: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Phase 4: Thread groups, shared FD tables, and futex
@@ -350,16 +356,23 @@ pub(crate) fn signal_deliver(ep_cap: u64, pid: usize, sig: u64, child_tid: u64, 
     // For async signals: use the actual user rax at interrupt time.
     let frame_rax = if is_async { saved_rax } else { syscall_ret as u64 };
 
-    // Compute new RSP for signal frame (below current user RSP, 16-byte aligned - 8)
+    // Compute frame RSP: 16-byte aligned, frame data starts here.
+    // The handler's return address (restorer) is placed 8 bytes below at entry_rsp.
+    // After handler `ret`, RSP = frame_rsp → kernel rt_sigreturn reads frame correctly.
     let frame_size = SIGNAL_FRAME_SIZE as u64;
-    let new_rsp = ((saved_rsp - frame_size) & !0xF) - 8;
+    let frame_rsp = (saved_rsp - frame_size) & !0xF;   // 16-byte aligned
+    let entry_rsp = frame_rsp - 8;                      // handler entry: RSP % 16 == 8
 
-    // Write the SignalFrame onto the child's user stack
-    // (LUCAS has access to child's pages at the same virtual addresses)
-    let frame_ptr = new_rsp as *mut u64;
+    // Write the handler's return address at entry_rsp
     unsafe {
-        core::ptr::write_volatile(frame_ptr.add(0),  restorer_addr);  // restorer
-        core::ptr::write_volatile(frame_ptr.add(1),  sig);            // signo
+        core::ptr::write_volatile(entry_rsp as *mut u64, restorer_addr);
+    }
+
+    // Write the SignalFrame at frame_rsp (where RSP will be after handler `ret`)
+    let frame_ptr = frame_rsp as *mut u64;
+    unsafe {
+        core::ptr::write_volatile(frame_ptr.add(0),  restorer_addr);  // restorer (kernel skips)
+        core::ptr::write_volatile(frame_ptr.add(1),  sig);            // signo (kernel skips)
         core::ptr::write_volatile(frame_ptr.add(2),  frame_rax);      // rax (syscall return)
         core::ptr::write_volatile(frame_ptr.add(3),  saved_rbx);      // rbx
         core::ptr::write_volatile(frame_ptr.add(4),  saved_rcx);      // rcx
@@ -396,7 +409,7 @@ pub(crate) fn signal_deliver(ep_cap: u64, pid: usize, sig: u64, child_tid: u64, 
             sig,          // regs[1] = signal number (RDI = arg0)
             0,            // regs[2] = &siginfo (RSI = arg1, 0 for now)
             0,            // regs[3] = &ucontext (RDX = arg2, 0 for now)
-            new_rsp,      // regs[4] = new RSP (below signal frame)
+            entry_rsp,    // regs[4] = handler entry RSP (return addr at *RSP)
             0, 0, 0,
         ],
     };

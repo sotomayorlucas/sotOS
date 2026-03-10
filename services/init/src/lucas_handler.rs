@@ -1114,8 +1114,8 @@ pub(crate) extern "C" fn lucas_handler() -> ! {
             SYS_CLONE => {
                 let child_fn = msg.regs[0];
 
-                // Allocate child stacks: 1 page guest + 4 pages handler
-                let stack_base = NEXT_CHILD_STACK.fetch_add(0x5000, Ordering::SeqCst);
+                // Allocate child stacks: 1 page guest + 32 pages handler (128KB)
+                let stack_base = NEXT_CHILD_STACK.fetch_add(0x21000, Ordering::SeqCst);
                 let guest_stack = stack_base;
                 let handler_stack = stack_base + 0x1000;
 
@@ -1129,9 +1129,9 @@ pub(crate) extern "C" fn lucas_handler() -> ! {
                     continue;
                 }
 
-                // Map handler stack (4 pages)
+                // Map handler stack (32 pages = 128KB)
                 let mut hok = true;
-                for hp in 0..4u64 {
+                for hp in 0..32u64 {
                     let hf = match sys::frame_alloc() {
                         Ok(f) => f,
                         Err(_) => { hok = false; break; }
@@ -1163,12 +1163,13 @@ pub(crate) extern "C" fn lucas_handler() -> ! {
                 CHILD_SETUP_EP.store(child_ep, Ordering::Release);
                 CHILD_SETUP_PID.store(child_pid, Ordering::Release);
                 CHILD_SETUP_FLAGS.store(0, Ordering::Release); // normal fork, no CLONE_ flags
+                CHILD_SETUP_AS_CAP.store(0, Ordering::Release);
                 CHILD_SETUP_READY.store(1, Ordering::Release);
 
-                // Spawn child handler thread (stack top = handler_stack + 4 pages)
+                // Spawn child handler thread (stack top = handler_stack + 32 pages)
                 if sys::thread_create(
                     child_handler as *const () as u64,
-                    handler_stack + 0x4000,
+                    handler_stack + 0x20000,
                 ).is_err() {
                     CHILD_SETUP_READY.store(0, Ordering::Release);
                     reply_val(ep_cap, -ENOMEM);

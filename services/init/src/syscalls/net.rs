@@ -11,12 +11,28 @@ use crate::exec::{reply_val, rdtsc};
 use crate::process::{sig_dequeue, sig_dispatch};
 use crate::fd::*;
 use crate::NET_EP_CAP;
+use crate::child_handler::mark_pipe_retry;
 use crate::net::{NET_CMD_TCP_CONNECT, NET_CMD_TCP_SEND, NET_CMD_TCP_RECV,
                  NET_CMD_UDP_BIND, NET_CMD_UDP_SENDTO, NET_CMD_UDP_RECV};
 use crate::framebuffer::{print, print_u64, kb_has_char};
 use super::context::{SyscallContext, MAX_EPOLL_ENTRIES};
 
 static NEXT_UDP_PORT: AtomicU64 = AtomicU64::new(49152);
+
+/// Check if an fd is poll-readable (has data or is at EOF).
+fn poll_fd_readable(ctx: &SyscallContext, fd: usize) -> bool {
+    let kind = ctx.child_fds[fd];
+    match kind {
+        1 => unsafe { kb_has_char() }, // stdin
+        10 => {
+            // Pipe read: check if buffer has data OR writer is closed (EOF)
+            let pipe_id = ctx.sock_conn_id[fd] as usize;
+            pipe_has_data(pipe_id) || pipe_writer_closed(pipe_id)
+        }
+        2 | 8 | 12 | 13 | 14 | 15 | 16 | 22 | 23 | 25 => true, // always "ready"
+        _ => true, // default: report readable
+    }
+}
 
 pub(crate) fn sys_poll(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let pid = ctx.pid;
@@ -31,14 +47,10 @@ pub(crate) fn sys_poll(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let events = unsafe { *((pfd.add(4)) as *const i16) };
         let mut revents: i16 = 0;
         if fd >= 0 && (fd as usize) < GRP_MAX_FDS && ctx.child_fds[fd as usize] != 0 {
-            if events & 1 != 0 {
-                if fd == 0 && ctx.child_fds[0] == 1 {
-                    if unsafe { kb_has_char() } { revents |= 1; }
-                } else {
-                    revents |= 1;
-                }
+            if events & 1 != 0 { // POLLIN
+                if poll_fd_readable(ctx, fd as usize) { revents |= 1; }
             }
-            if events & 4 != 0 { revents |= 4; }
+            if events & 4 != 0 { revents |= 4; } // POLLOUT: always writable
         } else if fd >= 0 {
             revents = 0x20; // POLLNVAL
         }
@@ -48,43 +60,18 @@ pub(crate) fn sys_poll(ctx: &mut SyscallContext, msg: &IpcMsg) {
     if ready > 0 || timeout == 0 {
         reply_val(ep_cap, ready as i64);
     } else {
-        let mut waited = 0u32;
-        let max_iters = if timeout > 0 { (timeout as u32) * 100 } else { u32::MAX };
-        let mut interrupted = false;
-        loop {
-            if unsafe { kb_has_char() } {
-                ready = 0;
-                for i in 0..nfds.min(16) {
-                    let pfd = unsafe { fds_ptr.add(i * 8) };
-                    let fd = unsafe { *(pfd as *const i32) };
-                    let events = unsafe { *((pfd.add(4)) as *const i16) };
-                    let mut revents: i16 = 0;
-                    if fd == 0 && (events & 1 != 0) { revents |= 1; }
-                    if events & 4 != 0 { revents |= 4; }
-                    unsafe { *((pfd.add(6)) as *mut i16) = revents; }
-                    if revents != 0 { ready += 1; }
-                }
-                break;
-            }
-            let s = sig_dequeue(pid);
-            if s != 0 && sig_dispatch(pid, s) >= 1 {
-                interrupted = true;
-                break;
-            }
-            sys::yield_now();
-            waited += 1;
-            if waited >= max_iters { break; }
-        }
-        if interrupted {
-            reply_val(ep_cap, -EINTR);
-        } else {
-            reply_val(ep_cap, ready as i64);
-        }
+        // No fds ready — use PIPE_RETRY_TAG to let kernel retry after
+        // yielding. This avoids blocking init (which stalls all children).
+        mark_pipe_retry(ctx.pid);
+        let reply = sotos_common::IpcMsg {
+            tag: sotos_common::PIPE_RETRY_TAG,
+            regs: [0; 8],
+        };
+        let _ = sys::send(ep_cap, &reply);
     }
 }
 
 pub(crate) fn sys_ppoll(ctx: &mut SyscallContext, msg: &IpcMsg) {
-    let pid = ctx.pid;
     let ep_cap = ctx.ep_cap;
     let fds_ptr = msg.regs[0] as *mut u8;
     let nfds = msg.regs[1] as usize;
@@ -96,9 +83,7 @@ pub(crate) fn sys_ppoll(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let mut revents: i16 = 0;
         if fd >= 0 && (fd as usize) < GRP_MAX_FDS && ctx.child_fds[fd as usize] != 0 {
             if events & 1 != 0 {
-                if fd == 0 && ctx.child_fds[0] == 1 {
-                    if unsafe { kb_has_char() } { revents |= 1; }
-                } else { revents |= 1; }
+                if poll_fd_readable(ctx, fd as usize) { revents |= 1; }
             }
             if events & 4 != 0 { revents |= 4; }
         } else if fd >= 0 { revents = 0x20; }
@@ -108,34 +93,13 @@ pub(crate) fn sys_ppoll(ctx: &mut SyscallContext, msg: &IpcMsg) {
     if ready > 0 {
         reply_val(ep_cap, ready as i64);
     } else {
-        let mut interrupted = false;
-        loop {
-            if unsafe { kb_has_char() } {
-                ready = 0;
-                for i in 0..nfds.min(16) {
-                    let pfd = unsafe { fds_ptr.add(i * 8) };
-                    let fd = unsafe { *(pfd as *const i32) };
-                    let events = unsafe { *((pfd.add(4)) as *const i16) };
-                    let mut revents: i16 = 0;
-                    if fd == 0 && (events & 1 != 0) { revents |= 1; }
-                    if events & 4 != 0 { revents |= 4; }
-                    unsafe { *((pfd.add(6)) as *mut i16) = revents; }
-                    if revents != 0 { ready += 1; }
-                }
-                break;
-            }
-            let s = sig_dequeue(pid);
-            if s != 0 && sig_dispatch(pid, s) >= 1 {
-                interrupted = true;
-                break;
-            }
-            sys::yield_now();
-        }
-        if interrupted {
-            reply_val(ep_cap, -EINTR);
-        } else {
-            reply_val(ep_cap, ready as i64);
-        }
+        // No fds ready — use PIPE_RETRY_TAG for kernel-side retry
+        mark_pipe_retry(ctx.pid);
+        let reply = sotos_common::IpcMsg {
+            tag: sotos_common::PIPE_RETRY_TAG,
+            regs: [0; 8],
+        };
+        let _ = sys::send(ep_cap, &reply);
     }
 }
 
@@ -653,51 +617,34 @@ pub(crate) fn sys_select(ctx: &mut SyscallContext, msg: &IpcMsg, syscall_nr: u64
     let rfds_in = if readfds_ptr != 0 { unsafe { *(readfds_ptr as *const u64) } } else { 0 };
     let wfds_in = if writefds_ptr != 0 { unsafe { *(writefds_ptr as *const u64) } } else { 0 };
 
-    let child_fds = &*ctx.child_fds;
-    let check_select = |rfds_in: u64, wfds_in: u64| -> (u64, u64, u32) {
-        let mut rfds_out: u64 = 0;
-        let mut wfds_out: u64 = 0;
-        let mut ready: u32 = 0;
-        for fd in 0..nfds {
-            let bit = 1u64 << fd;
-            if fd < GRP_MAX_FDS && child_fds[fd] != 0 {
-                if rfds_in & bit != 0 {
-                    let is_ready = match child_fds[fd] {
-                        1 => unsafe { kb_has_char() },
-                        16 => true,
-                        17 => true,
-                        12 | 13 | 15 => true,
-                        _ => true,
-                    };
-                    if is_ready { rfds_out |= bit; ready += 1; }
-                }
-                if wfds_in & bit != 0 {
-                    wfds_out |= bit; ready += 1;
-                }
+    let mut rfds_out: u64 = 0;
+    let mut wfds_out: u64 = 0;
+    let mut ready: u32 = 0;
+    for fd in 0..nfds {
+        let bit = 1u64 << fd;
+        if fd < GRP_MAX_FDS && ctx.child_fds[fd] != 0 {
+            if rfds_in & bit != 0 {
+                if poll_fd_readable(ctx, fd) { rfds_out |= bit; ready += 1; }
             }
-        }
-        (rfds_out, wfds_out, ready)
-    };
-
-    let (mut rfds_out, mut wfds_out, mut ready) = check_select(rfds_in, wfds_in);
-
-    if ready == 0 && timeout_ms != 0 {
-        let max_iters = if timeout_ms > 0 { (timeout_ms as u32).saturating_mul(100) } else { 500_000 };
-        let mut waited = 0u32;
-        loop {
-            sys::yield_now();
-            waited += 1;
-            let (ro, wo, r) = check_select(rfds_in, wfds_in);
-            rfds_out = ro; wfds_out = wo; ready = r;
-            if ready > 0 || waited >= max_iters { break; }
-            let s = sig_dequeue(pid);
-            if s != 0 { break; }
+            if wfds_in & bit != 0 {
+                wfds_out |= bit; ready += 1;
+            }
         }
     }
 
-    if readfds_ptr != 0 { unsafe { *(readfds_ptr as *mut u64) = rfds_out; } }
-    if writefds_ptr != 0 { unsafe { *(writefds_ptr as *mut u64) = wfds_out; } }
-    reply_val(ep_cap, ready as i64);
+    if ready > 0 || timeout_ms == 0 {
+        if readfds_ptr != 0 { unsafe { *(readfds_ptr as *mut u64) = rfds_out; } }
+        if writefds_ptr != 0 { unsafe { *(writefds_ptr as *mut u64) = wfds_out; } }
+        reply_val(ep_cap, ready as i64);
+    } else {
+        // No fds ready — use PIPE_RETRY_TAG for kernel-side retry
+        mark_pipe_retry(ctx.pid);
+        let reply = sotos_common::IpcMsg {
+            tag: sotos_common::PIPE_RETRY_TAG,
+            regs: [0; 8],
+        };
+        let _ = sys::send(ep_cap, &reply);
+    }
 }
 
 pub(crate) fn sys_epoll_create(ctx: &mut SyscallContext, _msg: &IpcMsg) {

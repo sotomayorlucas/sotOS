@@ -184,7 +184,7 @@ pub(crate) fn write_linux_stat_dev(stat_ptr: u64, dev: u64, oid: u64, size: u64,
     st.st_dev = dev;
     st.st_ino = oid;
     st.st_nlink = 1;
-    st.st_mode = if is_dir { S_IFDIR | 0o755 } else { S_IFREG | 0o644 };
+    st.st_mode = if is_dir { S_IFDIR | 0o755 } else { S_IFREG | 0o755 };
     st.st_size = size as i64;
     st.st_blksize = 512;
     st.st_blocks = ((size + 511) / 512) as i64;
@@ -221,6 +221,18 @@ pub(crate) static mut GRP_DIR_LEN: [usize; MAX_PROCS] = [0; MAX_PROCS];
 /// Directory listing position per group.
 pub(crate) static mut GRP_DIR_POS: [usize; MAX_PROCS] = [0; MAX_PROCS];
 
+/// Per-group current working directory (absolute path, NUL-terminated).
+pub(crate) const GRP_CWD_MAX: usize = 128;
+pub(crate) static mut GRP_CWD: [[u8; GRP_CWD_MAX]; MAX_PROCS] = {
+    // Default: "/"
+    const INIT_CWD: [u8; GRP_CWD_MAX] = {
+        let mut buf = [0u8; GRP_CWD_MAX];
+        buf[0] = b'/';
+        buf
+    };
+    [INIT_CWD; MAX_PROCS]
+};
+
 /// Spinlock per FD group (protects all GRP_ arrays for that group).
 pub(crate) static GRP_FD_LOCK: [AtomicU64; MAX_PROCS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
@@ -233,6 +245,137 @@ pub(crate) static mut GRP_BRK: [u64; MAX_PROCS] = [0; MAX_PROCS];
 pub(crate) static mut GRP_MMAP_NEXT: [u64; MAX_PROCS] = [0; MAX_PROCS];
 /// Initrd file buf base per memory group.
 pub(crate) static mut GRP_INITRD_BUF_BASE: [u64; MAX_PROCS] = [0; MAX_PROCS];
+
+// ---------------------------------------------------------------------------
+// Fork socket state handshake (serialized by CHILD_SETUP)
+// Parent writes before CHILD_SETUP_READY=1, child reads on init.
+// ---------------------------------------------------------------------------
+pub(crate) static mut FORK_SOCK_CONN: [u32; GRP_MAX_FDS] = [0xFFFF; GRP_MAX_FDS];
+pub(crate) static mut FORK_SOCK_UDP_LPORT: [u16; GRP_MAX_FDS] = [0; GRP_MAX_FDS];
+pub(crate) static mut FORK_SOCK_UDP_RIP: [u32; GRP_MAX_FDS] = [0; GRP_MAX_FDS];
+pub(crate) static mut FORK_SOCK_UDP_RPORT: [u16; GRP_MAX_FDS] = [0; GRP_MAX_FDS];
+/// Flag: 1 = fork child should copy socket state from FORK_SOCK_* on init.
+pub(crate) static FORK_SOCK_READY: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// Shared pipe buffers (inter-handler communication)
+// ---------------------------------------------------------------------------
+pub(crate) const MAX_PIPES: usize = 4;
+pub(crate) const PIPE_BUF_SIZE: usize = 131072; // 128KB per pipe
+
+/// Pipe data buffer (ring buffer).
+pub(crate) static mut PIPE_BUF: [[u8; PIPE_BUF_SIZE]; MAX_PIPES] = [[0; PIPE_BUF_SIZE]; MAX_PIPES];
+/// Write position (total bytes written, mod PIPE_BUF_SIZE for index).
+pub(crate) static PIPE_WRITE_POS: [AtomicU64; MAX_PIPES] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_PIPES]
+};
+/// Read position (total bytes read, mod PIPE_BUF_SIZE for index).
+pub(crate) static PIPE_READ_POS: [AtomicU64; MAX_PIPES] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_PIPES]
+};
+/// Writer closed flag: 0=open, 1=closed (reader gets EOF when buffer empty).
+pub(crate) static PIPE_WRITE_CLOSED: [AtomicU64; MAX_PIPES] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_PIPES]
+};
+/// Reader closed flag.
+pub(crate) static PIPE_READ_CLOSED: [AtomicU64; MAX_PIPES] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_PIPES]
+};
+/// Pipe active flag: 0=free, 1=in use.
+pub(crate) static PIPE_ACTIVE: [AtomicU64; MAX_PIPES] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_PIPES]
+};
+/// Pipe write-end reference count: how many open fds reference the write end.
+pub(crate) static PIPE_WRITE_REFS: [AtomicU64; MAX_PIPES] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_PIPES]
+};
+/// Pipe read-end reference count: how many open fds reference the read end.
+pub(crate) static PIPE_READ_REFS: [AtomicU64; MAX_PIPES] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_PIPES]
+};
+/// Next pipe ID counter.
+pub(crate) static NEXT_PIPE_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Allocate a new pipe, returns pipe index or None.
+pub(crate) fn pipe_alloc() -> Option<usize> {
+    for i in 0..MAX_PIPES {
+        if PIPE_ACTIVE[i].compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            PIPE_WRITE_POS[i].store(0, Ordering::Release);
+            PIPE_READ_POS[i].store(0, Ordering::Release);
+            PIPE_WRITE_CLOSED[i].store(0, Ordering::Release);
+            PIPE_READ_CLOSED[i].store(0, Ordering::Release);
+            PIPE_WRITE_REFS[i].store(1, Ordering::Release);
+            PIPE_READ_REFS[i].store(1, Ordering::Release);
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Write data to pipe buffer. Returns bytes written.
+pub(crate) fn pipe_write(pipe_id: usize, data: &[u8]) -> usize {
+    if pipe_id >= MAX_PIPES { return 0; }
+    let wp = PIPE_WRITE_POS[pipe_id].load(Ordering::Acquire);
+    let rp = PIPE_READ_POS[pipe_id].load(Ordering::Acquire);
+    // Available space = PIPE_BUF_SIZE - (wp - rp)
+    let used = (wp - rp) as usize;
+    let avail = PIPE_BUF_SIZE.saturating_sub(used);
+    let n = data.len().min(avail);
+    if n == 0 { return 0; }
+    unsafe {
+        for i in 0..n {
+            let idx = ((wp as usize) + i) % PIPE_BUF_SIZE;
+            PIPE_BUF[pipe_id][idx] = data[i];
+        }
+    }
+    PIPE_WRITE_POS[pipe_id].store(wp + n as u64, Ordering::Release);
+    n
+}
+
+/// Read data from pipe buffer. Returns bytes read (0 = empty, check closed for EOF).
+pub(crate) fn pipe_read(pipe_id: usize, buf: &mut [u8]) -> usize {
+    if pipe_id >= MAX_PIPES { return 0; }
+    let wp = PIPE_WRITE_POS[pipe_id].load(Ordering::Acquire);
+    let rp = PIPE_READ_POS[pipe_id].load(Ordering::Acquire);
+    let available = (wp - rp) as usize;
+    let n = buf.len().min(available);
+    if n == 0 { return 0; }
+    unsafe {
+        for i in 0..n {
+            let idx = ((rp as usize) + i) % PIPE_BUF_SIZE;
+            buf[i] = PIPE_BUF[pipe_id][idx];
+        }
+    }
+    PIPE_READ_POS[pipe_id].store(rp + n as u64, Ordering::Release);
+    n
+}
+
+/// Check if pipe writer is closed.
+pub(crate) fn pipe_writer_closed(pipe_id: usize) -> bool {
+    pipe_id < MAX_PIPES && PIPE_WRITE_CLOSED[pipe_id].load(Ordering::Acquire) != 0
+}
+
+/// Check if pipe has data available for reading.
+pub(crate) fn pipe_has_data(pipe_id: usize) -> bool {
+    if pipe_id >= MAX_PIPES { return false; }
+    let wp = PIPE_WRITE_POS[pipe_id].load(Ordering::Acquire);
+    let rp = PIPE_READ_POS[pipe_id].load(Ordering::Acquire);
+    wp > rp
+}
+
+/// Free a pipe buffer.
+pub(crate) fn pipe_free(pipe_id: usize) {
+    if pipe_id < MAX_PIPES {
+        PIPE_ACTIVE[pipe_id].store(0, Ordering::Release);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // FD group lock/unlock/init
@@ -262,5 +405,39 @@ pub(crate) fn fd_grp_init(g: usize) {
         GRP_DIR_BUF[g] = [0; 4096];
         GRP_DIR_LEN[g] = 0;
         GRP_DIR_POS[g] = 0;
+        GRP_CWD[g] = [0; GRP_CWD_MAX];
+        GRP_CWD[g][0] = b'/';
     }
+}
+
+/// Resolve a possibly-relative path against the CWD for FD group `g`.
+/// Returns a buffer with the resolved absolute path and its length.
+/// If `path` starts with '/', it's returned as-is. Otherwise, CWD + "/" + path.
+pub(crate) fn resolve_with_cwd(cwd: &[u8; GRP_CWD_MAX], path: &[u8], out: &mut [u8; 256]) -> usize {
+    if !path.is_empty() && path[0] == b'/' {
+        // Absolute: copy as-is
+        let len = path.len().min(255);
+        out[..len].copy_from_slice(&path[..len]);
+        out[len] = 0;
+        return len;
+    }
+    // Relative: CWD + "/" + path
+    let mut cwd_len = 0;
+    while cwd_len < GRP_CWD_MAX && cwd[cwd_len] != 0 { cwd_len += 1; }
+    let mut pos = 0;
+    // Copy CWD
+    let clen = cwd_len.min(250);
+    out[..clen].copy_from_slice(&cwd[..clen]);
+    pos = clen;
+    // Add separator if CWD doesn't end with '/'
+    if pos > 0 && out[pos - 1] != b'/' && pos < 255 {
+        out[pos] = b'/';
+        pos += 1;
+    }
+    // Copy relative path
+    let rlen = path.len().min(255 - pos);
+    out[pos..pos + rlen].copy_from_slice(&path[..rlen]);
+    pos += rlen;
+    out[pos] = 0;
+    pos
 }

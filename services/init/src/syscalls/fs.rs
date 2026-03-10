@@ -11,7 +11,7 @@ use crate::exec::{reply_val, rdtsc, copy_guest_path, starts_with,
                   format_uptime_into, format_proc_self_stat};
 use crate::process::*;
 use crate::fd::*;
-use crate::child_handler::{open_virtual_file, fill_random};
+use crate::child_handler::{open_virtual_file, fill_random, mark_pipe_retry};
 use crate::{NET_EP_CAP, vfs_lock, vfs_unlock, shared_store};
 use crate::net::{NET_CMD_TCP_SEND, NET_CMD_TCP_RECV, NET_CMD_TCP_CLOSE,
                  NET_CMD_UDP_SENDTO, NET_CMD_UDP_RECV};
@@ -41,7 +41,7 @@ pub(crate) fn sys_read(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 match unsafe { kb_read_char() } {
                     Some(0x03) => { reply_val(ctx.ep_cap, -EINTR); break; }
                     Some(ch) => {
-                        unsafe { *(buf_ptr as *mut u8) = ch; }
+                        ctx.guest_write(buf_ptr, &[ch]);
                         let reply = IpcMsg {
                             tag: 0,
                             regs: [1, ch as u64, 0, 0, 0, 0, 0, 0],
@@ -260,32 +260,75 @@ pub(crate) fn sys_read(ctx: &mut SyscallContext, msg: &IpcMsg) {
             }
         }
         10 => {
-            // Pipe read: read from shared pipe buffer
+            // Pipe read: non-blocking check with kernel-side retry.
+            // Instead of spinning in init (which blocks ALL children's IPC),
+            // we return PIPE_RETRY_TAG to the kernel. The kernel yields to let
+            // other threads (writers) run, then re-sends the read to init.
             let pipe_id = ctx.sock_conn_id[fd] as usize;
             let want = len.min(4096);
             let mut tmp = [0u8; 4096];
-            // Spin-wait for data or writer close
-            let mut retries = 0u32;
-            loop {
-                let n = pipe_read(pipe_id, &mut tmp[..want]);
-                if n > 0 {
-                    unsafe {
-                        let dst = buf_ptr as *mut u8;
-                        for i in 0..n { *dst.add(i) = tmp[i]; }
+            let n = pipe_read(pipe_id, &mut tmp[..want]);
+            if n > 0 {
+                ctx.guest_write(buf_ptr, &tmp[..n]);
+                if ctx.pid >= 3 {
+                    print(b"PIPE-R P"); print_u64(ctx.pid as u64);
+                    print(b" fd="); print_u64(fd as u64);
+                    print(b" n="); print_u64(n as u64);
+                    print(b" [");
+                    let show = n.min(80);
+                    for i in 0..show {
+                        if tmp[i] == 0x0A {
+                            print(b"\\n");
+                        } else if tmp[i] >= 0x20 && tmp[i] < 0x7F {
+                            sys::debug_print(tmp[i]);
+                        } else {
+                            print(b".");
+                        }
                     }
-                    reply_val(ctx.ep_cap, n as i64);
-                    break;
+                    print(b"]\n");
+                    // After P3 reads blank line (caps terminator), dump FD table
+                    if ctx.pid == 3 && n <= 2 && tmp[0] == 0x0A {
+                        print(b"=== P3 FD TABLE (after blank-line read) ===\n");
+                        for i in 0..10 {
+                            print(b"  fd="); print_u64(i as u64);
+                            print(b" kind="); print_u64(ctx.child_fds[i] as u64);
+                            print(b" conn="); print_u64(ctx.sock_conn_id[i] as u64);
+                            print(b"\n");
+                        }
+                        print(b"=== END P3 FD TABLE ===\n");
+                    }
                 }
-                if pipe_writer_closed(pipe_id) {
-                    reply_val(ctx.ep_cap, 0); // EOF
-                    break;
+                reply_val(ctx.ep_cap, n as i64);
+            } else if pipe_writer_closed(pipe_id) {
+                if ctx.pid >= 3 {
+                    print(b"PIPE-R P"); print_u64(ctx.pid as u64);
+                    print(b" fd="); print_u64(fd as u64);
+                    print(b" pipe="); print_u64(pipe_id as u64);
+                    print(b" wrefs="); print_u64(PIPE_WRITE_REFS[pipe_id].load(Ordering::Acquire));
+                    print(b" EOF(writer-closed)\n");
                 }
-                retries += 1;
-                if retries > 50000 {
-                    reply_val(ctx.ep_cap, 0); // safety timeout
-                    break;
+                reply_val(ctx.ep_cap, 0); // EOF
+            } else {
+                // No data, writer alive — ask kernel to retry after yielding.
+                // This lets init process other children's writes in between.
+                // Log first retry per burst for P3 (to see when blocking starts)
+                if ctx.pid == 3 {
+                    let rc = unsafe { crate::child_handler::RETRY_COUNT[3] };
+                    if rc == 0 {
+                        print(b"P3-PIPE-BLOCK fd="); print_u64(fd as u64);
+                        print(b" pipe="); print_u64(pipe_id as u64);
+                        print(b" wrefs="); print_u64(PIPE_WRITE_REFS[pipe_id].load(Ordering::Acquire));
+                        print(b" rpos="); print_u64(PIPE_READ_POS[pipe_id].load(Ordering::Acquire));
+                        print(b" wpos="); print_u64(PIPE_WRITE_POS[pipe_id].load(Ordering::Acquire));
+                        print(b"\n");
+                    }
                 }
-                sys::yield_now();
+                mark_pipe_retry(ctx.pid);
+                let reply = sotos_common::IpcMsg {
+                    tag: sotos_common::PIPE_RETRY_TAG,
+                    regs: [0; 8],
+                };
+                let _ = sys::send(ctx.ep_cap, &reply);
             }
         }
         _ => reply_val(ctx.ep_cap, -EBADF),
@@ -297,16 +340,49 @@ pub(crate) fn sys_write(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let fd = msg.regs[0] as usize;
     let buf_ptr = msg.regs[1];
     let len = msg.regs[2] as usize;
+    // Log ALL P3 writes (any fd) to trace git's write behavior
+    if ctx.pid == 3 {
+        let kind = if fd < GRP_MAX_FDS { ctx.child_fds[fd] } else { 0 };
+        print(b"P3-WRITE fd="); print_u64(fd as u64);
+        print(b" kind="); print_u64(kind as u64);
+        print(b" len="); print_u64(len as u64);
+        if len > 0 && buf_ptr > 0 && buf_ptr < 0x0000_8000_0000_0000 {
+            print(b" [");
+            let show = len.min(80);
+            let mut dbg_buf = [0u8; 80];
+            ctx.guest_read(buf_ptr, &mut dbg_buf[..show]);
+            for i in 0..show {
+                if dbg_buf[i] == 0x0A { print(b"\\n"); }
+                else if dbg_buf[i] >= 0x20 && dbg_buf[i] < 0x7F { sys::debug_print(dbg_buf[i]); }
+                else { print(b"."); }
+            }
+            print(b"]");
+        }
+        print(b"\n");
+    }
     if fd >= GRP_MAX_FDS || ctx.child_fds[fd] == 0 {
+        if ctx.pid == 4 {
+            print(b"P4-WRITE fd="); print_u64(fd as u64);
+            print(b" EBADF(kind=0)\n");
+        }
         reply_val(ctx.ep_cap, -EBADF);
         return;
     }
+    // Log all P4 writes for git debugging
+    if ctx.pid == 4 && fd >= 3 {
+        print(b"P4-WRITE fd="); print_u64(fd as u64);
+        print(b" kind="); print_u64(ctx.child_fds[fd] as u64);
+        print(b" len="); print_u64(len as u64);
+        print(b"\n");
+    }
     match ctx.child_fds[fd] {
         2 => {
-            // stdout/stderr
-            let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
-            for &b in data { sys::debug_print(b); unsafe { fb_putchar(b); } }
-            reply_val(ctx.ep_cap, len as i64);
+            // stdout/stderr — read child's data via guest_read for CoW fork compat
+            let safe_len = len.min(4096);
+            let mut local_buf = [0u8; 4096];
+            ctx.guest_read(buf_ptr, &mut local_buf[..safe_len]);
+            for i in 0..safe_len { sys::debug_print(local_buf[i]); unsafe { fb_putchar(local_buf[i]); } }
+            reply_val(ctx.ep_cap, safe_len as i64);
         }
         8 => reply_val(ctx.ep_cap, len as i64), // /dev/null: discard
         22 => {
@@ -419,10 +495,29 @@ pub(crate) fn sys_write(ctx: &mut SyscallContext, msg: &IpcMsg) {
         11 => {
             // Pipe write: write to shared pipe buffer
             let pipe_id = ctx.sock_conn_id[fd] as usize;
-            let src = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
+            // Read child's data into local buffer (handles CoW fork)
+            let safe_len = len.min(4096);
+            let mut local_buf = [0u8; 4096];
+            ctx.guest_read(buf_ptr, &mut local_buf[..safe_len]);
+            let src = &local_buf[..safe_len];
+            // Log pipe write data for git debugging
+            if ctx.pid >= 3 {
+                print(b"PIPE-W P"); print_u64(ctx.pid as u64);
+                print(b" fd="); print_u64(fd as u64);
+                print(b" len="); print_u64(len as u64);
+                print(b" [");
+                let show = safe_len.min(80);
+                for i in 0..show {
+                    if src[i] == 0x0A { print(b"\\n"); }
+                    else if src[i] >= 0x20 && src[i] < 0x7F {
+                        sys::debug_print(src[i]);
+                    } else { print(b"."); }
+                }
+                print(b"]\n");
+            }
             let mut written = 0usize;
             let mut retries = 0u32;
-            while written < len {
+            while written < safe_len {
                 let n = pipe_write(pipe_id, &src[written..]);
                 written += n;
                 if n == 0 {
@@ -464,7 +559,9 @@ pub(crate) fn sys_write(ctx: &mut SyscallContext, msg: &IpcMsg) {
             }
             if !found { reply_val(ctx.ep_cap, -EBADF); }
         }
-        _ => reply_val(ctx.ep_cap, -EBADF),
+        _ => {
+            reply_val(ctx.ep_cap, -EBADF);
+        }
     }
 }
 
@@ -799,20 +896,36 @@ pub(crate) fn sys_close(ctx: &mut SyscallContext, msg: &IpcMsg) {
             }
             ctx.sock_conn_id[fd] = 0xFFFF;
         } else if ctx.child_fds[fd] == 11 {
-            // Pipe write end close -> mark writer closed for EOF
+            // Pipe write end close — decrement refcount, mark closed when last ref gone
             let pipe_id = ctx.sock_conn_id[fd] as usize;
             if pipe_id < MAX_PIPES {
-                PIPE_WRITE_CLOSED[pipe_id].store(1, Ordering::Release);
+                let prev = PIPE_WRITE_REFS[pipe_id].fetch_sub(1, Ordering::AcqRel);
+                if ctx.pid >= 3 {
+                    print(b"CLOSE-PW P"); print_u64(ctx.pid as u64);
+                    print(b" fd="); print_u64(fd as u64);
+                    print(b" pipe="); print_u64(pipe_id as u64);
+                    print(b" wrefs="); print_u64(prev); // prev = before decrement
+                    print(b"->"); print_u64(if prev > 0 { prev - 1 } else { 0 });
+                    print(b"\n");
+                }
+                if prev <= 1 {
+                    PIPE_WRITE_CLOSED[pipe_id].store(1, Ordering::Release);
+                    if PIPE_READ_CLOSED[pipe_id].load(Ordering::Acquire) != 0 {
+                        pipe_free(pipe_id);
+                    }
+                }
             }
             ctx.sock_conn_id[fd] = 0xFFFF;
         } else if ctx.child_fds[fd] == 10 {
-            // Pipe read end close
+            // Pipe read end close — decrement refcount, mark closed when last ref gone
             let pipe_id = ctx.sock_conn_id[fd] as usize;
             if pipe_id < MAX_PIPES {
-                PIPE_READ_CLOSED[pipe_id].store(1, Ordering::Release);
-                // Free pipe if both ends closed
-                if PIPE_WRITE_CLOSED[pipe_id].load(Ordering::Acquire) != 0 {
-                    pipe_free(pipe_id);
+                let prev = PIPE_READ_REFS[pipe_id].fetch_sub(1, Ordering::AcqRel);
+                if prev <= 1 {
+                    PIPE_READ_CLOSED[pipe_id].store(1, Ordering::Release);
+                    if PIPE_WRITE_CLOSED[pipe_id].load(Ordering::Acquire) != 0 {
+                        pipe_free(pipe_id);
+                    }
                 }
             }
             ctx.sock_conn_id[fd] = 0xFFFF;
@@ -1230,6 +1343,35 @@ pub(crate) fn sys_readv(ctx: &mut SyscallContext, msg: &IpcMsg) {
         } else {
             reply_val(ctx.ep_cap, -EAGAIN);
         }
+    } else if ctx.child_fds[fd] == 10 {
+        // Pipe read via readv: non-blocking with kernel-side retry
+        let pipe_id = ctx.sock_conn_id[fd] as usize;
+        let cnt = iovcnt.min(16);
+        let mut total = 0usize;
+        for i in 0..cnt {
+            let entry = iov_ptr + (i as u64) * 16;
+            if entry + 16 > 0x0000_8000_0000_0000 { break; }
+            let base = unsafe { *(entry as *const u64) };
+            let ilen = unsafe { *((entry + 8) as *const u64) } as usize;
+            if base == 0 || ilen == 0 { continue; }
+            let dst = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, ilen) };
+            let n = pipe_read(pipe_id, dst);
+            total += n;
+            if n < ilen { break; } // short read or no data
+        }
+        if total > 0 {
+            reply_val(ctx.ep_cap, total as i64);
+        } else if pipe_writer_closed(pipe_id) {
+            reply_val(ctx.ep_cap, 0); // EOF
+        } else {
+            // No data, writer alive — ask kernel to retry
+            mark_pipe_retry(ctx.pid);
+            let reply = sotos_common::IpcMsg {
+                tag: sotos_common::PIPE_RETRY_TAG,
+                regs: [0; 8],
+            };
+            let _ = sys::send(ctx.ep_cap, &reply);
+        }
     } else if ctx.child_fds[fd] == 2 {
         // stdout/stderr readv -> -EBADF (write-only)
         reply_val(ctx.ep_cap, -EBADF);
@@ -1245,18 +1387,62 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let fd = msg.regs[0] as usize;
     let iov_ptr = msg.regs[1];
     let iovcnt = msg.regs[2] as usize;
+    // Log ALL P3 writev (any fd) to trace git's write behavior
+    if ctx.pid == 3 {
+        let kind = if fd < GRP_MAX_FDS { ctx.child_fds[fd] } else { 0 };
+        // Compute total length
+        let cnt_peek = iovcnt.min(16);
+        let mut tlen_peek = 0usize;
+        for j in 0..cnt_peek {
+            let e = iov_ptr + (j as u64) * 16;
+            if e + 16 > 0x0000_8000_0000_0000 { break; }
+            let il = unsafe { *((e + 8) as *const u64) } as usize;
+            tlen_peek += il;
+        }
+        print(b"P3-WRITEV fd="); print_u64(fd as u64);
+        print(b" kind="); print_u64(kind as u64);
+        print(b" len="); print_u64(tlen_peek as u64);
+        print(b" [");
+        let mut shown = 0usize;
+        for j in 0..cnt_peek {
+            let e = iov_ptr + (j as u64) * 16;
+            if e + 16 > 0x0000_8000_0000_0000 { break; }
+            let base = unsafe { *(e as *const u64) };
+            let il = unsafe { *((e + 8) as *const u64) } as usize;
+            if base == 0 || il == 0 { continue; }
+            let lim = il.min(80 - shown);
+            for k in 0..lim {
+                let b = unsafe { *(base as *const u8).add(k) };
+                if b == 0x0A { print(b"\\n"); }
+                else if b >= 0x20 && b < 0x7F { sys::debug_print(b); }
+                else { print(b"."); }
+            }
+            shown += lim;
+            if shown >= 80 { break; }
+        }
+        print(b"]\n");
+    }
+    // Log all P4 writev to non-serial fds
+    if ctx.pid == 4 && fd >= 3 {
+        let kind = if fd < GRP_MAX_FDS { ctx.child_fds[fd] } else { 0 };
+        print(b"P4-WRITEV fd="); print_u64(fd as u64);
+        print(b" kind="); print_u64(kind as u64);
+        print(b"\n");
+    }
     if fd < GRP_MAX_FDS && ctx.child_fds[fd] == 2 {
         let mut total: usize = 0;
         let cnt = iovcnt.min(16);
         for i in 0..cnt {
             let entry = iov_ptr + (i as u64) * 16;
             if entry + 16 > 0x0000_8000_0000_0000 { break; }
-            let base = unsafe { *(entry as *const u64) };
-            let len = unsafe { *((entry + 8) as *const u64) } as usize;
+            let base = ctx.guest_read_u64(entry);
+            let len = ctx.guest_read_u64(entry + 8) as usize;
             if base == 0 || len == 0 { continue; }
-            let data = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
-            for &b in data { sys::debug_print(b); unsafe { fb_putchar(b); } }
-            total += len;
+            let safe_len = len.min(4096);
+            let mut local_buf = [0u8; 4096];
+            ctx.guest_read(base, &mut local_buf[..safe_len]);
+            for j in 0..safe_len { sys::debug_print(local_buf[j]); unsafe { fb_putchar(local_buf[j]); } }
+            total += safe_len;
         }
         reply_val(ctx.ep_cap, total as i64);
     } else if fd < GRP_MAX_FDS && ctx.child_fds[fd] == 8 {
@@ -1346,6 +1532,71 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
             if !ok { break; }
         }
         reply_val(ctx.ep_cap, if ok && total > 0 { total as i64 } else { -EIO });
+    } else if fd < GRP_MAX_FDS && ctx.child_fds[fd] == 11 {
+        // Pipe write via writev: gather iovecs and write to pipe buffer
+        let pipe_id = ctx.sock_conn_id[fd] as usize;
+        let cnt = iovcnt.min(16);
+        let mut total = 0usize;
+        // Log all iovec content for git debugging
+        if ctx.pid >= 3 && cnt > 0 {
+            // Compute total length
+            let mut tlen = 0usize;
+            for j in 0..cnt {
+                let e = iov_ptr + (j as u64) * 16;
+                if e + 16 > 0x0000_8000_0000_0000 { break; }
+                let il = unsafe { *((e + 8) as *const u64) } as usize;
+                tlen += il;
+            }
+            print(b"PIPEV-W P"); print_u64(ctx.pid as u64);
+            print(b" fd="); print_u64(fd as u64);
+            print(b" len="); print_u64(tlen as u64);
+            print(b" [");
+            let mut shown = 0usize;
+            for j in 0..cnt {
+                let e = iov_ptr + (j as u64) * 16;
+                if e + 16 > 0x0000_8000_0000_0000 { break; }
+                let base = unsafe { *(e as *const u64) };
+                let il = unsafe { *((e + 8) as *const u64) } as usize;
+                if base == 0 || il == 0 { continue; }
+                let lim = il.min(80 - shown);
+                for k in 0..lim {
+                    let b = unsafe { *(base as *const u8).add(k) };
+                    if b == 0x0A { print(b"\\n"); }
+                    else if b >= 0x20 && b < 0x7F { sys::debug_print(b); }
+                    else { print(b"."); }
+                }
+                shown += lim;
+                if shown >= 80 { break; }
+            }
+            print(b"]\n");
+        }
+        for i in 0..cnt {
+            let entry = iov_ptr + (i as u64) * 16;
+            if entry + 16 > 0x0000_8000_0000_0000 { break; }
+            let base = ctx.guest_read_u64(entry);
+            let ilen = ctx.guest_read_u64(entry + 8) as usize;
+            if base == 0 || ilen == 0 { continue; }
+            let safe_ilen = ilen.min(4096);
+            let mut local_buf = [0u8; 4096];
+            ctx.guest_read(base, &mut local_buf[..safe_ilen]);
+            let src = &local_buf[..safe_ilen];
+            let mut written = 0usize;
+            let mut retries = 0u32;
+            while written < safe_ilen {
+                let n = pipe_write(pipe_id, &src[written..]);
+                written += n;
+                if n == 0 {
+                    retries += 1;
+                    if retries > 10000 { break; }
+                    sys::yield_now();
+                } else {
+                    retries = 0;
+                }
+            }
+            total += written;
+            if written < safe_ilen { break; } // pipe full, stop
+        }
+        reply_val(ctx.ep_cap, total as i64);
     } else {
         reply_val(ctx.ep_cap, -EBADF);
     }
@@ -1452,6 +1703,11 @@ pub(crate) fn sys_dup(ctx: &mut SyscallContext, msg: &IpcMsg) {
             if ctx.child_fds[i] == 0 { newfd = Some(i); break; }
         }
         if let Some(nfd) = newfd {
+            // Increment pipe refcount for the dup'd fd
+            let ok = ctx.child_fds[oldfd];
+            let op = ctx.sock_conn_id[oldfd] as usize;
+            if ok == 11 && op < MAX_PIPES { PIPE_WRITE_REFS[op].fetch_add(1, Ordering::AcqRel); }
+            else if ok == 10 && op < MAX_PIPES { PIPE_READ_REFS[op].fetch_add(1, Ordering::AcqRel); }
             ctx.child_fds[nfd] = ctx.child_fds[oldfd];
             ctx.sock_conn_id[nfd] = ctx.sock_conn_id[oldfd];
             ctx.sock_udp_local_port[nfd] = ctx.sock_udp_local_port[oldfd];
@@ -1471,6 +1727,23 @@ pub(crate) fn sys_dup2(ctx: &mut SyscallContext, msg: &IpcMsg) {
     if oldfd >= GRP_MAX_FDS || ctx.child_fds[oldfd] == 0 || newfd >= GRP_MAX_FDS {
         reply_val(ctx.ep_cap, -EBADF);
     } else {
+        // If newfd was a pipe, decrement its refcount before overwriting
+        if newfd < GRP_MAX_FDS && ctx.child_fds[newfd] != 0 {
+            let nk = ctx.child_fds[newfd];
+            let np = ctx.sock_conn_id[newfd] as usize;
+            if nk == 11 && np < MAX_PIPES {
+                let prev = PIPE_WRITE_REFS[np].fetch_sub(1, Ordering::AcqRel);
+                if prev <= 1 { PIPE_WRITE_CLOSED[np].store(1, Ordering::Release); }
+            } else if nk == 10 && np < MAX_PIPES {
+                let prev = PIPE_READ_REFS[np].fetch_sub(1, Ordering::AcqRel);
+                if prev <= 1 { PIPE_READ_CLOSED[np].store(1, Ordering::Release); }
+            }
+        }
+        // Increment refcount for the pipe being dup'd
+        let ok = ctx.child_fds[oldfd];
+        let op = ctx.sock_conn_id[oldfd] as usize;
+        if ok == 11 && op < MAX_PIPES { PIPE_WRITE_REFS[op].fetch_add(1, Ordering::AcqRel); }
+        else if ok == 10 && op < MAX_PIPES { PIPE_READ_REFS[op].fetch_add(1, Ordering::AcqRel); }
         ctx.child_fds[newfd] = ctx.child_fds[oldfd];
         ctx.sock_conn_id[newfd] = ctx.sock_conn_id[oldfd];
         ctx.sock_udp_local_port[newfd] = ctx.sock_udp_local_port[oldfd];
@@ -1492,6 +1765,11 @@ pub(crate) fn sys_fcntl(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 let mut nfd = None;
                 for i in min..GRP_MAX_FDS { if ctx.child_fds[i] == 0 { nfd = Some(i); break; } }
                 if let Some(n) = nfd {
+                    // Increment pipe refcount
+                    let ok = ctx.child_fds[fd];
+                    let op = ctx.sock_conn_id[fd] as usize;
+                    if ok == 11 && op < MAX_PIPES { PIPE_WRITE_REFS[op].fetch_add(1, Ordering::AcqRel); }
+                    else if ok == 10 && op < MAX_PIPES { PIPE_READ_REFS[op].fetch_add(1, Ordering::AcqRel); }
                     ctx.child_fds[n] = ctx.child_fds[fd];
                     ctx.sock_conn_id[n] = ctx.sock_conn_id[fd];
                     ctx.sock_udp_local_port[n] = ctx.sock_udp_local_port[fd];
@@ -2282,7 +2560,24 @@ pub(crate) fn sys_dup3(ctx: &mut SyscallContext, msg: &IpcMsg) {
     } else if oldfd == newfd {
         reply_val(ctx.ep_cap, -EINVAL);
     } else {
-        if ctx.child_fds[newfd] != 0 { ctx.child_fds[newfd] = 0; } // close newfd
+        // Decrement refcount for existing pipe at newfd
+        if ctx.child_fds[newfd] != 0 {
+            let nk = ctx.child_fds[newfd];
+            let np = ctx.sock_conn_id[newfd] as usize;
+            if nk == 11 && np < MAX_PIPES {
+                let prev = PIPE_WRITE_REFS[np].fetch_sub(1, Ordering::AcqRel);
+                if prev <= 1 { PIPE_WRITE_CLOSED[np].store(1, Ordering::Release); }
+            } else if nk == 10 && np < MAX_PIPES {
+                let prev = PIPE_READ_REFS[np].fetch_sub(1, Ordering::AcqRel);
+                if prev <= 1 { PIPE_READ_CLOSED[np].store(1, Ordering::Release); }
+            }
+            ctx.child_fds[newfd] = 0;
+        }
+        // Increment refcount for pipe being dup'd
+        let ok = ctx.child_fds[oldfd];
+        let op = ctx.sock_conn_id[oldfd] as usize;
+        if ok == 11 && op < MAX_PIPES { PIPE_WRITE_REFS[op].fetch_add(1, Ordering::AcqRel); }
+        else if ok == 10 && op < MAX_PIPES { PIPE_READ_REFS[op].fetch_add(1, Ordering::AcqRel); }
         ctx.child_fds[newfd] = ctx.child_fds[oldfd];
         ctx.sock_conn_id[newfd] = ctx.sock_conn_id[oldfd];
         ctx.sock_udp_local_port[newfd] = ctx.sock_udp_local_port[oldfd];

@@ -8,6 +8,8 @@ pub fn alloc_blocks(bitmap: &mut [u8; BITMAP_BYTES], max_blocks: u32, count: u32
     if count == 0 {
         return None;
     }
+    // Clamp to bitmap capacity to prevent out-of-bounds access
+    let max_blocks = max_blocks.min((BITMAP_BYTES as u32) * 8);
     let mut run_start: u32 = 0;
     let mut run_len: u32 = 0;
     let mut bit: u32 = 0;
@@ -44,7 +46,9 @@ pub fn alloc_blocks(bitmap: &mut [u8; BITMAP_BYTES], max_blocks: u32, count: u32
 
 /// Free `count` blocks starting at `start`.
 pub fn free_blocks(bitmap: &mut [u8; BITMAP_BYTES], start: u32, count: u32) {
+    let cap = (BITMAP_BYTES as u32) * 8;
     for b in start..start + count {
+        if b >= cap { break; }
         let byte_idx = (b / 8) as usize;
         let bit_idx = b % 8;
         bitmap[byte_idx] &= !(1 << bit_idx);
@@ -53,6 +57,7 @@ pub fn free_blocks(bitmap: &mut [u8; BITMAP_BYTES], start: u32, count: u32) {
 
 /// Count the number of free blocks in the bitmap (byte-level optimization).
 pub fn count_free(bitmap: &[u8; BITMAP_BYTES], max_blocks: u32) -> u32 {
+    let max_blocks = max_blocks.min((BITMAP_BYTES as u32) * 8);
     let full_bytes = (max_blocks / 8) as usize;
     let mut free = 0u32;
     // Count full bytes using popcount

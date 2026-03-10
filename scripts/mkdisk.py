@@ -26,6 +26,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import io
 import os
 import struct
@@ -176,6 +177,9 @@ class DiskBuilder:
         # Name-based lookup cache: (parent_oid, name_bytes) -> oid
         self._dir_cache = {(0, b'/'): ROOT_OID}
 
+        # Content dedup cache: sha256 -> (sector_start, sector_count)
+        self._content_cache = {}
+
     def alloc_blocks(self, count):
         """Allocate contiguous data blocks. Returns start block index."""
         if count == 0:
@@ -226,9 +230,17 @@ class DiskBuilder:
             idx, oid = existing
             size = len(file_data)
             count = sectors_for(size)
-            start = self.alloc_blocks(count)
             if size > 0:
-                self.write_data(start, file_data)
+                content_hash = hashlib.sha256(file_data).digest()
+                cached = self._content_cache.get(content_hash)
+                if cached is not None:
+                    start, _ = cached
+                else:
+                    start = self.alloc_blocks(count)
+                    self.write_data(start, file_data)
+                    self._content_cache[content_hash] = (start, count)
+            else:
+                start = 0
             entry = make_direntry(
                 oid=oid, name_bytes=name_bytes, size=size,
                 sector_start=start, sector_count=count, flags=0,
@@ -243,9 +255,19 @@ class DiskBuilder:
 
         size = len(file_data)
         count = sectors_for(size)
-        start = self.alloc_blocks(count)
+
+        # Content dedup: reuse data blocks for identical files
         if size > 0:
-            self.write_data(start, file_data)
+            content_hash = hashlib.sha256(file_data).digest()
+            cached = self._content_cache.get(content_hash)
+            if cached is not None:
+                start, _ = cached
+            else:
+                start = self.alloc_blocks(count)
+                self.write_data(start, file_data)
+                self._content_cache[content_hash] = (start, count)
+        else:
+            start = 0
 
         oid = self.next_oid
         self.next_oid += 1

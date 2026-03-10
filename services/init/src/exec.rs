@@ -12,6 +12,10 @@ use ufmt::uwrite;
 fn parse_elf_goblin(data: &[u8]) -> Result<(ElfInfo, [LoadSegment; MAX_LOAD_SEGMENTS], usize, Option<InterpInfo>), i64> {
     use goblin::elf::Elf;
 
+    // Reset bump allocator BEFORE parsing to ensure enough heap space.
+    // Caller holds EXEC_LOCK so no concurrent allocations from other execs.
+    crate::bump_alloc::reset();
+
     let elf = Elf::parse(data).map_err(|_| -8i64)?;
 
     let info = ElfInfo {
@@ -77,11 +81,18 @@ pub(crate) const INTERP_BUF_BASE: u64 = 0xA000000; // Far from other regions
 pub(crate) const INTERP_BUF_PAGES: u64 = 220; // ~900 KiB, enough for ld-musl (~845 KiB)
 /// Load base for the dynamic interpreter (ET_DYN, position-independent).
 pub(crate) const INTERP_LOAD_BASE: u64 = 0x6000000;
+/// Per-process ELF code base for ET_DYN (PIE) binaries.
+/// Each exec gets a unique 16MB slot starting at 0x70000000.
+/// 16 slots × 16MB = 256MB, ending at 0x80000000.
+pub(crate) static NEXT_DYN_BASE: AtomicU64 = AtomicU64::new(0x70000000);
+const DYN_BASE_SLOT_SIZE: u64 = 0x1000000; // 16 MiB per binary
 
 /// Max args for execve (including argv[0]).
 pub(crate) const MAX_EXEC_ARGS: usize = 16;
 /// Max length of a single argv string.
 pub(crate) const MAX_EXEC_ARG_LEN: usize = 128;
+/// Max env vars passed via execve envp.
+pub(crate) const MAX_EXEC_ENVS: usize = 16;
 
 pub(crate) const MAP_WRITABLE: u64 = 2;
 
@@ -225,16 +236,34 @@ pub(crate) fn map_elf_segments(
         let seg_end = (load_vaddr + seg.memsz as u64 + 0xFFF) & !0xFFF;
         let is_writable = (seg.flags & 2) != 0;
 
+        let mut page_count = 0u64;
         let mut page_vaddr = seg_start;
         while page_vaddr < seg_end {
-            let frame_cap = sys::frame_alloc().map_err(|_| -12i64)?;
+            if page_count < 3 {
+                for &b in b"P:" { sys::debug_print(b); }
+                // Print page_count digit
+                sys::debug_print(b'0' + page_count as u8);
+                sys::debug_print(b' ');
+            }
+            page_count += 1;
+            let frame_cap = match sys::frame_alloc() {
+                Ok(f) => f,
+                Err(_) => {
+                    for &b in b"FA!\n" { sys::debug_print(b); }
+                    return Err(-12);
+                }
+            };
+            if page_count <= 3 { sys::debug_print(b'a'); }
 
             // Map temporarily to copy data
             if sys::map(EXEC_TEMP_MAP, frame_cap, MAP_WRITABLE).is_err() {
+                for &b in b"MT!\n" { sys::debug_print(b); }
                 return Err(-12);
             }
+            if page_count <= 3 { sys::debug_print(b'm'); }
 
             unsafe { core::ptr::write_bytes(EXEC_TEMP_MAP as *mut u8, 0, 4096); }
+            if page_count <= 3 { sys::debug_print(b'z'); }
 
             // Copy file data for this page
             let page_start = page_vaddr;
@@ -256,17 +285,22 @@ pub(crate) fn map_elf_segments(
                     );
                 }
             }
+            if page_count <= 3 { sys::debug_print(b'c'); }
 
             let _ = sys::unmap(EXEC_TEMP_MAP);
+            if page_count <= 3 { sys::debug_print(b'u'); }
 
             let flags = if is_writable { MAP_WRITABLE } else { 0 };
             if sys::map(page_vaddr, frame_cap, flags).is_err() {
+                for &b in b"MF!\n" { sys::debug_print(b); }
                 return Err(-12);
             }
+            if page_count <= 3 { sys::debug_print(b'M'); sys::debug_print(b'\n'); }
 
             page_vaddr += 4096;
         }
     }
+    sys::debug_print(b'\n');
     Ok(())
 }
 
@@ -293,10 +327,10 @@ pub(crate) fn unmap_temp_buf(base: u64, pages: u64) {
 /// Caller must hold EXEC_LOCK.
 pub(crate) fn exec_from_initrd(bin_name: &[u8]) -> Result<(u64, u64), i64> {
     let empty: [[u8; MAX_EXEC_ARG_LEN]; 0] = [];
-    exec_from_initrd_argv(bin_name, &empty)
+    exec_from_initrd_argv(bin_name, &empty, &empty)
 }
 
-pub(crate) fn exec_from_initrd_argv(bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_LEN]]) -> Result<(u64, u64), i64> {
+pub(crate) fn exec_from_initrd_argv(bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_LEN]], envp: &[[u8; MAX_EXEC_ARG_LEN]]) -> Result<(u64, u64), i64> {
     // Step 1: Map temp buffer and read main ELF from initrd
     map_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES)?;
 
@@ -314,19 +348,19 @@ pub(crate) fn exec_from_initrd_argv(bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_L
     };
 
     // Delegate to shared ELF loading path
-    exec_loaded_elf(file_size, bin_name, argv)
+    exec_loaded_elf(file_size, bin_name, argv, envp)
 }
 
 /// Load an ELF from VFS into the current address space, create a redirected thread.
 /// Caller must hold EXEC_LOCK.
 pub(crate) fn exec_from_vfs(path: &[u8]) -> Result<(u64, u64), i64> {
     let empty: [[u8; MAX_EXEC_ARG_LEN]; 0] = [];
-    exec_from_vfs_argv(path, &empty)
+    exec_from_vfs_argv(path, &empty, &empty)
 }
 
 /// Load an ELF from VFS with argv support.
 /// Caller must hold EXEC_LOCK.
-pub(crate) fn exec_from_vfs_argv(path: &[u8], argv: &[[u8; MAX_EXEC_ARG_LEN]]) -> Result<(u64, u64), i64> {
+pub(crate) fn exec_from_vfs_argv(path: &[u8], argv: &[[u8; MAX_EXEC_ARG_LEN]], envp: &[[u8; MAX_EXEC_ARG_LEN]]) -> Result<(u64, u64), i64> {
     // Step 1: Map temp buffer and read main ELF from VFS
     map_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES)?;
 
@@ -355,12 +389,24 @@ pub(crate) fn exec_from_vfs_argv(path: &[u8], argv: &[[u8; MAX_EXEC_ARG_LEN]]) -
     }
 
     // Step 2-8 are identical to exec_from_initrd_argv — factor into shared helper
-    exec_loaded_elf(file_size, path, argv)
+    exec_loaded_elf(file_size, path, argv, envp)
 }
 
 /// Common ELF loading path after the binary data is already at EXEC_BUF_BASE.
 /// Used by both exec_from_initrd_argv and exec_from_vfs_argv.
-fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_LEN]]) -> Result<(u64, u64), i64> {
+/// Check if an env entry (e.g., b"HOME=/tmp\0...") has the given key prefix.
+fn env_key_eq(entry: &[u8; MAX_EXEC_ARG_LEN], key: &[u8]) -> bool {
+    if key.len() >= MAX_EXEC_ARG_LEN { return false; }
+    if entry[key.len()] != b'=' { return false; }
+    let mut i = 0;
+    while i < key.len() {
+        if entry[i] != key[i] { return false; }
+        i += 1;
+    }
+    true
+}
+
+fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_LEN]], envp: &[[u8; MAX_EXEC_ARG_LEN]]) -> Result<(u64, u64), i64> {
     let elf_data = unsafe { core::slice::from_raw_parts(EXEC_BUF_BASE as *const u8, file_size) };
     let (elf_info, segments, seg_count, interp_info) = match parse_elf_goblin(elf_data) {
         Ok(parsed) => parsed,
@@ -370,8 +416,15 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
         }
     };
     let is_dynamic = interp_info.is_some();
+    for &b in b"EL:1\n" { sys::debug_print(b); }
 
-    let main_base: u64 = if elf_info.elf_type == 3 { 0x400000 } else { 0 };
+    // ET_DYN (PIE): each process gets a unique 16MB slot to avoid code overlap.
+    // ET_EXEC uses the fixed address from the ELF (main_base = 0).
+    let main_base: u64 = if elf_info.elf_type == 3 {
+        NEXT_DYN_BASE.fetch_add(DYN_BASE_SLOT_SIZE, Ordering::SeqCst)
+    } else {
+        0
+    };
 
     // Unmap previous binary's ELF pages (leftover from prior exec)
     // Scan segments to determine the full range and free it
@@ -394,11 +447,12 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
             }
         }
     }
-
+    for &b in b"EL:2\n" { sys::debug_print(b); }
     if let Err(e) = map_elf_segments(EXEC_BUF_BASE, &elf_info, &segments, seg_count, main_base) {
         unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
         return Err(e);
     }
+    for &b in b"EL:3\n" { sys::debug_print(b); }
 
     let mut exec_entry = main_base + elf_info.entry;
     let mut interp_base: u64 = 0;
@@ -470,8 +524,9 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
             }
         };
 
-        interp_base = INTERP_LOAD_BASE;
-        // Unmap previous interpreter pages (e.g., leftover from musl dynamic test)
+        // Place interpreter 8MB past main_base (within the 16MB slot)
+        interp_base = if elf_info.elf_type == 3 { main_base + 0x800000 } else { INTERP_LOAD_BASE };
+        // Unmap previous interpreter pages at this location
         for pg in 0..0x110u64 {
             let _ = sys::unmap_free(interp_base + pg * 0x1000);
         }
@@ -549,27 +604,48 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
     let elf_base = main_base + if seg_count > 0 { segments[0].vaddr & !0xFFF } else { 0 };
     let phdr_vaddr = elf_base + elf_info.phoff as u64;
 
-    // Environment strings
-    let env_term = b"TERM=xterm\0";
-    let env_home = b"HOME=/\0";
-    let env_terminfo = b"TERMINFO=/usr/share/terminfo\0";
-    let env_path = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin\0";
-    let env_term_addr = str_area + spos as u64;
-    unsafe { core::ptr::copy_nonoverlapping(env_term.as_ptr(), env_term_addr as *mut u8, env_term.len()); }
-    spos += env_term.len();
-    let env_home_addr = str_area + spos as u64;
-    unsafe { core::ptr::copy_nonoverlapping(env_home.as_ptr(), env_home_addr as *mut u8, env_home.len()); }
-    spos += env_home.len();
-    let env_terminfo_addr = str_area + spos as u64;
-    unsafe { core::ptr::copy_nonoverlapping(env_terminfo.as_ptr(), env_terminfo_addr as *mut u8, env_terminfo.len()); }
-    spos += env_terminfo.len();
-    let env_path_addr = str_area + spos as u64;
-    unsafe { core::ptr::copy_nonoverlapping(env_path.as_ptr(), env_path_addr as *mut u8, env_path.len()); }
+    // Environment: user envp first (overrides defaults), then defaults for non-overridden keys
+    let defaults: [&[u8]; 4] = [
+        b"TERM=xterm\0", b"HOME=/\0",
+        b"TERMINFO=/usr/share/terminfo\0", b"PATH=/usr/bin:/bin:/usr/sbin:/sbin\0",
+    ];
+    let default_keys: [&[u8]; 4] = [b"TERM", b"HOME", b"TERMINFO", b"PATH"];
+    let mut env_addrs = [0u64; MAX_EXEC_ENVS + 4];
+    let mut env_count: usize = 0;
+
+    // User env vars first (they take priority — libc uses first occurrence)
+    for e in 0..envp.len() {
+        let mut elen = 0;
+        while elen < MAX_EXEC_ARG_LEN && envp[e][elen] != 0 { elen += 1; }
+        if elen == 0 { continue; }
+        env_addrs[env_count] = str_area + spos as u64;
+        unsafe {
+            let dst = (str_area + spos as u64) as *mut u8;
+            core::ptr::copy_nonoverlapping(envp[e].as_ptr(), dst, elen);
+            *dst.add(elen) = 0;
+        }
+        spos += elen + 1;
+        env_count += 1;
+    }
+
+    // Defaults only if key not already provided by user
+    for d in 0..4 {
+        let mut overridden = false;
+        for e in 0..envp.len() {
+            if env_key_eq(&envp[e], default_keys[d]) { overridden = true; break; }
+        }
+        if !overridden {
+            let val = defaults[d];
+            env_addrs[env_count] = str_area + spos as u64;
+            unsafe { core::ptr::copy_nonoverlapping(val.as_ptr(), (str_area + spos as u64) as *mut u8, val.len()); }
+            spos += val.len(); // val includes \0
+            env_count += 1;
+        }
+    }
 
     // Auxv: 10 pairs for dynamic, 9 for static (added AT_UID/AT_GID/AT_CLKTCK)
     let auxv_pairs: u64 = if is_dynamic { 12 } else { 11 };
-    let env_count: u64 = 4;
-    let entries: u64 = 1 + argc as u64 + 1 + env_count + 1 + auxv_pairs * 2;
+    let entries: u64 = 1 + argc as u64 + 1 + env_count as u64 + 1 + auxv_pairs * 2;
     let rsp = (str_area - entries as u64 * 8) & !0xF;
 
     unsafe {
@@ -578,10 +654,7 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
         *sp.add(i) = argc as u64; i += 1;
         for a in 0..argc { *sp.add(i) = argv_addrs[a]; i += 1; }
         *sp.add(i) = 0; i += 1;
-        *sp.add(i) = env_term_addr; i += 1;
-        *sp.add(i) = env_home_addr; i += 1;
-        *sp.add(i) = env_terminfo_addr; i += 1;
-        *sp.add(i) = env_path_addr; i += 1;
+        for e in 0..env_count { *sp.add(i) = env_addrs[e]; i += 1; }
         *sp.add(i) = 0; i += 1;
         // AT_PHDR(3)
         *sp.add(i) = 3; i += 1; *sp.add(i) = phdr_vaddr; i += 1;

@@ -848,6 +848,16 @@ pub fn set_current_fs_base(value: u64) {
     write_fs_base_msr(value);
 }
 
+/// Set a thread's FS_BASE by TID (for CoW fork — child inherits parent's TLS).
+pub fn set_thread_fs_base(tid: ThreadId, value: u64) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(slot) = sched.slot_of(tid) {
+        if let Some(t) = sched.threads.get_mut_by_index(slot) {
+            t.fs_base = value;
+        }
+    }
+}
+
 /// Get the current thread's FS_BASE value.
 pub fn get_current_fs_base() -> u64 {
     let percpu = percpu::current_percpu();

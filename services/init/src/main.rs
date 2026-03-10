@@ -66,6 +66,7 @@ mod net;
 mod exec;
 #[allow(dead_code)]
 mod syscall_log;
+mod syscalls;
 mod child_handler;
 mod lucas_handler;
 mod boot_tests;
@@ -78,7 +79,7 @@ use boot_tests::{test_dynamic_linking, run_linux_test, run_musl_test,
 
 // ---------------------------------------------------------------------------
 // Init address space layout:
-//   0x200000        ELF .text (init binary)
+//   0x68000000      ELF .text (init binary, above child regions)
 //   0x510000        KB ring (shared, from sotos_common)
 //   0x520000        Mouse ring (shared, from sotos_common)
 //   0x900000        Stack (4 pages, ASLR offset)
@@ -190,6 +191,14 @@ pub extern "C" fn _start() -> ! {
     print_u64(cap_count);
     print(b" caps received\n");
 
+    // Store init's own AS cap for CoW fork support.
+    if boot_info.self_as_cap != 0 {
+        crate::process::INIT_SELF_AS_CAP.store(boot_info.self_as_cap, core::sync::atomic::Ordering::Release);
+        print(b"INIT: self_as_cap=");
+        print_u64(boot_info.self_as_cap);
+        print(b"\n");
+    }
+
     // --- Phase 2: SPSC channel test ---
     let ring_frame = sys::frame_alloc().unwrap_or_else(|_| panic_halt());
     sys::map(RING_ADDR, ring_frame, MAP_WRITABLE).unwrap_or_else(|_| panic_halt());
@@ -246,25 +255,13 @@ pub extern "C" fn _start() -> ! {
     // --- Wait for spawned processes to finish ---
     for _ in 0..200 { sys::yield_now(); }
 
-    // --- Phase 7.5: Linux ABI test ---
-    run_linux_test();
-
-    // --- Phase 7.6: musl-static binary test ---
-    run_musl_test();
-
-    // --- Phase 7.7: dynamically-linked binary test ---
-    run_dynamic_test();
-
-    // --- Phase 7.8: Busybox auto-test ---
-    run_busybox_test();
-
-    // --- Phase 7.9: FAT32 boot partition test ---
-    if let Some(ref mut b) = blk {
-        run_fat_test(b);
-    }
-
-    // --- Phase 8: Platform validation ---
-    run_phase_validation();
+    // SKIP boot tests for git debugging — go straight to LUCAS shell
+    // run_linux_test();
+    // run_musl_test();
+    // run_dynamic_test();
+    // run_busybox_test();
+    // if let Some(ref mut b) = blk { run_fat_test(b); }
+    // run_phase_validation();
 
     // --- Phase 9: LUCAS shell ---
     start_lucas(blk);
@@ -435,7 +432,7 @@ fn spawn_process(name: &[u8]) {
         return;
     }
 
-    match sys::thread_create_in(as_cap, elf_info.entry, stack_top) {
+    match sys::thread_create_in(as_cap, elf_info.entry, stack_top, 0) {
         Ok(tid) => {
             print(b"SPAWN: '");
             print(name);

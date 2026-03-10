@@ -87,6 +87,11 @@ const SYS_ADDR_SPACE_CREATE: u64 = 120;
 const SYS_MAP_INTO: u64 = 121;
 const SYS_THREAD_CREATE_IN: u64 = 122;
 const SYS_UNMAP_FROM: u64 = 123;
+const SYS_AS_CLONE: u64 = 125;
+const SYS_FRAME_COPY: u64 = 126;
+const SYS_PTE_READ: u64 = 127;
+const SYS_VM_READ: u64 = 128;
+const SYS_VM_WRITE: u64 = 129;
 
 /// Syscall numbers — service registry.
 const SYS_SVC_REGISTER: u64 = 130;
@@ -274,35 +279,54 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
             regs: [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9, tid, saved_user_rsp],
             cap_transfer: None,
         };
-        match endpoint::call(PoolHandle::from_raw(ep_raw), msg) {
-            Ok(reply) => {
-                if reply.tag == sotos_common::SIG_REDIRECT_TAG {
-                    // Signal delivery: LUCAS built a signal frame on the child's
-                    // stack and wants to redirect execution to the signal handler.
-                    frame.rcx = reply.regs[0]; // new user RIP = handler address
-                    frame.rdi = reply.regs[1] as u64; // arg0 = signal number
-                    frame.rsi = reply.regs[2]; // arg1 = &siginfo (or 0)
-                    frame.rdx = reply.regs[3]; // arg2 = &ucontext (or 0)
-                    saved_user_rsp = reply.regs[4]; // new user RSP (below signal frame)
-                    frame.rax = reply.regs[5]; // custom RAX (0 for signals, child_pid for fork)
-                    frame.r11 = 0x202; // RFLAGS with IF=1
-                    kdebug!("SIG_REDIRECT: handler={:#x} signo={} rsp={:#x}", reply.regs[0], reply.regs[1], reply.regs[4]);
-                } else {
-                    frame.rax = reply.regs[0]; // return value
-                    // For SYS_read (tag=0): if handler returned inline byte
-                    // data in regs[1], write it to the user buffer from kernel
-                    // context as insurance (redundant with handler's write).
-                    if msg.tag == 0 && reply.regs[0] > 0 {
-                        let buf_ptr = frame.rsi;
-                        let byte_count = reply.regs[0] as usize;
-                        if buf_ptr != 0 && buf_ptr < USER_ADDR_LIMIT && byte_count == 1 {
-                            unsafe { core::ptr::write_volatile(buf_ptr as *mut u8, reply.regs[1] as u8); }
+
+        // Retry loop: init may reply PIPE_RETRY_TAG for pipe reads/polls
+        // when no data is available. The kernel yields (letting other threads
+        // write pipe data) then re-sends the syscall to init.
+        let mut retries = 0u32;
+        loop {
+            match endpoint::call(PoolHandle::from_raw(ep_raw), msg) {
+                Ok(reply) => {
+                    if reply.tag == sotos_common::PIPE_RETRY_TAG {
+                        retries += 1;
+                        if retries < 500_000 {
+                            sched::schedule(); // yield to let other threads run
+                            continue; // re-send message to init
                         }
+                        // Retry limit hit — return 0 (EOF) to the child
+                        frame.rax = 0;
+                        break;
+                    } else if reply.tag == sotos_common::SIG_REDIRECT_TAG {
+                        // Signal delivery: LUCAS built a signal frame on the child's
+                        // stack and wants to redirect execution to the signal handler.
+                        frame.rcx = reply.regs[0]; // new user RIP = handler address
+                        frame.rdi = reply.regs[1] as u64; // arg0 = signal number
+                        frame.rsi = reply.regs[2]; // arg1 = &siginfo (or 0)
+                        frame.rdx = reply.regs[3]; // arg2 = &ucontext (or 0)
+                        saved_user_rsp = reply.regs[4]; // new user RSP (below signal frame)
+                        frame.rax = reply.regs[5]; // custom RAX (0 for signals, child_pid for fork)
+                        frame.r11 = 0x202; // RFLAGS with IF=1
+                        kdebug!("SIG_REDIRECT: handler={:#x} signo={} rsp={:#x}", reply.regs[0], reply.regs[1], reply.regs[4]);
+                        break;
+                    } else {
+                        frame.rax = reply.regs[0]; // return value
+                        // For SYS_read (tag=0): if handler returned inline byte
+                        // data in regs[1], write it to the user buffer from kernel
+                        // context as insurance (redundant with handler's write).
+                        if msg.tag == 0 && reply.regs[0] > 0 {
+                            let buf_ptr = frame.rsi;
+                            let byte_count = reply.regs[0] as usize;
+                            if buf_ptr != 0 && buf_ptr < USER_ADDR_LIMIT && byte_count == 1 {
+                                unsafe { core::ptr::write_volatile(buf_ptr as *mut u8, reply.regs[1] as u8); }
+                            }
+                        }
+                        break;
                     }
                 }
-            }
-            Err(e) => {
-                frame.rax = e as i64 as u64;
+                Err(e) => {
+                    frame.rax = e as i64 as u64;
+                    break;
+                }
             }
         }
         percpu::current_percpu().user_rsp_save = saved_user_rsp;
@@ -799,13 +823,13 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         }
 
         // SYS_FAULT_REGISTER — register notification for page fault delivery
-        // rdi = notify_cap (requires WRITE right), rsi = as_cap (0 = caller's own AS)
+        // rdi = notify_cap (requires WRITE right), rsi = as_cap (0 = global fallback)
         SYS_FAULT_REGISTER => {
             match cap::validate(frame.rdi as u32, Rights::WRITE) {
                 Ok(CapObject::Notification { id }) => {
                     let cr3 = if frame.rsi == 0 {
-                        // Register for caller's own address space.
-                        paging::read_cr3()
+                        // Register as global fallback handler (cr3=0).
+                        0
                     } else {
                         // Register for a specific address space.
                         match cap::validate(frame.rsi as u32, Rights::READ) {
@@ -823,6 +847,10 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
                         }
                     };
                     fault::register(PoolHandle::from_raw(id), cr3);
+                    // Also register cr3 → as_cap mapping if a specific AS was given.
+                    if frame.rsi != 0 {
+                        fault::register_cr3_cap(cr3, frame.rsi as u32);
+                    }
                     frame.rax = 0;
                 }
                 Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
@@ -831,7 +859,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         }
 
         // SYS_FAULT_RECV — pop next fault from queue
-        // Returns: rdi=addr, rsi=code, rdx=tid, r8=cr3 (or WouldBlock if empty)
+        // Returns: rdi=addr, rsi=code, rdx=tid, r8=cr3, r9=as_cap_id (or WouldBlock)
         SYS_FAULT_RECV => {
             match fault::pop_fault() {
                 Some(info) => {
@@ -840,6 +868,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
                     frame.rsi = info.code;
                     frame.rdx = info.tid as u64;
                     frame.r8 = info.cr3;
+                    frame.r9 = info.as_cap_id as u64;
                 }
                 None => {
                     frame.rax = SysError::WouldBlock as i64 as u64;
@@ -1155,16 +1184,33 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         }
 
         // SYS_THREAD_CREATE_IN — create a thread in a target address space
-        // rdi = as_cap (WRITE), rsi = rip, rdx = rsp
+        // rdi = as_cap (WRITE), rsi = rip, rdx = rsp, r8 = redirect_ep_cap (0 = none)
         SYS_THREAD_CREATE_IN => {
             match cap::validate(frame.rdi as u32, Rights::WRITE) {
                 Ok(CapObject::AddrSpace { cr3 }) => {
                     let rip = frame.rsi;
                     let rsp = frame.rdx;
+                    let redirect_cap = frame.r8;
                     if rip == 0 || rsp == 0 || rip >= USER_ADDR_LIMIT || rsp >= USER_ADDR_LIMIT {
                         frame.rax = SysError::InvalidArg as i64 as u64;
                     } else {
-                        let tid = sched::spawn_user(rip, rsp, cr3);
+                        let redirect_ep = if redirect_cap != 0 {
+                            match cap::validate(redirect_cap as u32, Rights::READ.or(Rights::WRITE)) {
+                                Ok(CapObject::Endpoint { id: ep_id }) => Some(ep_id),
+                                _ => {
+                                    frame.rax = SysError::InvalidCap as i64 as u64;
+                                    percpu::current_percpu().user_rsp_save = saved_user_rsp;
+                                    return;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        let tid = if let Some(ep_id) = redirect_ep {
+                            sched::spawn_user_with_redirect(rip, rsp, cr3, ep_id)
+                        } else {
+                            sched::spawn_user(rip, rsp, cr3)
+                        };
                         match cap::insert(CapObject::Thread { id: tid.0 }, Rights::ALL, None) {
                             Some(cap_id) => frame.rax = cap_id.raw() as u64,
                             None => frame.rax = SysError::OutOfResources as i64 as u64,
@@ -1470,6 +1516,19 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
             frame.rax = sched::get_current_fs_base();
         }
 
+        // SYS_SET_THREAD_FSBASE (162) — set FS_BASE for a target thread (by thread cap)
+        // rdi = thread_cap (WRITE), rsi = new FS base address
+        162 => {
+            match cap::validate(frame.rdi as u32, Rights::WRITE) {
+                Ok(CapObject::Thread { id: tid }) => {
+                    sched::set_thread_fs_base(ThreadId(tid), frame.rsi);
+                    frame.rax = 0;
+                }
+                Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
+                Err(e) => frame.rax = e as i64 as u64,
+            }
+        }
+
         // SYS_DEBUG_PRINT — write a single byte to serial
         SYS_DEBUG_PRINT => {
             serial::write_byte(frame.rdi as u8);
@@ -1547,6 +1606,212 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
             } else {
                 sched::set_pending_signal(ThreadId(target_tid), sig);
                 frame.rax = 0;
+            }
+        }
+
+        // SYS_AS_CLONE — clone an address space with CoW semantics
+        // rdi = src_as_cap (READ)
+        // Returns: rax = new AS cap_id (or error)
+        SYS_AS_CLONE => {
+            match cap::validate(frame.rdi as u32, Rights::READ) {
+                Ok(CapObject::AddrSpace { cr3 }) => {
+                    let src = paging::AddressSpace::from_cr3(cr3);
+                    let child = src.clone_cow();
+                    kdebug!("AS_CLONE: clone done, flushing TLB...");
+                    // Flush TLB: parent PTEs changed from writable to read-only.
+                    // If parent is current CR3, stale TLB entries could allow writes.
+                    if cr3 == paging::read_cr3() {
+                        paging::flush_tlb();
+                    }
+                    kdebug!("AS_CLONE: TLB flushed, inserting cap...");
+                    let child_cr3 = child.cr3();
+                    match cap::insert(CapObject::AddrSpace { cr3: child_cr3 }, Rights::ALL, None) {
+                        Some(cap_id) => {
+                            fault::register_cr3_cap(child_cr3, cap_id.raw());
+                            kdebug!("AS_CLONE: ok, cap={}", cap_id.raw());
+                            frame.rax = cap_id.raw() as u64;
+                        }
+                        None => {
+                            kdebug!("AS_CLONE: cap insert failed!");
+                            frame.rax = SysError::OutOfResources as i64 as u64;
+                        }
+                    }
+                }
+                Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
+                Err(e) => frame.rax = e as i64 as u64,
+            }
+        }
+
+        // SYS_FRAME_COPY — copy 4KiB from a page in src AS to a frame cap
+        // rdi = dst_frame_cap (WRITE), rsi = src_as_cap (READ), rdx = vaddr in src AS
+        // Copies via HHDM. Returns 0 on success.
+        SYS_FRAME_COPY => {
+            let dst_cap = frame.rdi as u32;
+            let src_as_cap = frame.rsi as u32;
+            let vaddr = frame.rdx;
+            match cap::validate(dst_cap, Rights::WRITE) {
+                Ok(CapObject::Memory { base: dst_phys, .. }) => {
+                    match cap::validate(src_as_cap, Rights::READ) {
+                        Ok(CapObject::AddrSpace { cr3 }) => {
+                            let src_as = paging::AddressSpace::from_cr3(cr3);
+                            match src_as.lookup_phys(vaddr & !0xFFF) {
+                                Some(src_phys) => {
+                                    let hhdm = mm::hhdm_offset();
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            (src_phys + hhdm) as *const u8,
+                                            (dst_phys + hhdm) as *mut u8,
+                                            4096,
+                                        );
+                                    }
+                                    frame.rax = 0;
+                                }
+                                None => frame.rax = SysError::NotFound as i64 as u64,
+                            }
+                        }
+                        Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
+                        Err(e) => frame.rax = e as i64 as u64,
+                    }
+                }
+                Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
+                Err(e) => frame.rax = e as i64 as u64,
+            }
+        }
+
+        // SYS_PTE_READ — read PTE (phys + flags) for a vaddr in an AS
+        // rdi = as_cap (READ), rsi = vaddr
+        // Returns: rax = phys_addr, rdi = flags (or error in rax)
+        SYS_PTE_READ => {
+            match cap::validate(frame.rdi as u32, Rights::READ) {
+                Ok(CapObject::AddrSpace { cr3 }) => {
+                    let vaddr = frame.rsi;
+                    let aspace = paging::AddressSpace::from_cr3(cr3);
+                    match aspace.lookup_pte(vaddr & !0xFFF) {
+                        Some((phys, flags)) => {
+                            frame.rax = phys;
+                            frame.rdi = flags;
+                        }
+                        None => frame.rax = SysError::NotFound as i64 as u64,
+                    }
+                }
+                Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
+                Err(e) => frame.rax = e as i64 as u64,
+            }
+        }
+
+        // SYS_VM_READ — read bytes from a target AS into caller's buffer
+        // rdi = as_cap, rsi = remote_vaddr, rdx = local_buf, r10 = len
+        SYS_VM_READ => {
+            let as_cap_id = frame.rdi as u32;
+            let remote_vaddr = frame.rsi;
+            let local_buf = frame.rdx;
+            let len = frame.r10 as usize;
+            if len > 4096 {
+                frame.rax = SysError::InvalidArg as i64 as u64;
+            } else {
+                match cap::validate(as_cap_id, Rights::READ) {
+                    Ok(CapObject::AddrSpace { cr3 }) => {
+                        let target_as = paging::AddressSpace::from_cr3(cr3);
+                        let hhdm = mm::hhdm_offset();
+                        let mut done = 0usize;
+                        let mut ok = true;
+                        while done < len {
+                            let vaddr = remote_vaddr + done as u64;
+                            let page_off = (vaddr & 0xFFF) as usize;
+                            let chunk = (4096 - page_off).min(len - done);
+                            match target_as.lookup_phys(vaddr & !0xFFF) {
+                                Some(phys) => {
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            (phys + hhdm + page_off as u64) as *const u8,
+                                            (local_buf + done as u64) as *mut u8,
+                                            chunk,
+                                        );
+                                    }
+                                    done += chunk;
+                                }
+                                None => { ok = false; break; }
+                            }
+                        }
+                        frame.rax = if ok { 0 } else { SysError::NotFound as i64 as u64 };
+                    }
+                    Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
+                    Err(e) => frame.rax = e as i64 as u64,
+                }
+            }
+        }
+
+        // SYS_VM_WRITE — write bytes from caller's buffer into a target AS
+        // rdi = as_cap, rsi = remote_vaddr, rdx = local_buf, r10 = len
+        // Handles CoW: if the target page is read-only, does copy-on-write.
+        SYS_VM_WRITE => {
+            let as_cap_id = frame.rdi as u32;
+            let remote_vaddr = frame.rsi;
+            let local_buf = frame.rdx;
+            let len = frame.r10 as usize;
+            if len > 4096 {
+                frame.rax = SysError::InvalidArg as i64 as u64;
+            } else {
+                match cap::validate(as_cap_id, Rights::WRITE) {
+                    Ok(CapObject::AddrSpace { cr3 }) => {
+                        let target_as = paging::AddressSpace::from_cr3(cr3);
+                        let hhdm = mm::hhdm_offset();
+                        let mut done = 0usize;
+                        let mut ok = true;
+                        while done < len {
+                            let vaddr = remote_vaddr + done as u64;
+                            let page_off = (vaddr & 0xFFF) as usize;
+                            let chunk = (4096 - page_off).min(len - done);
+                            match target_as.lookup_pte_mut(vaddr & !0xFFF) {
+                                Some(pte_ptr) => {
+                                    let pte = unsafe { *pte_ptr };
+                                    let old_phys = pte & 0x000F_FFFF_FFFF_F000;
+                                    let flags = pte & !0x000F_FFFF_FFFF_F000;
+
+                                    let write_phys = if flags & paging::PAGE_WRITABLE == 0 {
+                                        // CoW page: allocate new frame, copy old content, update PTE
+                                        let new_frame = match mm::alloc_frame() {
+                                            Some(f) => f.addr(),
+                                            None => { ok = false; break; }
+                                        };
+                                        // Copy old page content to new frame
+                                        unsafe {
+                                            core::ptr::copy_nonoverlapping(
+                                                (old_phys + hhdm) as *const u8,
+                                                (new_frame + hhdm) as *mut u8,
+                                                4096,
+                                            );
+                                        }
+                                        // Update PTE to point to new frame with WRITABLE
+                                        let new_pte = new_frame | (flags | paging::PAGE_WRITABLE);
+                                        unsafe { *pte_ptr = new_pte; }
+                                        // Decrement refcount on old frame
+                                        let rc = mm::frame_refcount_dec(old_phys);
+                                        if rc == 0 {
+                                            mm::free_frame(mm::PhysFrame::from_addr(old_phys));
+                                        }
+                                        new_frame
+                                    } else {
+                                        old_phys
+                                    };
+
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            (local_buf + done as u64) as *const u8,
+                                            (write_phys + hhdm + page_off as u64) as *mut u8,
+                                            chunk,
+                                        );
+                                    }
+                                    done += chunk;
+                                }
+                                None => { ok = false; break; }
+                            }
+                        }
+                        frame.rax = if ok { 0 } else { SysError::NotFound as i64 as u64 };
+                    }
+                    Ok(_) => frame.rax = SysError::InvalidCap as i64 as u64,
+                    Err(e) => frame.rax = e as i64 as u64,
+                }
             }
         }
 

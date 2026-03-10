@@ -1064,7 +1064,8 @@ pub(crate) fn run_busybox_test() {
     argv[2][..cmd.len()].copy_from_slice(cmd);
     print(b"BUSYBOX-TEST: argv built, calling exec_from_initrd_argv\n");
 
-    let ep_cap = match exec_from_initrd_argv(b"busybox", &argv) {
+    let empty_envp: [[u8; MAX_EXEC_ARG_LEN]; 0] = [];
+    let ep_cap = match exec_from_initrd_argv(b"busybox", &argv, &empty_envp) {
         Ok((ep, _tc)) => {
             EXEC_LOCK.store(0, Ordering::Release);
             ep
@@ -1113,6 +1114,7 @@ pub(crate) fn run_busybox_test() {
     let mut fork_saved_r15: u64 = 0;
     let mut _fork_saved_fsbase: u64 = 0;
     let mut fork_saved_stack: [u8; 512] = [0; 512]; // save stack around fork point
+    let mut fork_ret_addr: u64 = 0; // return address at [fork_rsp]
     let mut next_child_pid: u64 = 100;
     // child exit tracking: up to 8 children
     let mut child_pids: [u64; 8] = [0; 8];
@@ -2047,6 +2049,8 @@ pub(crate) fn run_busybox_test() {
                 fork_saved_r14 = saved_regs[13];
                 fork_saved_r15 = saved_regs[14];
                 _fork_saved_fsbase = saved_regs[16];
+                // Save return address at [fork_rsp] before child corrupts it
+                fork_ret_addr = unsafe { core::ptr::read_volatile(fork_saved_rsp as *const u64) };
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         fork_saved_rsp as *const u8,
@@ -2379,6 +2383,8 @@ pub(crate) fn run_busybox_test() {
                             fork_saved_rsp as *mut u8,
                             512,
                         );
+                        // Restore return address at [fork_rsp] explicitly
+                        core::ptr::write_volatile(fork_saved_rsp as *mut u64, fork_ret_addr);
                     }
                     // Build a restore frame on the fork-time stack:
                     // [rbx, rbp, r12, r13, r14, r15, return_rip]
@@ -2458,6 +2464,8 @@ pub(crate) fn run_busybox_test() {
                         fork_saved_rsp as *mut u8,
                         512,
                     );
+                    // Restore return address at [fork_rsp] explicitly
+                    core::ptr::write_volatile(fork_saved_rsp as *mut u64, fork_ret_addr);
                 }
                 let mut rsp = fork_saved_rsp;
                 rsp -= 8; unsafe { *(rsp as *mut u64) = fork_saved_rip; }

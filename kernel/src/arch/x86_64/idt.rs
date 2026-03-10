@@ -73,11 +73,11 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
             .set_handler_fn(general_protection_handler)
             .set_stack_index(super::gdt::GP_FAULT_IST_INDEX);
     }
-    unsafe {
-        idt.page_fault
-            .set_handler_fn(page_fault_handler)
-            .set_stack_index(super::gdt::PAGE_FAULT_IST_INDEX);
-    }
+    // #PF does NOT use IST — user-mode faults use the per-thread kernel stack
+    // (TSS RSP0), which is safe for context switching away faulted threads.
+    // Using IST causes corruption when multiple threads fault before the first
+    // returns through the IST stack (e.g., CoW fork marks all PTEs read-only).
+    idt.page_fault.set_handler_fn(page_fault_handler);
 
     // Contributory exceptions on IST 3 — catch them before they chain into #DF
     unsafe {
@@ -198,6 +198,13 @@ extern "x86-interrupt" fn page_fault_handler(
     if code.contains(PageFaultErrorCode::USER_MODE) {
         let tid = crate::sched::current_tid().map(|t| t.0).unwrap_or(0);
         let cr3 = crate::mm::paging::read_cr3();
+        // Log null-pointer faults (addr=0 or rip=0) to reduce noise
+        if addr == 0 || frame.instruction_pointer.as_u64() == 0 {
+            kprintln!(
+                "#PF-NULL tid={} addr={:#x} code={:#x} rip={:#x}",
+                tid, addr, code.bits(), frame.instruction_pointer.as_u64()
+            );
+        }
         if crate::fault::push_fault(tid, addr, code.bits(), cr3) {
             crate::sched::fault_current();
         } else {

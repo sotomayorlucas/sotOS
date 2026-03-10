@@ -30,6 +30,51 @@ pub fn init(memory_map: &MemoryMapResponse, hhdm_offset: u64) {
     frame::init(memory_map, hhdm_offset);
 }
 
+// ---------------------------------------------------------------
+// Frame refcount table — tracks CoW sharing.
+// Index = (phys_addr >> 12). Max 128K frames = 512MB RAM.
+// Refcount 0 = untracked (normal single-owner frame).
+// Refcount 1 = shared but only one reference left (can make writable).
+// Refcount >= 2 = shared, CoW copy needed on write.
+// ---------------------------------------------------------------
+const MAX_REFCOUNT_FRAMES: usize = 131072;
+static FRAME_REFCOUNT: spin::Mutex<[u16; MAX_REFCOUNT_FRAMES]> =
+    spin::Mutex::new([0u16; MAX_REFCOUNT_FRAMES]);
+
+/// Increment refcount for a physical frame. Called during CoW clone.
+pub fn frame_refcount_inc(phys: u64) {
+    let idx = (phys >> 12) as usize;
+    if idx < MAX_REFCOUNT_FRAMES {
+        let mut rc = FRAME_REFCOUNT.lock();
+        rc[idx] = rc[idx].saturating_add(1);
+    }
+}
+
+/// Decrement refcount for a physical frame. Returns new count.
+/// When count reaches 0, the frame can be freed via bitmap allocator.
+pub fn frame_refcount_dec(phys: u64) -> u16 {
+    let idx = (phys >> 12) as usize;
+    if idx < MAX_REFCOUNT_FRAMES {
+        let mut rc = FRAME_REFCOUNT.lock();
+        if rc[idx] > 0 {
+            rc[idx] -= 1;
+        }
+        rc[idx]
+    } else {
+        0
+    }
+}
+
+/// Get current refcount for a physical frame.
+pub fn frame_refcount_get(phys: u64) -> u16 {
+    let idx = (phys >> 12) as usize;
+    if idx < MAX_REFCOUNT_FRAMES {
+        FRAME_REFCOUNT.lock()[idx]
+    } else {
+        0
+    }
+}
+
 /// Simple RDTSC-seeded xorshift64 PRNG for ASLR jitter.
 static PRNG_STATE: AtomicU64 = AtomicU64::new(0);
 

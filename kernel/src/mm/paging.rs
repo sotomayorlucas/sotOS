@@ -70,6 +70,14 @@ pub fn invlpg(vaddr: u64) {
     }
 }
 
+/// Flush the entire TLB by reloading CR3.
+pub fn flush_tlb() {
+    let cr3 = read_cr3();
+    unsafe {
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+    }
+}
+
 /// If the entry is present, extract its physical address.
 /// Otherwise allocate a new table frame, write the entry, and return its address.
 fn ensure_table(entry: &mut u64, flags: u64) -> u64 {
@@ -241,6 +249,165 @@ impl AddressSpace {
         let phys = *pte & 0x000F_FFFF_FFFF_F000;
         *pte = 0;
         Some(phys)
+    }
+
+    /// Read the raw PTE for a virtual address. Returns (phys, flags) if present.
+    /// Used by VMM for CoW fault handling (to read the old frame address and flags).
+    pub fn lookup_pte(&self, virt: u64) -> Option<(u64, u64)> {
+        let hhdm = hhdm_offset();
+
+        let pml4 = (self.pml4_phys + hhdm) as *const u64;
+        let pml4e = unsafe { *pml4.add(pml4_index(virt)) };
+        if pml4e & PAGE_PRESENT == 0 { return None; }
+        let pdp_phys = pml4e & 0x000F_FFFF_FFFF_F000;
+
+        let pdp = (pdp_phys + hhdm) as *const u64;
+        let pdpe = unsafe { *pdp.add(pdp_index(virt)) };
+        if pdpe & PAGE_PRESENT == 0 { return None; }
+        let pd_phys = pdpe & 0x000F_FFFF_FFFF_F000;
+
+        let pd = (pd_phys + hhdm) as *const u64;
+        let pde = unsafe { *pd.add(pd_index(virt)) };
+        if pde & PAGE_PRESENT == 0 { return None; }
+        let pt_phys = pde & 0x000F_FFFF_FFFF_F000;
+
+        let pt = (pt_phys + hhdm) as *const u64;
+        let pte = unsafe { *pt.add(pt_index(virt)) };
+        if pte & PAGE_PRESENT == 0 { return None; }
+        let phys = pte & 0x000F_FFFF_FFFF_F000;
+        let flags = pte & !0x000F_FFFF_FFFF_F000;
+        Some((phys, flags))
+    }
+
+    /// Return a mutable pointer to the leaf PTE for `virt`, if present.
+    /// Used by VmWrite to update CoW pages in-place.
+    pub fn lookup_pte_mut(&self, virt: u64) -> Option<*mut u64> {
+        let hhdm = hhdm_offset();
+
+        let pml4 = (self.pml4_phys + hhdm) as *const u64;
+        let pml4e = unsafe { *pml4.add(pml4_index(virt)) };
+        if pml4e & PAGE_PRESENT == 0 { return None; }
+        let pdp_phys = pml4e & 0x000F_FFFF_FFFF_F000;
+
+        let pdp = (pdp_phys + hhdm) as *const u64;
+        let pdpe = unsafe { *pdp.add(pdp_index(virt)) };
+        if pdpe & PAGE_PRESENT == 0 { return None; }
+        let pd_phys = pdpe & 0x000F_FFFF_FFFF_F000;
+
+        let pd = (pd_phys + hhdm) as *const u64;
+        let pde = unsafe { *pd.add(pd_index(virt)) };
+        if pde & PAGE_PRESENT == 0 { return None; }
+        let pt_phys = pde & 0x000F_FFFF_FFFF_F000;
+
+        let pt = (pt_phys + hhdm) as *mut u64;
+        let pte_ptr = unsafe { pt.add(pt_index(virt)) };
+        let pte = unsafe { *pte_ptr };
+        if pte & PAGE_PRESENT == 0 { return None; }
+        Some(pte_ptr)
+    }
+
+    /// Clone this address space with Copy-on-Write semantics.
+    ///
+    /// Creates a new PML4, walks all user-half page tables (entries 0..256),
+    /// and for each present leaf PTE:
+    ///   1. Remove WRITABLE from BOTH parent and child PTEs
+    ///   2. Copy the PTE (same physical frame) to child
+    ///   3. Increment refcount for the physical frame
+    /// Kernel-half entries (256..512) are shared as usual.
+    /// Returns the new AddressSpace.
+    ///
+    /// Caller must flush the TLB after this call if the parent is the current CR3.
+    pub fn clone_cow(&self) -> Self {
+        use super::frame_refcount_inc;
+
+        let hhdm = hhdm_offset();
+        let table_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+
+        let mut total_pages = 0u32;
+        let mut total_tables = 0u32;
+
+        // Allocate new PML4
+        let new_pml4_phys = alloc_table_frame();
+        let new_pml4 = (new_pml4_phys + hhdm) as *mut u64;
+
+        // Copy kernel-half entries (256..512) — shared, not cloned
+        let src_pml4 = (self.pml4_phys + hhdm) as *mut u64;
+        unsafe {
+            for i in 256..512 {
+                *new_pml4.add(i) = *src_pml4.add(i);
+            }
+        }
+
+        // Walk user-half (entries 0..256) and clone with CoW
+        for pml4_i in 0..256usize {
+            let pml4e = unsafe { *src_pml4.add(pml4_i) };
+            if pml4e & PAGE_PRESENT == 0 { continue; }
+            let pdp_phys = pml4e & 0x000F_FFFF_FFFF_F000;
+
+            // Allocate new PDP for child
+            let new_pdp_phys = alloc_table_frame();
+            unsafe { *new_pml4.add(pml4_i) = new_pdp_phys | table_flags; }
+
+            let src_pdp = (pdp_phys + hhdm) as *mut u64;
+            let new_pdp = (new_pdp_phys + hhdm) as *mut u64;
+
+            for pdp_i in 0..512usize {
+                let pdpe = unsafe { *src_pdp.add(pdp_i) };
+                if pdpe & PAGE_PRESENT == 0 { continue; }
+                let pd_phys = pdpe & 0x000F_FFFF_FFFF_F000;
+
+                // Allocate new PD for child
+                let new_pd_phys = alloc_table_frame();
+                unsafe { *new_pdp.add(pdp_i) = new_pd_phys | table_flags; }
+
+                let src_pd = (pd_phys + hhdm) as *mut u64;
+                let new_pd = (new_pd_phys + hhdm) as *mut u64;
+
+                for pd_i in 0..512usize {
+                    let pde = unsafe { *src_pd.add(pd_i) };
+                    if pde & PAGE_PRESENT == 0 { continue; }
+                    let pt_phys = pde & 0x000F_FFFF_FFFF_F000;
+
+                    // Allocate new PT for child
+                    let new_pt_phys = alloc_table_frame();
+                    unsafe { *new_pd.add(pd_i) = new_pt_phys | table_flags; }
+                    total_tables += 1;
+
+                    let src_pt = (pt_phys + hhdm) as *mut u64;
+                    let new_pt = (new_pt_phys + hhdm) as *mut u64;
+
+                    for pt_i in 0..512usize {
+                        let pte = unsafe { *src_pt.add(pt_i) };
+                        if pte & PAGE_PRESENT == 0 { continue; }
+
+                        let phys = pte & 0x000F_FFFF_FFFF_F000;
+
+                        // Remove WRITABLE from parent PTE (CoW protect)
+                        let cow_pte = pte & !PAGE_WRITABLE;
+                        unsafe { *src_pt.add(pt_i) = cow_pte; }
+
+                        // Copy to child with same CoW flags
+                        unsafe { *new_pt.add(pt_i) = cow_pte; }
+
+                        // Increment refcount: if frame was previously untracked (rc=0),
+                        // set to 2 (parent + child). If already tracked, just +1.
+                        let idx = (phys >> 12) as usize;
+                        if idx < super::MAX_REFCOUNT_FRAMES {
+                            let mut rc = super::FRAME_REFCOUNT.lock();
+                            if rc[idx] == 0 {
+                                rc[idx] = 2;
+                            } else {
+                                rc[idx] = rc[idx].saturating_add(1);
+                            }
+                        }
+                        total_pages += 1;
+                    }
+                }
+            }
+        }
+
+        crate::kdebug!("clone_cow: {} pages, {} tables", total_pages, total_tables);
+        Self { pml4_phys: new_pml4_phys }
     }
 
     /// Update the flags of an already-mapped page (mprotect-like).

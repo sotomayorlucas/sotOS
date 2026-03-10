@@ -1,7 +1,7 @@
 //! sotOS VMM (Virtual Memory Manager) Service Process
 //!
-//! Handles page faults for the init process by allocating frames and
-//! mapping them into init's address space.
+//! Handles page faults for the init process and CoW-cloned child address
+//! spaces by allocating frames and mapping them.
 //!
 //! Runs as a separate process with its own CR3.
 
@@ -39,7 +39,14 @@ pub extern "C" fn _start() -> ! {
         loop { sys::yield_now(); }
     });
 
-    print(b"VMM: registered for init faults\n");
+    // Also register as global fallback handler (cr3=0) to catch faults
+    // from CoW-cloned child address spaces created by fork.
+    sys::fault_register(notify_cap).unwrap_or_else(|_| {
+        print(b"VMM: global fault_register failed!\n");
+        loop { sys::yield_now(); }
+    });
+
+    print(b"VMM: registered for init + global faults\n");
 
     // Track last fault per thread to detect infinite loops.
     // [tid % 16] -> (last_addr, repeat_count)
@@ -54,6 +61,15 @@ pub extern "C" fn _start() -> ! {
                     let vaddr_raw = fault.addr & !0xFFF;
                     let code = fault.code;
                     let slot = (fault.tid as usize) % 16;
+
+                    // Use the AS cap delivered with the fault.
+                    // The kernel resolves cr3 → as_cap_id via register_cr3_cap().
+                    // Fall back to init_as_cap if no specific cap was registered.
+                    let target_as_cap = if fault.as_cap_id != 0 {
+                        fault.as_cap_id
+                    } else {
+                        init_as_cap
+                    };
 
                     // Guard: NX violation (instruction fetch on NX page).
                     // Mapping a new writable frame would get NX again (W^X) -> infinite loop.
@@ -71,11 +87,41 @@ pub extern "C" fn _start() -> ! {
                         fault_track[slot] = (vaddr_raw, 1);
                     }
 
+                    // Check for CoW fault: write (bit 1) to present (bit 0) page.
+                    if code & 0x03 == 0x03 {
+                        // CoW fault: page is present but read-only due to clone_cow.
+                        // 1. Allocate a new frame
+                        let new_frame = sys::frame_alloc().unwrap_or_else(|_| {
+                            print(b"VMM: OOM(CoW)\n");
+                            loop { sys::yield_now(); }
+                        });
+                        // 2. Copy 4KiB from the old frame to the new frame
+                        //    (kernel copies via HHDM using SYS_FRAME_COPY)
+                        if let Err(_) = sys::frame_copy(new_frame, target_as_cap, vaddr_raw) {
+                            print(b"VMM: frame_copy failed\n");
+                            // Fall through to demand-page as fallback
+                        }
+                        // 3. Unmap old PTE
+                        let _ = sys::unmap_from(target_as_cap, vaddr_raw);
+                        // 4. Map new frame as WRITABLE
+                        sys::map_into(target_as_cap, vaddr_raw, new_frame, MAP_WRITABLE).unwrap_or_else(|_| {
+                            print(b"VMM: map_into(CoW) failed!\n");
+                            loop { sys::yield_now(); }
+                        });
+                        // 5. Resume thread
+                        sys::thread_resume(fault.tid as u64).unwrap_or_else(|_| {
+                            print(b"VMM: resume(CoW) failed!\n");
+                            loop { sys::yield_now(); }
+                        });
+                        continue;
+                    }
+
+                    // Demand paging: page not present — allocate new frame.
                     let frame = sys::frame_alloc().unwrap_or_else(|_| {
                         print(b"VMM: OOM\n");
                         loop { sys::yield_now(); }
                     });
-                    sys::map_into(init_as_cap, vaddr_raw, frame, MAP_WRITABLE).unwrap_or_else(|_| {
+                    sys::map_into(target_as_cap, vaddr_raw, frame, MAP_WRITABLE).unwrap_or_else(|_| {
                         print(b"VMM: map_into failed!\n");
                         loop { sys::yield_now(); }
                     });
