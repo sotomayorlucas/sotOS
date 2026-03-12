@@ -977,13 +977,14 @@ fn process_ipc_cmd(
                 }
 
                 // Wait for connection (up to ~5 seconds for real internet)
-                for _ in 0..5000u32 {
+                for i in 0..5000u32 {
                     iface.poll(now(), device, sockets);
                     let sock = sockets.get_mut::<tcp::Socket>(handle);
                     if sock.is_active() && sock.may_send() {
                         return slot as u64;
                     }
-                    if sock.state() == tcp::State::Closed {
+                    let st = sock.state();
+                    if st == tcp::State::Closed {
                         break;
                     }
                     sys::yield_now();
@@ -1080,8 +1081,9 @@ fn process_ipc_cmd(
             if conn_id < MAX_TCP {
                 if let Some(handle) = unsafe { TCP_SLOTS[conn_id] } {
                     let sock = sockets.get_mut::<tcp::Socket>(handle);
-                    sock.close();
+                    sock.abort();
                     iface.poll(now(), device, sockets);
+                    sockets.remove(handle);
                     unsafe {
                         TCP_SLOTS[conn_id] = None;
                     }

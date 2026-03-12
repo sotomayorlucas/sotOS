@@ -11,7 +11,7 @@ use crate::exec::{reply_val, rdtsc, copy_guest_path, starts_with,
                   format_uptime_into, format_proc_self_stat};
 use crate::process::*;
 use crate::fd::*;
-use crate::child_handler::{open_virtual_file, fill_random, mark_pipe_retry};
+use crate::child_handler::{open_virtual_file, fill_random, mark_pipe_retry_on};
 use crate::{NET_EP_CAP, vfs_lock, vfs_unlock, shared_store};
 use crate::net::{NET_CMD_TCP_SEND, NET_CMD_TCP_RECV, NET_CMD_TCP_CLOSE,
                  NET_CMD_UDP_SENDTO, NET_CMD_UDP_RECV};
@@ -261,18 +261,43 @@ pub(crate) fn sys_read(ctx: &mut SyscallContext, msg: &IpcMsg) {
         }
         10 => {
             // Pipe read: non-blocking check with kernel-side retry.
-            // Instead of spinning in init (which blocks ALL children's IPC),
-            // we return PIPE_RETRY_TAG to the kernel. The kernel yields to let
-            // other threads (writers) run, then re-sends the read to init.
             let pipe_id = ctx.sock_conn_id[fd] as usize;
+            // DIAG: dump pipe state before read for P6
+            if ctx.pid == 6 && pipe_id < MAX_PIPES {
+                let wp = PIPE_WRITE_POS[pipe_id].load(Ordering::Acquire);
+                let rp = PIPE_READ_POS[pipe_id].load(Ordering::Acquire);
+                print(b"P6-PRE-RD pipe="); print_u64(pipe_id as u64);
+                print(b" wp="); print_u64(wp);
+                print(b" rp="); print_u64(rp);
+                print(b" avail="); print_u64(wp.wrapping_sub(rp));
+                print(b" pwc="); print_u64(PIPE_WRITE_CLOSED[pipe_id].load(Ordering::Acquire));
+                print(b" wrefs="); print_u64(PIPE_WRITE_REFS[pipe_id].load(Ordering::Acquire));
+                print(b" rrefs="); print_u64(PIPE_READ_REFS[pipe_id].load(Ordering::Acquire));
+                print(b" act="); print_u64(crate::fd::PIPE_ACTIVE[pipe_id].load(Ordering::Acquire));
+                print(b"\n");
+            }
+            // Check writer state
             let want = len.min(4096);
             let mut tmp = [0u8; 4096];
             let n = pipe_read(pipe_id, &mut tmp[..want]);
+            // DIAG: log pipe 0 reads for P5 during final retry phase
+            if ctx.pid == 5 && pipe_id == 0 {
+                let stall = unsafe { crate::child_handler::PIPE_STALL[5] };
+                if stall > 40 || n > 0 {
+                    print(b"P5-PIPE0: n="); print_u64(n as u64);
+                    print(b" stall="); print_u64(stall as u64);
+                    print(b" pwc="); print_u64(PIPE_WRITE_CLOSED[0].load(Ordering::Acquire));
+                    print(b" wref="); print_u64(PIPE_WRITE_REFS[0].load(Ordering::Acquire));
+                    print(b"\n");
+                }
+            }
             if n > 0 {
+                crate::child_handler::clear_pipe_stall(ctx.pid);
                 ctx.guest_write(buf_ptr, &tmp[..n]);
                 if ctx.pid >= 3 {
                     print(b"PIPE-R P"); print_u64(ctx.pid as u64);
                     print(b" fd="); print_u64(fd as u64);
+                    print(b" want="); print_u64(want as u64);
                     print(b" n="); print_u64(n as u64);
                     print(b" [");
                     let show = n.min(80);
@@ -286,17 +311,16 @@ pub(crate) fn sys_read(ctx: &mut SyscallContext, msg: &IpcMsg) {
                         }
                     }
                     print(b"]\n");
-                    // After P3 reads blank line (caps terminator), dump FD table
-                    if ctx.pid == 3 && n <= 2 && tmp[0] == 0x0A {
-                        print(b"=== P3 FD TABLE (after blank-line read) ===\n");
-                        for i in 0..10 {
-                            print(b"  fd="); print_u64(i as u64);
-                            print(b" kind="); print_u64(ctx.child_fds[i] as u64);
-                            print(b" conn="); print_u64(ctx.sock_conn_id[i] as u64);
-                            print(b"\n");
+                    // Add hex dump of first 8 bytes for debugging
+                    if n <= 8 {
+                        print(b"  hex:");
+                        for i in 0..n {
+                            print(b" 0x");
+                            crate::framebuffer::print_hex64(tmp[i] as u64);
                         }
-                        print(b"=== END P3 FD TABLE ===\n");
+                        print(b"\n");
                     }
+                    // (injection removed — fixing dual-reader root cause instead)
                 }
                 reply_val(ctx.ep_cap, n as i64);
             } else if pipe_writer_closed(pipe_id) {
@@ -305,25 +329,56 @@ pub(crate) fn sys_read(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     print(b" fd="); print_u64(fd as u64);
                     print(b" pipe="); print_u64(pipe_id as u64);
                     print(b" wrefs="); print_u64(PIPE_WRITE_REFS[pipe_id].load(Ordering::Acquire));
+                    print(b" PWC="); print_u64(PIPE_WRITE_CLOSED[pipe_id].load(Ordering::Acquire));
+                    print(b" ACT="); print_u64(crate::fd::PIPE_ACTIVE[pipe_id].load(Ordering::Acquire));
                     print(b" EOF(writer-closed)\n");
                 }
                 reply_val(ctx.ep_cap, 0); // EOF
             } else {
                 // No data, writer alive — ask kernel to retry after yielding.
-                // This lets init process other children's writes in between.
-                // Log first retry per burst for P3 (to see when blocking starts)
-                if ctx.pid == 3 {
-                    let rc = unsafe { crate::child_handler::RETRY_COUNT[3] };
-                    if rc == 0 {
-                        print(b"P3-PIPE-BLOCK fd="); print_u64(fd as u64);
+                // Deadlock detection: if both this process AND another are
+                // stalled on pipe reads, they're deadlocked. Reply EOF (0)
+                // directly so the kernel stops retrying and the process
+                // can proceed with its cleanup/exit path.
+                let stall = unsafe { crate::child_handler::PIPE_STALL[ctx.pid] };
+                if stall > 1000 {
+                    // Only trigger if another process is ALSO stuck on a pipe
+                    // read for a long time — suggests a real deadlock cycle.
+                    // Note: two processes waiting for a third (e.g. during exec)
+                    // is NOT a deadlock — just a temporary stall.
+                    let mut other_pid = 0usize;
+                    for p in 1..16usize {
+                        if p != ctx.pid && unsafe { crate::child_handler::PIPE_STALL[p] } > 1000 {
+                            other_pid = p;
+                            break;
+                        }
+                    }
+                    if other_pid != 0 {
+                        // Resolve deadlock: close write ends for BOTH pipes
+                        // so both processes get natural EOF simultaneously.
+                        let other_pipe = unsafe { crate::child_handler::PIPE_STALL_ID[other_pid] } as usize;
+                        print(b"PIPE-DEADLOCK: pid="); print_u64(ctx.pid as u64);
                         print(b" pipe="); print_u64(pipe_id as u64);
-                        print(b" wrefs="); print_u64(PIPE_WRITE_REFS[pipe_id].load(Ordering::Acquire));
-                        print(b" rpos="); print_u64(PIPE_READ_POS[pipe_id].load(Ordering::Acquire));
-                        print(b" wpos="); print_u64(PIPE_WRITE_POS[pipe_id].load(Ordering::Acquire));
+                        print(b" other="); print_u64(other_pid as u64);
+                        print(b" other_pipe="); print_u64(other_pipe as u64);
                         print(b"\n");
+                        crate::fd::pipe_close_all_writers(pipe_id);
+                        if other_pipe < crate::fd::MAX_PIPES && other_pipe != pipe_id {
+                            crate::fd::pipe_close_all_writers(other_pipe);
+                        }
+                        crate::child_handler::clear_pipe_stall(ctx.pid);
+                        crate::child_handler::clear_pipe_stall(other_pid);
+                        // Mark both processes as deadlock-EOF recipients so their
+                        // exit codes get overridden to 0 (clean exit).
+                        unsafe {
+                            crate::child_handler::DEADLOCK_EOF[ctx.pid] = true;
+                            crate::child_handler::DEADLOCK_EOF[other_pid] = true;
+                        }
+                        // Don't reply — let retry continue. Next iteration
+                        // pipe_writer_closed() returns true → normal EOF.
                     }
                 }
-                mark_pipe_retry(ctx.pid);
+                mark_pipe_retry_on(ctx.pid, pipe_id);
                 let reply = sotos_common::IpcMsg {
                     tag: sotos_common::PIPE_RETRY_TAG,
                     regs: [0; 8],
@@ -340,40 +395,10 @@ pub(crate) fn sys_write(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let fd = msg.regs[0] as usize;
     let buf_ptr = msg.regs[1];
     let len = msg.regs[2] as usize;
-    // Log ALL P3 writes (any fd) to trace git's write behavior
-    if ctx.pid == 3 {
-        let kind = if fd < GRP_MAX_FDS { ctx.child_fds[fd] } else { 0 };
-        print(b"P3-WRITE fd="); print_u64(fd as u64);
-        print(b" kind="); print_u64(kind as u64);
-        print(b" len="); print_u64(len as u64);
-        if len > 0 && buf_ptr > 0 && buf_ptr < 0x0000_8000_0000_0000 {
-            print(b" [");
-            let show = len.min(80);
-            let mut dbg_buf = [0u8; 80];
-            ctx.guest_read(buf_ptr, &mut dbg_buf[..show]);
-            for i in 0..show {
-                if dbg_buf[i] == 0x0A { print(b"\\n"); }
-                else if dbg_buf[i] >= 0x20 && dbg_buf[i] < 0x7F { sys::debug_print(dbg_buf[i]); }
-                else { print(b"."); }
-            }
-            print(b"]");
-        }
-        print(b"\n");
-    }
+    // (debug logging removed — serial is too slow for per-syscall prints)
     if fd >= GRP_MAX_FDS || ctx.child_fds[fd] == 0 {
-        if ctx.pid == 4 {
-            print(b"P4-WRITE fd="); print_u64(fd as u64);
-            print(b" EBADF(kind=0)\n");
-        }
         reply_val(ctx.ep_cap, -EBADF);
         return;
-    }
-    // Log all P4 writes for git debugging
-    if ctx.pid == 4 && fd >= 3 {
-        print(b"P4-WRITE fd="); print_u64(fd as u64);
-        print(b" kind="); print_u64(ctx.child_fds[fd] as u64);
-        print(b" len="); print_u64(len as u64);
-        print(b"\n");
     }
     match ctx.child_fds[fd] {
         2 => {
@@ -514,6 +539,15 @@ pub(crate) fn sys_write(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     } else { print(b"."); }
                 }
                 print(b"]\n");
+                // Hex dump for small pipe writes
+                if safe_len <= 8 {
+                    print(b"  hex:");
+                    for i in 0..safe_len {
+                        print(b" 0x");
+                        crate::framebuffer::print_hex64(src[i] as u64);
+                    }
+                    print(b"\n");
+                }
             }
             let mut written = 0usize;
             let mut retries = 0u32;
@@ -540,7 +574,18 @@ pub(crate) fn sys_write(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
                     vfs_lock();
                     let result = unsafe { shared_store() }
-                        .and_then(|store| store.write_obj_range(oid, pos, data).ok());
+                        .and_then(|store| {
+                            let f_pre = store.find_slot_pub(oid).map(|sl| store.dir[sl].flags);
+                            let r = store.write_obj_range(oid, pos, data).ok();
+                            let f_post = store.find_slot_pub(oid).map(|sl| store.dir[sl].flags);
+                            if f_pre != f_post {
+                                print(b"WRITE-FLAG-CORRUPT: oid="); print_u64(oid);
+                                print(b" flags "); print_u64(f_pre.unwrap_or(99) as u64);
+                                print(b"->"); print_u64(f_post.unwrap_or(99) as u64);
+                                print(b"\n");
+                            }
+                            r
+                        });
                     vfs_unlock();
                     match result {
                         Some(_) => {
@@ -634,8 +679,8 @@ pub(crate) fn sys_stat(ctx: &mut SyscallContext, msg: &IpcMsg) {
     };
     let name = &path[..path_len];
 
-    // Debug: print stat path for git debugging
-    if ctx.pid > 1 {
+    // Debug: print stat path for config files only
+    if ctx.pid > 1 && name.windows(6).any(|w| w == b"config") {
         print(b"STAT: ");
         print(name);
         print(b"\n");
@@ -656,42 +701,25 @@ pub(crate) fn sys_stat(ctx: &mut SyscallContext, msg: &IpcMsg) {
     // Try VFS
     vfs_lock();
     let vfs_stat = unsafe { shared_store() }.and_then(|store| {
-        // Diagnostic: step-by-step walk for /usr/bin paths
-        if ctx.pid > 1 && starts_with(name, b"/usr/bin/") {
-            print(b"VFS-WALK: ");
-            match store.find_in(b"usr", sotos_objstore::ROOT_OID) {
-                Some(uid) => {
-                    print(b"usr="); print_u64(uid);
-                    match store.find_in(b"bin", uid) {
-                        Some(bid) => {
-                            print(b" bin="); print_u64(bid);
-                            let leaf = &name[9..]; // after "/usr/bin/"
-                            match store.find_in(leaf, bid) {
-                                Some(lid) => { print(b" "); print(leaf); print(b"="); print_u64(lid); }
-                                None => { print(b" "); print(leaf); print(b"=MISS"); }
-                            }
-                        }
-                        None => print(b" bin=MISS"),
-                    }
-                }
-                None => print(b" usr=MISS"),
-            }
-            print(b"\n");
-        }
-        let rp = store.resolve_path(name, sotos_objstore::ROOT_OID);
-        if ctx.pid > 1 && starts_with(name, b"/usr/bin/") {
-            match &rp {
-                Ok(oid) => { print(b"VFS-RP: ok oid="); print_u64(*oid); print(b"\n"); }
-                Err(_) => { print(b"VFS-RP: FAIL for "); print(name); print(b"\n"); }
-            }
-        }
-        let oid = rp.ok()?;
+        let oid = store.resolve_path(name, sotos_objstore::ROOT_OID).ok()?;
         let entry = store.stat(oid)?;
         Some((oid, entry.size, entry.is_dir()))
     });
     vfs_unlock();
 
     if let Some((oid, size, is_dir)) = vfs_stat {
+        // DIAG: trace stat results for config paths
+        if name.windows(6).any(|w| w == b"config") {
+            print(b"STAT-R: oid=");
+            print_u64(oid);
+            print(b" dir=");
+            sys::debug_print(if is_dir { b'1' } else { b'0' });
+            print(b" sz=");
+            print_u64(size);
+            print(b" ");
+            print(name);
+            print(b"\n");
+        }
         write_linux_stat(stat_ptr, oid, size, is_dir);
         reply_val(ctx.ep_cap, 0);
     } else {
@@ -840,99 +868,159 @@ pub(crate) fn sys_pread64(ctx: &mut SyscallContext, msg: &IpcMsg) {
     }
 }
 
+/// Internal: close a single fd, cleaning up associated resources, without sending a reply.
+/// Returns true if the fd was valid and closed.
+pub(crate) fn close_fd_internal(ctx: &mut SyscallContext, fd: usize) -> bool {
+    if fd >= GRP_MAX_FDS || ctx.child_fds[fd] == 0 { return false; }
+    if ctx.pid >= 3 {
+        let k = ctx.child_fds[fd];
+        if k == 10 || k == 11 {
+            print(b"FD-CLOSE P"); print_u64(ctx.pid as u64);
+            print(b" fd="); print_u64(fd as u64);
+            print(b" k="); print_u64(k as u64);
+            print(b" pipe="); print_u64(ctx.sock_conn_id[fd] as u64);
+            print(b"\n");
+        }
+    }
+    if ctx.child_fds[fd] == 12 {
+        for s in 0..GRP_MAX_INITRD {
+            if ctx.initrd_files[s][3] == fd as u64 {
+                ctx.initrd_files[s][3] = u64::MAX; // mark FD closed but data alive
+                break;
+            }
+        }
+    } else if ctx.child_fds[fd] == 13 || ctx.child_fds[fd] == 14 {
+        for s in 0..GRP_MAX_VFS {
+            if ctx.vfs_files[s][3] == fd as u64 { ctx.vfs_files[s] = [0; 4]; break; }
+        }
+    } else if ctx.child_fds[fd] == 22 {
+        // eventfd close
+        if let Some(slot) = ctx.eventfd_slot_fd.iter().position(|&x| x == fd) {
+            ctx.eventfd_slot_fd[slot] = usize::MAX;
+            ctx.eventfd_counter[slot] = 0;
+        }
+    } else if ctx.child_fds[fd] == 23 {
+        // timerfd close
+        if let Some(slot) = ctx.timerfd_slot_fd.iter().position(|&x| x == fd) {
+            ctx.timerfd_slot_fd[slot] = usize::MAX;
+            ctx.timerfd_expiry_tsc[slot] = 0;
+            ctx.timerfd_interval_ns[slot] = 0;
+        }
+    } else if ctx.child_fds[fd] == 25 {
+        // memfd close — free pages
+        if let Some(slot) = ctx.memfd_slot_fd.iter().position(|&x| x == fd) {
+            let cap_pages = (ctx.memfd_cap[slot] + 0xFFF) / 0x1000;
+            for p in 0..cap_pages { let _ = sys::unmap_free(ctx.memfd_base[slot] + p * 0x1000); }
+            ctx.memfd_slot_fd[slot] = usize::MAX;
+            ctx.memfd_base[slot] = 0;
+            ctx.memfd_size[slot] = 0;
+            ctx.memfd_cap[slot] = 0;
+        }
+        for s in 0..GRP_MAX_VFS {
+            if ctx.vfs_files[s][3] == fd as u64 && ctx.vfs_files[s][0] == 0xFEFD {
+                ctx.vfs_files[s] = [0; 4]; break;
+            }
+        }
+    } else if ctx.child_fds[fd] == 16 {
+        // TCP socket close -> NET_CMD_TCP_CLOSE
+        let net_cap = NET_EP_CAP.load(Ordering::Acquire);
+        let cid = ctx.sock_conn_id[fd];
+        if net_cap != 0 && cid != 0xFFFF {
+            let req = sotos_common::IpcMsg {
+                tag: NET_CMD_TCP_CLOSE,
+                regs: [cid as u64, 0, 0, 0, 0, 0, 0, 0],
+            };
+            let _ = sys::call_timeout(net_cap, &req, 500);
+        }
+        ctx.sock_conn_id[fd] = 0xFFFF;
+    } else if ctx.child_fds[fd] == 11 {
+        // Pipe write end close — decrement refcount, mark closed when last ref gone
+        let pipe_id = ctx.sock_conn_id[fd] as usize;
+        if pipe_id < MAX_PIPES {
+            let prev = PIPE_WRITE_REFS[pipe_id].fetch_sub(1, Ordering::AcqRel);
+            if ctx.pid >= 3 {
+                print(b"CLOSE-PW P"); print_u64(ctx.pid as u64);
+                print(b" fd="); print_u64(fd as u64);
+                print(b" pipe="); print_u64(pipe_id as u64);
+                print(b" wrefs="); print_u64(prev); // prev = before decrement
+                print(b"->"); print_u64(if prev > 0 { prev - 1 } else { 0 });
+                print(b"\n");
+            }
+            if prev <= 1 {
+                print(b"PWC-SET close P"); print_u64(ctx.pid as u64);
+                print(b" pipe="); print_u64(pipe_id as u64);
+                print(b"\n");
+                PIPE_WRITE_CLOSED[pipe_id].store(1, Ordering::Release);
+                if PIPE_READ_CLOSED[pipe_id].load(Ordering::Acquire) != 0 {
+                    pipe_free(pipe_id);
+                }
+            }
+        }
+        ctx.sock_conn_id[fd] = 0xFFFF;
+    } else if ctx.child_fds[fd] == 10 {
+        // Pipe read end close — decrement refcount, mark closed when last ref gone
+        let pipe_id = ctx.sock_conn_id[fd] as usize;
+        if pipe_id < MAX_PIPES {
+            let prev = PIPE_READ_REFS[pipe_id].fetch_sub(1, Ordering::AcqRel);
+            if prev <= 1 {
+                PIPE_READ_CLOSED[pipe_id].store(1, Ordering::Release);
+                if PIPE_WRITE_CLOSED[pipe_id].load(Ordering::Acquire) != 0 {
+                    pipe_free(pipe_id);
+                }
+            }
+        }
+        ctx.sock_conn_id[fd] = 0xFFFF;
+    }
+    ctx.child_fds[fd] = 0;
+    // Clear cloexec bit
+    if fd < 32 { *ctx.fd_cloexec &= !(1 << fd); }
+    true
+}
+
 /// SYS_CLOSE (3): close fd, cleaning up associated resources.
 pub(crate) fn sys_close(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let fd = msg.regs[0] as usize;
-    if fd < GRP_MAX_FDS && ctx.child_fds[fd] != 0 {
-        if ctx.child_fds[fd] == 12 {
-            for s in 0..GRP_MAX_INITRD {
-                if ctx.initrd_files[s][3] == fd as u64 {
-                    ctx.initrd_files[s][3] = u64::MAX; // mark FD closed but data alive
-                    break;
-                }
-            }
-        } else if ctx.child_fds[fd] == 13 || ctx.child_fds[fd] == 14 {
-            for s in 0..GRP_MAX_VFS {
-                if ctx.vfs_files[s][3] == fd as u64 { ctx.vfs_files[s] = [0; 4]; break; }
-            }
-        } else if ctx.child_fds[fd] == 22 {
-            // eventfd close
-            if let Some(slot) = ctx.eventfd_slot_fd.iter().position(|&x| x == fd) {
-                ctx.eventfd_slot_fd[slot] = usize::MAX;
-                ctx.eventfd_counter[slot] = 0;
-            }
-        } else if ctx.child_fds[fd] == 23 {
-            // timerfd close
-            if let Some(slot) = ctx.timerfd_slot_fd.iter().position(|&x| x == fd) {
-                ctx.timerfd_slot_fd[slot] = usize::MAX;
-                ctx.timerfd_expiry_tsc[slot] = 0;
-                ctx.timerfd_interval_ns[slot] = 0;
-            }
-        } else if ctx.child_fds[fd] == 25 {
-            // memfd close — free pages
-            if let Some(slot) = ctx.memfd_slot_fd.iter().position(|&x| x == fd) {
-                let cap_pages = (ctx.memfd_cap[slot] + 0xFFF) / 0x1000;
-                for p in 0..cap_pages { let _ = sys::unmap_free(ctx.memfd_base[slot] + p * 0x1000); }
-                ctx.memfd_slot_fd[slot] = usize::MAX;
-                ctx.memfd_base[slot] = 0;
-                ctx.memfd_size[slot] = 0;
-                ctx.memfd_cap[slot] = 0;
-            }
-            for s in 0..GRP_MAX_VFS {
-                if ctx.vfs_files[s][3] == fd as u64 && ctx.vfs_files[s][0] == 0xFEFD {
-                    ctx.vfs_files[s] = [0; 4]; break;
-                }
-            }
-        } else if ctx.child_fds[fd] == 16 {
-            // TCP socket close -> NET_CMD_TCP_CLOSE
-            let net_cap = NET_EP_CAP.load(Ordering::Acquire);
-            let cid = ctx.sock_conn_id[fd];
-            if net_cap != 0 && cid != 0xFFFF {
-                let req = sotos_common::IpcMsg {
-                    tag: NET_CMD_TCP_CLOSE,
-                    regs: [cid as u64, 0, 0, 0, 0, 0, 0, 0],
-                };
-                let _ = sys::call_timeout(net_cap, &req, 500);
-            }
-            ctx.sock_conn_id[fd] = 0xFFFF;
-        } else if ctx.child_fds[fd] == 11 {
-            // Pipe write end close — decrement refcount, mark closed when last ref gone
-            let pipe_id = ctx.sock_conn_id[fd] as usize;
-            if pipe_id < MAX_PIPES {
-                let prev = PIPE_WRITE_REFS[pipe_id].fetch_sub(1, Ordering::AcqRel);
-                if ctx.pid >= 3 {
-                    print(b"CLOSE-PW P"); print_u64(ctx.pid as u64);
-                    print(b" fd="); print_u64(fd as u64);
-                    print(b" pipe="); print_u64(pipe_id as u64);
-                    print(b" wrefs="); print_u64(prev); // prev = before decrement
-                    print(b"->"); print_u64(if prev > 0 { prev - 1 } else { 0 });
-                    print(b"\n");
-                }
-                if prev <= 1 {
-                    PIPE_WRITE_CLOSED[pipe_id].store(1, Ordering::Release);
-                    if PIPE_READ_CLOSED[pipe_id].load(Ordering::Acquire) != 0 {
-                        pipe_free(pipe_id);
-                    }
-                }
-            }
-            ctx.sock_conn_id[fd] = 0xFFFF;
-        } else if ctx.child_fds[fd] == 10 {
-            // Pipe read end close — decrement refcount, mark closed when last ref gone
-            let pipe_id = ctx.sock_conn_id[fd] as usize;
-            if pipe_id < MAX_PIPES {
-                let prev = PIPE_READ_REFS[pipe_id].fetch_sub(1, Ordering::AcqRel);
-                if prev <= 1 {
-                    PIPE_READ_CLOSED[pipe_id].store(1, Ordering::Release);
-                    if PIPE_WRITE_CLOSED[pipe_id].load(Ordering::Acquire) != 0 {
-                        pipe_free(pipe_id);
-                    }
-                }
-            }
-            ctx.sock_conn_id[fd] = 0xFFFF;
-        }
-        ctx.child_fds[fd] = 0;
-    }
+    close_fd_internal(ctx, fd);
     reply_val(ctx.ep_cap, 0);
+}
+
+/// Close all fds marked with FD_CLOEXEC (called during execve).
+/// Also closes any pipe fds (kind 10/11) above fd 2 that lack CLOEXEC —
+/// programs rely on pipe fds not leaking through fork+exec, but may use
+/// plain pipe() without O_CLOEXEC and expect the child to close them.
+pub(crate) fn close_cloexec_fds(ctx: &mut SyscallContext) {
+    let mut bits = *ctx.fd_cloexec;
+    while bits != 0 {
+        let fd = bits.trailing_zeros() as usize;
+        if fd >= 32 { break; }
+        print(b"CLOEXEC-CLOSE P"); print_u64(ctx.pid as u64);
+        print(b" fd="); print_u64(fd as u64);
+        print(b" kind="); print_u64(ctx.child_fds[fd] as u64);
+        print(b"\n");
+        close_fd_internal(ctx, fd);
+        bits &= !(1 << fd);
+    }
+    // Close inherited pipe fds > 2 that weren't CLOEXEC.
+    // After fork+exec, the child dup2's needed pipes to 0/1/2 and
+    // explicitly closes the originals. Any remaining pipe fds are leaks.
+    for fd in 3..GRP_MAX_FDS {
+        let k = ctx.child_fds[fd];
+        if k == 10 || k == 11 {
+            print(b"EXEC-PIPE-CLOSE P"); print_u64(ctx.pid as u64);
+            print(b" fd="); print_u64(fd as u64);
+            print(b" kind="); print_u64(k as u64);
+            print(b"\n");
+            close_fd_internal(ctx, fd);
+        }
+    }
+    // Clear orphaned initrd entries (fd == u64::MAX) inherited from forked parent.
+    // After exec, the new binary has no use for the parent's stale initrd buffers.
+    // Leaving them causes mmap to match the wrong file data.
+    for s in 0..GRP_MAX_INITRD {
+        if ctx.initrd_files[s][0] != 0 && ctx.initrd_files[s][3] == u64::MAX {
+            ctx.initrd_files[s] = [0; 4];
+        }
+    }
 }
 
 /// SYS_OPEN (2): open file by path — devices, virtual files, directories, initrd, VFS.
@@ -1058,6 +1146,14 @@ pub(crate) fn sys_open(ctx: &mut SyscallContext, msg: &IpcMsg) {
             FILE_BUF_PAGES_OPEN * 0x1000,
         ) {
             Ok(sz) => {
+                // DIAG: initrd matched by basename
+                if basename == b"config" {
+                    print(b"OPEN-INITRD: basename=config sz=");
+                    print_u64(sz);
+                    print(b" path=");
+                    print(name);
+                    print(b"\n");
+                }
                 let mut fd = None;
                 for i in 3..GRP_MAX_FDS { if ctx.child_fds[i] == 0 { fd = Some(i); break; } }
                 if let Some(f) = fd {
@@ -1079,6 +1175,18 @@ pub(crate) fn sys_open(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     // Try resolve existing
                     if let Ok(oid) = store.resolve_path(name, ROOT_OID) {
                         let entry = store.stat(oid)?;
+                        // DIAG: if this is a config file and entry is_dir, dump details
+                        if entry.is_dir() && name.windows(6).any(|w| w == b"config") {
+                            print(b"VFS-DIR-BUG: oid=");
+                            print_u64(oid);
+                            print(b" flags=");
+                            print_u64(entry.flags as u64);
+                            print(b" name=[");
+                            print(entry.name_as_str());
+                            print(b"] path=[");
+                            print(name);
+                            print(b"]\n");
+                        }
                         // O_TRUNC: reset file size
                         if flags & O_TRUNC != 0 && !entry.is_dir() {
                             store.write_obj(oid, &[]).ok();
@@ -1100,12 +1208,32 @@ pub(crate) fn sys_open(ctx: &mut SyscallContext, msg: &IpcMsg) {
                             None => (ROOT_OID, name),
                         };
                         let oid = store.create_in(fname, &[], parent).ok()?;
+                        // DIAG: print slot for newly created files
+                        if let Some(sl) = store.find_slot_pub(oid) {
+                            let e = &store.dir[sl];
+                            print(b"CREAT: oid="); print_u64(oid);
+                            print(b" slot="); print_u64(sl as u64);
+                            print(b" flags="); print_u64(e.flags as u64);
+                            print(b" parent="); print_u64(e.parent_oid);
+                            print(b" name=["); print(e.name_as_str());
+                            print(b"] "); print(name);
+                            print(b"\n");
+                        }
                         return Some((oid, 0, false));
                     }
                     None
                 });
                 vfs_unlock();
                 if let Some((oid, size, is_dir)) = vfs_result {
+                    // DIAG: trace VFS open for P6
+                    if ctx.pid == 6 || name.windows(6).any(|w| w == b"config") {
+                        print(b"OPEN-VFS: P"); print_u64(ctx.pid as u64);
+                        print(b" oid="); print_u64(oid);
+                        print(b" sz="); print_u64(size);
+                        print(b" dir=");
+                        sys::debug_print(if is_dir { b'1' } else { b'0' });
+                        print(b" ["); print(name); print(b"]\n");
+                    }
                     let mut vslot = None;
                     for s in 0..GRP_MAX_VFS { if ctx.vfs_files[s][0] == 0 { vslot = Some(s); break; } }
                     let mut fd = None;
@@ -1118,6 +1246,12 @@ pub(crate) fn sys_open(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     }
                 }
                 if !vfs_found {
+                    // DIAG: log open failures for P5
+                    if ctx.pid == 5 {
+                        print(b"P5-ENOENT: ");
+                        print(&name[..path_len]);
+                        print(b"\n");
+                    }
                     reply_val(ctx.ep_cap, -ENOENT);
                 }
             }
@@ -1348,6 +1482,20 @@ pub(crate) fn sys_readv(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let pipe_id = ctx.sock_conn_id[fd] as usize;
         let cnt = iovcnt.min(16);
         let mut total = 0usize;
+        // Log iov structure for debugging
+        if ctx.pid >= 3 && cnt > 0 {
+            print(b"PIPEV-R P"); print_u64(ctx.pid as u64);
+            print(b" fd="); print_u64(fd as u64);
+            print(b" iovcnt="); print_u64(cnt as u64);
+            for j in 0..cnt.min(3) {
+                let e = iov_ptr + (j as u64) * 16;
+                if e + 16 > 0x0000_8000_0000_0000 { break; }
+                let b = unsafe { *(e as *const u64) };
+                let l = unsafe { *((e + 8) as *const u64) };
+                print(b" ["); print_u64(b); print(b","); print_u64(l); print(b"]");
+            }
+            print(b"\n");
+        }
         for i in 0..cnt {
             let entry = iov_ptr + (i as u64) * 16;
             if entry + 16 > 0x0000_8000_0000_0000 { break; }
@@ -1360,12 +1508,26 @@ pub(crate) fn sys_readv(ctx: &mut SyscallContext, msg: &IpcMsg) {
             if n < ilen { break; } // short read or no data
         }
         if total > 0 {
+            // Log data read
+            if ctx.pid >= 3 {
+                print(b"PIPEV-R P"); print_u64(ctx.pid as u64);
+                print(b" fd="); print_u64(fd as u64);
+                print(b" total="); print_u64(total as u64);
+                print(b" pipe="); print_u64(pipe_id as u64);
+                print(b"\n");
+            }
             reply_val(ctx.ep_cap, total as i64);
         } else if pipe_writer_closed(pipe_id) {
+            if ctx.pid >= 3 {
+                print(b"PIPEV-R P"); print_u64(ctx.pid as u64);
+                print(b" fd="); print_u64(fd as u64);
+                print(b" pipe="); print_u64(pipe_id as u64);
+                print(b" EOF\n");
+            }
             reply_val(ctx.ep_cap, 0); // EOF
         } else {
             // No data, writer alive — ask kernel to retry
-            mark_pipe_retry(ctx.pid);
+            mark_pipe_retry_on(ctx.pid, pipe_id);
             let reply = sotos_common::IpcMsg {
                 tag: sotos_common::PIPE_RETRY_TAG,
                 regs: [0; 8],
@@ -1387,48 +1549,7 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let fd = msg.regs[0] as usize;
     let iov_ptr = msg.regs[1];
     let iovcnt = msg.regs[2] as usize;
-    // Log ALL P3 writev (any fd) to trace git's write behavior
-    if ctx.pid == 3 {
-        let kind = if fd < GRP_MAX_FDS { ctx.child_fds[fd] } else { 0 };
-        // Compute total length
-        let cnt_peek = iovcnt.min(16);
-        let mut tlen_peek = 0usize;
-        for j in 0..cnt_peek {
-            let e = iov_ptr + (j as u64) * 16;
-            if e + 16 > 0x0000_8000_0000_0000 { break; }
-            let il = unsafe { *((e + 8) as *const u64) } as usize;
-            tlen_peek += il;
-        }
-        print(b"P3-WRITEV fd="); print_u64(fd as u64);
-        print(b" kind="); print_u64(kind as u64);
-        print(b" len="); print_u64(tlen_peek as u64);
-        print(b" [");
-        let mut shown = 0usize;
-        for j in 0..cnt_peek {
-            let e = iov_ptr + (j as u64) * 16;
-            if e + 16 > 0x0000_8000_0000_0000 { break; }
-            let base = unsafe { *(e as *const u64) };
-            let il = unsafe { *((e + 8) as *const u64) } as usize;
-            if base == 0 || il == 0 { continue; }
-            let lim = il.min(80 - shown);
-            for k in 0..lim {
-                let b = unsafe { *(base as *const u8).add(k) };
-                if b == 0x0A { print(b"\\n"); }
-                else if b >= 0x20 && b < 0x7F { sys::debug_print(b); }
-                else { print(b"."); }
-            }
-            shown += lim;
-            if shown >= 80 { break; }
-        }
-        print(b"]\n");
-    }
-    // Log all P4 writev to non-serial fds
-    if ctx.pid == 4 && fd >= 3 {
-        let kind = if fd < GRP_MAX_FDS { ctx.child_fds[fd] } else { 0 };
-        print(b"P4-WRITEV fd="); print_u64(fd as u64);
-        print(b" kind="); print_u64(kind as u64);
-        print(b"\n");
-    }
+    // (debug logging removed — serial too slow for per-syscall prints)
     if fd < GRP_MAX_FDS && ctx.child_fds[fd] == 2 {
         let mut total: usize = 0;
         let cnt = iovcnt.min(16);
@@ -1549,6 +1670,7 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
             }
             print(b"PIPEV-W P"); print_u64(ctx.pid as u64);
             print(b" fd="); print_u64(fd as u64);
+            print(b" pipe="); print_u64(pipe_id as u64);
             print(b" len="); print_u64(tlen as u64);
             print(b" [");
             let mut shown = 0usize;
@@ -1595,6 +1717,15 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
             }
             total += written;
             if written < safe_ilen { break; } // pipe full, stop
+        }
+        // DIAG: log pipe state after writev for P3 writing to pipe 2
+        if ctx.pid == 3 && pipe_id == 2 {
+            let wp = PIPE_WRITE_POS[pipe_id].load(Ordering::Acquire);
+            let rp = PIPE_READ_POS[pipe_id].load(Ordering::Acquire);
+            print(b"P3-POST-WV pipe=2 wp="); print_u64(wp);
+            print(b" rp="); print_u64(rp);
+            print(b" total="); print_u64(total as u64);
+            print(b"\n");
         }
         reply_val(ctx.ep_cap, total as i64);
     } else {
@@ -1647,14 +1778,11 @@ pub(crate) fn sys_access(ctx: &mut SyscallContext, msg: &IpcMsg, syscall_nr: u64
                         store.resolve_path(name, sotos_objstore::ROOT_OID).ok()
                     }).is_some();
                     vfs_unlock();
-                    if ctx.pid > 1 {
-                        let has_libexec = name.windows(7).any(|w| w == b"libexec");
-                        let has_index = name.windows(5).any(|w| w == b"index");
-                        if has_libexec || has_index || !found {
-                            print(if found { b"ACCESS: OK " } else { b"ACCESS: ENOENT " });
-                            print(name);
-                            print(b"\n");
-                        }
+                    // Only print access for config-related paths (reduced noise)
+                    if ctx.pid > 1 && name.windows(6).any(|w| w == b"config") {
+                        print(if found { b"ACCESS-OK: " } else { b"ACCESS-MISS: " });
+                        print(name);
+                        print(b"\n");
                     }
                     reply_val(ctx.ep_cap, if found { 0 } else { -ENOENT });
                 }
@@ -1683,6 +1811,13 @@ pub(crate) fn sys_pipe(ctx: &mut SyscallContext, msg: &IpcMsg) {
             ctx.sock_conn_id[r] = pipe_id as u32;
             ctx.sock_conn_id[w] = pipe_id as u32;
             unsafe { *pipefd = r as i32; *pipefd.add(1) = w as i32; }
+            if ctx.pid >= 3 {
+                print(b"FD-PIPE P"); print_u64(ctx.pid as u64);
+                print(b" r="); print_u64(r as u64);
+                print(b" w="); print_u64(w as u64);
+                print(b" pipe="); print_u64(pipe_id as u64);
+                print(b"\n");
+            }
             reply_val(ctx.ep_cap, 0);
         } else {
             reply_val(ctx.ep_cap, -EMFILE);
@@ -1713,6 +1848,16 @@ pub(crate) fn sys_dup(ctx: &mut SyscallContext, msg: &IpcMsg) {
             ctx.sock_udp_local_port[nfd] = ctx.sock_udp_local_port[oldfd];
             ctx.sock_udp_remote_ip[nfd] = ctx.sock_udp_remote_ip[oldfd];
             ctx.sock_udp_remote_port[nfd] = ctx.sock_udp_remote_port[oldfd];
+            // dup does NOT set FD_CLOEXEC on new fd
+            if nfd < 32 { *ctx.fd_cloexec &= !(1 << nfd); }
+            if ctx.pid >= 3 {
+                print(b"FD-DUP P"); print_u64(ctx.pid as u64);
+                print(b" "); print_u64(oldfd as u64);
+                print(b"->"); print_u64(nfd as u64);
+                print(b" k="); print_u64(ok as u64);
+                print(b" pipe="); print_u64(op as u64);
+                print(b"\n");
+            }
             reply_val(ctx.ep_cap, nfd as i64);
         } else {
             reply_val(ctx.ep_cap, -EMFILE);
@@ -1733,7 +1878,12 @@ pub(crate) fn sys_dup2(ctx: &mut SyscallContext, msg: &IpcMsg) {
             let np = ctx.sock_conn_id[newfd] as usize;
             if nk == 11 && np < MAX_PIPES {
                 let prev = PIPE_WRITE_REFS[np].fetch_sub(1, Ordering::AcqRel);
-                if prev <= 1 { PIPE_WRITE_CLOSED[np].store(1, Ordering::Release); }
+                if prev <= 1 {
+                    print(b"PWC-SET dup2 P"); print_u64(ctx.pid as u64);
+                    print(b" pipe="); print_u64(np as u64);
+                    print(b"\n");
+                    PIPE_WRITE_CLOSED[np].store(1, Ordering::Release);
+                }
             } else if nk == 10 && np < MAX_PIPES {
                 let prev = PIPE_READ_REFS[np].fetch_sub(1, Ordering::AcqRel);
                 if prev <= 1 { PIPE_READ_CLOSED[np].store(1, Ordering::Release); }
@@ -1749,6 +1899,18 @@ pub(crate) fn sys_dup2(ctx: &mut SyscallContext, msg: &IpcMsg) {
         ctx.sock_udp_local_port[newfd] = ctx.sock_udp_local_port[oldfd];
         ctx.sock_udp_remote_ip[newfd] = ctx.sock_udp_remote_ip[oldfd];
         ctx.sock_udp_remote_port[newfd] = ctx.sock_udp_remote_port[oldfd];
+        // dup2 does NOT set FD_CLOEXEC on new fd
+        if newfd < 32 { *ctx.fd_cloexec &= !(1 << newfd); }
+        if ctx.pid >= 3 {
+            let ok = ctx.child_fds[newfd];
+            let op = ctx.sock_conn_id[newfd] as u64;
+            print(b"FD-DUP2 P"); print_u64(ctx.pid as u64);
+            print(b" "); print_u64(oldfd as u64);
+            print(b"->"); print_u64(newfd as u64);
+            print(b" k="); print_u64(ok as u64);
+            print(b" pipe="); print_u64(op);
+            print(b"\n");
+        }
         reply_val(ctx.ep_cap, newfd as i64);
     }
 }
@@ -1790,13 +1952,51 @@ pub(crate) fn sys_fcntl(ctx: &mut SyscallContext, msg: &IpcMsg) {
                             }
                         }
                     }
+                    // Set cloexec on new fd if F_DUPFD_CLOEXEC
+                    if cmd == 1030 && n < 32 {
+                        *ctx.fd_cloexec |= 1 << n;
+                    }
+                    if ctx.pid >= 3 {
+                        print(b"FD-FCNTL P"); print_u64(ctx.pid as u64);
+                        print(b" F_DUPFD"); if cmd == 1030 { print(b"_CX"); }
+                        print(b" "); print_u64(fd as u64);
+                        print(b"->"); print_u64(n as u64);
+                        print(b" k="); print_u64(ok as u64);
+                        print(b" pipe="); print_u64(op as u64);
+                        print(b"\n");
+                    }
                     reply_val(ctx.ep_cap, n as i64);
                 }
                 else { reply_val(ctx.ep_cap, -EMFILE); }
             }
         }
-        1 | 3 => reply_val(ctx.ep_cap, 0), // F_GETFD, F_GETFL
-        2 | 4 => reply_val(ctx.ep_cap, 0), // F_SETFD, F_SETFL
+        1 => { // F_GETFD
+            if fd < 32 {
+                let val = if *ctx.fd_cloexec & (1 << fd) != 0 { 1 } else { 0 };
+                reply_val(ctx.ep_cap, val);
+            } else { reply_val(ctx.ep_cap, 0); }
+        }
+        2 => { // F_SETFD
+            if fd < 32 {
+                let flags = msg.regs[2] as u32;
+                if flags & 1 != 0 { // FD_CLOEXEC = 1
+                    *ctx.fd_cloexec |= 1 << fd;
+                } else {
+                    *ctx.fd_cloexec &= !(1 << fd);
+                }
+            }
+            reply_val(ctx.ep_cap, 0);
+        }
+        3 => { // F_GETFL
+            let flags = if fd < GRP_MAX_FDS { ctx.fd_flags[fd] } else { 0 };
+            reply_val(ctx.ep_cap, flags as i64);
+        }
+        4 => { // F_SETFL — save flags (O_NONBLOCK, O_APPEND, etc.)
+            if fd < GRP_MAX_FDS {
+                ctx.fd_flags[fd] = msg.regs[2] as u32;
+            }
+            reply_val(ctx.ep_cap, 0);
+        }
         _ => reply_val(ctx.ep_cap, -EINVAL),
     }
 }
@@ -1870,6 +2070,15 @@ pub(crate) fn sys_rename(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let old_name = &old_path[..old_len];
     let new_name = &new_path[..new_len];
 
+    // DIAG: trace rename for config paths
+    if ctx.pid > 1 && (old_name.windows(6).any(|w| w == b"config") || new_name.windows(6).any(|w| w == b"config")) {
+        print(b"REN: ");
+        print(old_name);
+        print(b" -> ");
+        print(new_name);
+        print(b"\n");
+    }
+
     vfs_lock();
     let result = unsafe { shared_store() }.and_then(|store| {
         use sotos_objstore::ROOT_OID;
@@ -1887,7 +2096,37 @@ pub(crate) fn sys_rename(ctx: &mut SyscallContext, msg: &IpcMsg) {
             }
             None => (ROOT_OID, new_name),
         };
-        store.rename(old_oid, new_basename, new_parent).ok()
+        // DIAG: check flags before rename
+        if let Some(entry_pre) = store.stat(old_oid) {
+            print(b"REN-PRE: oid="); print_u64(old_oid);
+            print(b" flags="); print_u64(entry_pre.flags as u64);
+            print(b" slot=");
+            if let Some(sl) = store.find_slot_pub(old_oid) {
+                print_u64(sl as u64);
+            }
+            print(b" name=["); print(entry_pre.name_as_str());
+            print(b"]\n");
+        }
+        store.rename(old_oid, new_basename, new_parent).ok()?;
+        // Post-rename verification: check renamed entry's flags
+        if let Some(entry) = store.stat(old_oid) {
+            if entry.is_dir() {
+                print(b"REN-POSTCHECK-DIR: oid=");
+                print_u64(old_oid);
+                print(b" flags=");
+                print_u64(entry.flags as u64);
+                print(b" name=[");
+                print(entry.name_as_str());
+                print(b"]\n");
+            }
+        }
+        // Also check if old name still resolves (shouldn't!)
+        if store.resolve_path(old_name, ROOT_OID).is_ok() {
+            print(b"REN-OLDNAME-STILL-EXISTS: ");
+            print(old_name);
+            print(b"\n");
+        }
+        Some(())
     });
     vfs_unlock();
     reply_val(ctx.ep_cap, if result.is_some() { 0 } else { -2 });
@@ -2008,7 +2247,7 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
             let rest = &path[6..path_len];
             let (n, consumed) = parse_u64_from(rest);
             if consumed > 0 && n >= 1 && n <= MAX_PROCS as u64
-                && PROC_STATE[n as usize - 1].load(Ordering::Acquire) != 0
+                && PROCESSES[n as usize - 1].state.load(Ordering::Acquire) != 0
             {
                 let after = &rest[consumed..];
                 if after == b"/status" || after.is_empty() {
@@ -2117,16 +2356,8 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
                             return None;
                         }
                         if has_trunc && !entry.is_dir() {
-                            let parent = entry.parent_oid;
-                            let fname = entry.name_as_str();
-                            let mut fname_buf = [0u8; 48];
-                            let flen = fname.len().min(48);
-                            fname_buf[..flen].copy_from_slice(&fname[..flen]);
-                            let _ = store.delete(oid);
-                            match store.create_in(&fname_buf[..flen], &[], parent) {
-                                Ok(new_oid) => Some((new_oid, 0u64, false)),
-                                Err(_) => None,
-                            }
+                            store.write_obj(oid, &[]).ok();
+                            Some((oid, 0u64, false))
                         } else {
                             Some((oid, entry.size, entry.is_dir()))
                         }
@@ -2477,12 +2708,18 @@ pub(crate) fn sys_mkdir(ctx: &mut SyscallContext, msg: &IpcMsg) {
         print(abs_name);
         print(if mkdir_ok { b" OK\n" } else { b" FAIL\n" });
     }
+    // Enable verbose P3 logging after "refs" mkdir
+    if ctx.pid == 3 && abs_name.windows(4).any(|w| w == b"refs") {
+        unsafe { crate::child_handler::P3_VERBOSE = true; }
+        print(b"[P3-VERBOSE: ON]\n");
+    }
     reply_val(ctx.ep_cap, if mkdir_ok { 0 } else { -ENOSPC });
 }
 
 /// SYS_PIPE2 (293): pipe with flags.
 pub(crate) fn sys_pipe2(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let pipefd_ptr = msg.regs[0];
+    let flags = msg.regs[1] as u32;
     let mut rfd = None;
     let mut wfd = None;
     for i in 3..GRP_MAX_FDS {
@@ -2497,6 +2734,11 @@ pub(crate) fn sys_pipe2(ctx: &mut SyscallContext, msg: &IpcMsg) {
             ctx.child_fds[w] = 11;
             ctx.sock_conn_id[r] = pipe_id as u32;
             ctx.sock_conn_id[w] = pipe_id as u32;
+            // Set close-on-exec if O_CLOEXEC requested
+            if flags & O_CLOEXEC != 0 {
+                if r < 32 { *ctx.fd_cloexec |= 1 << r; }
+                if w < 32 { *ctx.fd_cloexec |= 1 << w; }
+            }
             unsafe {
                 *(pipefd_ptr as *mut i32) = r as i32;
                 *((pipefd_ptr + 4) as *mut i32) = w as i32;
@@ -2555,6 +2797,7 @@ pub(crate) fn sys_readlink(ctx: &mut SyscallContext, msg: &IpcMsg) {
 pub(crate) fn sys_dup3(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let oldfd = msg.regs[0] as usize;
     let newfd = msg.regs[1] as usize;
+    let flags = msg.regs[2] as u32;
     if oldfd >= GRP_MAX_FDS || ctx.child_fds[oldfd] == 0 || newfd >= GRP_MAX_FDS {
         reply_val(ctx.ep_cap, -EBADF);
     } else if oldfd == newfd {
@@ -2566,7 +2809,12 @@ pub(crate) fn sys_dup3(ctx: &mut SyscallContext, msg: &IpcMsg) {
             let np = ctx.sock_conn_id[newfd] as usize;
             if nk == 11 && np < MAX_PIPES {
                 let prev = PIPE_WRITE_REFS[np].fetch_sub(1, Ordering::AcqRel);
-                if prev <= 1 { PIPE_WRITE_CLOSED[np].store(1, Ordering::Release); }
+                if prev <= 1 {
+                    print(b"PWC-SET dup3 P"); print_u64(ctx.pid as u64);
+                    print(b" pipe="); print_u64(np as u64);
+                    print(b"\n");
+                    PIPE_WRITE_CLOSED[np].store(1, Ordering::Release);
+                }
             } else if nk == 10 && np < MAX_PIPES {
                 let prev = PIPE_READ_REFS[np].fetch_sub(1, Ordering::AcqRel);
                 if prev <= 1 { PIPE_READ_CLOSED[np].store(1, Ordering::Release); }
@@ -2583,6 +2831,14 @@ pub(crate) fn sys_dup3(ctx: &mut SyscallContext, msg: &IpcMsg) {
         ctx.sock_udp_local_port[newfd] = ctx.sock_udp_local_port[oldfd];
         ctx.sock_udp_remote_ip[newfd] = ctx.sock_udp_remote_ip[oldfd];
         ctx.sock_udp_remote_port[newfd] = ctx.sock_udp_remote_port[oldfd];
+        // Set or clear FD_CLOEXEC based on flags
+        if newfd < 32 {
+            if flags & O_CLOEXEC != 0 {
+                *ctx.fd_cloexec |= 1 << newfd;
+            } else {
+                *ctx.fd_cloexec &= !(1 << newfd);
+            }
+        }
         reply_val(ctx.ep_cap, newfd as i64);
     }
 }

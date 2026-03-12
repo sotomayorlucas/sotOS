@@ -61,6 +61,17 @@ pub(crate) fn print_hex64(mut n: u64) {
     }
 }
 
+pub(crate) fn print_hex8(val: u8) {
+    let hex = b"0123456789ABCDEF";
+    let hi = hex[((val >> 4) & 0xF) as usize];
+    let lo = hex[(val & 0xF) as usize];
+    sys::debug_print(hi);
+    sys::debug_print(lo);
+    if unsafe { FB_ACTIVE } {
+        unsafe { fb_putchar(hi); fb_putchar(lo); }
+    }
+}
+
 pub(crate) fn print_hex(val: u32) {
     let hex = b"0123456789ABCDEF";
     for i in (0..8).rev() {

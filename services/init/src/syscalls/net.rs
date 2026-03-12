@@ -11,7 +11,7 @@ use crate::exec::{reply_val, rdtsc};
 use crate::process::{sig_dequeue, sig_dispatch};
 use crate::fd::*;
 use crate::NET_EP_CAP;
-use crate::child_handler::mark_pipe_retry;
+use crate::child_handler::mark_pipe_retry_on;
 use crate::net::{NET_CMD_TCP_CONNECT, NET_CMD_TCP_SEND, NET_CMD_TCP_RECV,
                  NET_CMD_UDP_BIND, NET_CMD_UDP_SENDTO, NET_CMD_UDP_RECV};
 use crate::framebuffer::{print, print_u64, kb_has_char};
@@ -62,7 +62,7 @@ pub(crate) fn sys_poll(ctx: &mut SyscallContext, msg: &IpcMsg) {
     } else {
         // No fds ready — use PIPE_RETRY_TAG to let kernel retry after
         // yielding. This avoids blocking init (which stalls all children).
-        mark_pipe_retry(ctx.pid);
+        mark_pipe_retry_on(ctx.pid, 0xFF);
         let reply = sotos_common::IpcMsg {
             tag: sotos_common::PIPE_RETRY_TAG,
             regs: [0; 8],
@@ -94,7 +94,7 @@ pub(crate) fn sys_ppoll(ctx: &mut SyscallContext, msg: &IpcMsg) {
         reply_val(ep_cap, ready as i64);
     } else {
         // No fds ready — use PIPE_RETRY_TAG for kernel-side retry
-        mark_pipe_retry(ctx.pid);
+        mark_pipe_retry_on(ctx.pid, 0xFF);
         let reply = sotos_common::IpcMsg {
             tag: sotos_common::PIPE_RETRY_TAG,
             regs: [0; 8],
@@ -108,6 +108,7 @@ pub(crate) fn sys_socket(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let domain = msg.regs[0] as u32;
     let sock_type = msg.regs[1] as u32;
     let base_type = sock_type & 0xFF;
+    let sock_nonblock = sock_type & 0x800; // SOCK_NONBLOCK
     if domain == 2 && (base_type == 1 || base_type == 2 || base_type == 3) {
         let net_cap = NET_EP_CAP.load(Ordering::Acquire);
         if net_cap == 0 {
@@ -119,6 +120,10 @@ pub(crate) fn sys_socket(ctx: &mut SyscallContext, msg: &IpcMsg) {
             }
             match fd {
                 Some(f) => {
+                    // Propagate SOCK_NONBLOCK to fd_flags
+                    if sock_nonblock != 0 {
+                        ctx.fd_flags[f] = 0x800; // O_NONBLOCK
+                    }
                     if base_type == 1 {
                         ctx.child_fds[f] = 16; // TCP
                         ctx.sock_conn_id[f] = 0xFFFF;
@@ -244,22 +249,38 @@ pub(crate) fn sys_sendto(ctx: &mut SyscallContext, msg: &IpcMsg) {
             Err(_) => reply_val(ep_cap, -EIO),
         }
     } else {
-        // TCP send
+        // TCP send — multi-chunk loop (same as sys_write for kind=16)
         let net_cap = NET_EP_CAP.load(Ordering::Acquire);
         let conn_id = ctx.sock_conn_id[fd] as u64;
-        let send_len = len.min(40);
-        let mut req = IpcMsg {
-            tag: NET_CMD_TCP_SEND,
-            regs: [conn_id, 0, send_len as u64, 0, 0, 0, 0, 0],
-        };
-        let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, send_len) };
-        unsafe {
-            let dst = &mut req.regs[3] as *mut u64 as *mut u8;
-            core::ptr::copy_nonoverlapping(data.as_ptr(), dst, send_len);
+        let mut total_sent = 0usize;
+        let mut off = 0usize;
+        while off < len {
+            let chunk = (len - off).min(40);
+            let mut req = IpcMsg {
+                tag: NET_CMD_TCP_SEND,
+                regs: [conn_id, 0, chunk as u64, 0, 0, 0, 0, 0],
+            };
+            let data = unsafe { core::slice::from_raw_parts((buf_ptr + off as u64) as *const u8, chunk) };
+            unsafe {
+                let dst = &mut req.regs[3] as *mut u64 as *mut u8;
+                core::ptr::copy_nonoverlapping(data.as_ptr(), dst, chunk);
+            }
+            match sys::call_timeout(net_cap, &req, 500) {
+                Ok(resp) => {
+                    let n = resp.regs[0] as i64;
+                    if n <= 0 { break; }
+                    let n = n as usize;
+                    total_sent += n;
+                    off += n;
+                }
+                Err(_) => break,
+            }
         }
-        match sys::call_timeout(net_cap, &req, 500) {
-            Ok(resp) => reply_val(ep_cap, resp.regs[0] as i64),
-            Err(_) => reply_val(ep_cap, -EIO),
+        // (SENDTO-TCP debug logging removed)
+        if total_sent > 0 {
+            reply_val(ep_cap, total_sent as i64);
+        } else {
+            reply_val(ep_cap, -EIO);
         }
     }
 }
@@ -317,22 +338,37 @@ pub(crate) fn sys_sendmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
             Err(_) => reply_val(ep_cap, -EIO),
         }
     } else {
-        // TCP sendmsg
+        // TCP sendmsg — multi-chunk loop
         let net_cap = NET_EP_CAP.load(Ordering::Acquire);
         let conn_id = ctx.sock_conn_id[fd] as u64;
-        let send_len = iov_len.min(40);
-        let mut req = IpcMsg {
-            tag: NET_CMD_TCP_SEND,
-            regs: [conn_id, 0, send_len as u64, 0, 0, 0, 0, 0],
-        };
-        let data = unsafe { core::slice::from_raw_parts(iov_base as *const u8, send_len) };
-        unsafe {
-            let dst = &mut req.regs[3] as *mut u64 as *mut u8;
-            core::ptr::copy_nonoverlapping(data.as_ptr(), dst, send_len);
+        let mut total_sent = 0usize;
+        let mut off = 0usize;
+        while off < iov_len {
+            let chunk = (iov_len - off).min(40);
+            let mut req = IpcMsg {
+                tag: NET_CMD_TCP_SEND,
+                regs: [conn_id, 0, chunk as u64, 0, 0, 0, 0, 0],
+            };
+            let data = unsafe { core::slice::from_raw_parts((iov_base + off as u64) as *const u8, chunk) };
+            unsafe {
+                let dst = &mut req.regs[3] as *mut u64 as *mut u8;
+                core::ptr::copy_nonoverlapping(data.as_ptr(), dst, chunk);
+            }
+            match sys::call_timeout(net_cap, &req, 500) {
+                Ok(resp) => {
+                    let n = resp.regs[0] as i64;
+                    if n <= 0 { break; }
+                    let n = n as usize;
+                    total_sent += n;
+                    off += n;
+                }
+                Err(_) => break,
+            }
         }
-        match sys::call_timeout(net_cap, &req, 500) {
-            Ok(resp) => reply_val(ep_cap, resp.regs[0] as i64),
-            Err(_) => reply_val(ep_cap, -EIO),
+        if total_sent > 0 {
+            reply_val(ep_cap, total_sent as i64);
+        } else {
+            reply_val(ep_cap, -EIO);
         }
     }
 }
@@ -403,8 +439,12 @@ pub(crate) fn sys_recvfrom(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let net_cap = NET_EP_CAP.load(Ordering::Acquire);
         let conn_id = ctx.sock_conn_id[fd] as u64;
         let recv_len = len.min(64);
+        let nonblock = fd < GRP_MAX_FDS && (ctx.fd_flags[fd] & 0x800) != 0; // O_NONBLOCK
+        // Non-blocking: try a few times then return -EAGAIN fast.
+        // Blocking: full retry loop (same as sys_read for TCP).
+        let max_attempts = if nonblock { 10u32 } else { 5000u32 };
         let mut got = 0usize;
-        for _ in 0..5000u32 {
+        for attempt in 0..max_attempts {
             let req = IpcMsg {
                 tag: NET_CMD_TCP_RECV,
                 regs: [conn_id, recv_len as u64, 0, 0, 0, 0, 0, 0],
@@ -418,6 +458,7 @@ pub(crate) fn sys_recvfrom(ctx: &mut SyscallContext, msg: &IpcMsg) {
                             core::ptr::copy_nonoverlapping(src, buf_ptr as *mut u8, n);
                         }
                         got = n;
+                        // (RECVFROM-OK debug logging removed)
                         break;
                     }
                 }
@@ -426,7 +467,10 @@ pub(crate) fn sys_recvfrom(ctx: &mut SyscallContext, msg: &IpcMsg) {
             sys::yield_now();
         }
         if got > 0 { reply_val(ep_cap, got as i64); }
-        else { reply_val(ep_cap, -EAGAIN); }
+        else {
+            // (RECVFROM-EAGAIN debug logging removed)
+            reply_val(ep_cap, -EAGAIN);
+        }
     }
 }
 
@@ -516,8 +560,10 @@ pub(crate) fn sys_recvmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let net_cap = NET_EP_CAP.load(Ordering::Acquire);
         let conn_id = ctx.sock_conn_id[fd] as u64;
         let recv_len = iov_len.min(64);
+        let nonblock = fd < GRP_MAX_FDS && (ctx.fd_flags[fd] & 0x800) != 0;
+        let max_attempts = if nonblock { 10u32 } else { 5000u32 };
         let mut got = 0usize;
-        for _ in 0..5000u32 {
+        for _ in 0..max_attempts {
             let req = IpcMsg {
                 tag: NET_CMD_TCP_RECV,
                 regs: [conn_id, recv_len as u64, 0, 0, 0, 0, 0, 0],
@@ -638,7 +684,7 @@ pub(crate) fn sys_select(ctx: &mut SyscallContext, msg: &IpcMsg, syscall_nr: u64
         reply_val(ep_cap, ready as i64);
     } else {
         // No fds ready — use PIPE_RETRY_TAG for kernel-side retry
-        mark_pipe_retry(ctx.pid);
+        mark_pipe_retry_on(ctx.pid, 0xFF);
         let reply = sotos_common::IpcMsg {
             tag: sotos_common::PIPE_RETRY_TAG,
             regs: [0; 8],

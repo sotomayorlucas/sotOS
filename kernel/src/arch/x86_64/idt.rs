@@ -186,6 +186,41 @@ extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, _code
 }
 
 extern "x86-interrupt" fn general_protection_handler(frame: InterruptStackFrame, code: u64) {
+    // Check if fault is from user mode (RPL of CS selector)
+    let cs = frame.code_segment.0;
+    if cs & 3 != 0 {
+        // User-mode #GP — kill the thread instead of panicking the kernel.
+        let tid = crate::sched::current_tid().map(|t| t.0).unwrap_or(0);
+        let rip = frame.instruction_pointer.as_u64();
+        kprintln!(
+            "#GP(user) tid={} code={} rip={:#x} rsp={:#x}",
+            tid, code, rip, frame.stack_pointer.as_u64()
+        );
+        // Dump instruction bytes at RIP to identify the faulting opcode
+        let cr3 = crate::mm::paging::read_cr3();
+        let aspace = crate::mm::paging::AddressSpace::from_cr3(cr3);
+        if let Some(phys) = aspace.lookup_phys(rip & !0xFFF) {
+            let hhdm = crate::mm::hhdm_offset();
+            let off = (rip & 0xFFF) as usize;
+            let base = (phys + hhdm) as *const u8;
+            let mut bytes = [0u8; 8];
+            for i in 0..8 {
+                if off + i < 4096 {
+                    bytes[i] = unsafe { *base.add(off + i) };
+                }
+            }
+            kprintln!(
+                "#GP: bytes@rip: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
+            );
+        }
+        // Set SIGSEGV pending so parent sees WIFSIGNALED, then exit thread.
+        if let Some(tid) = crate::sched::current_tid() {
+            crate::sched::set_pending_signal(tid, 11);
+        }
+        crate::sched::exit_current();
+        return;
+    }
     panic!("EXCEPTION: general protection fault (code {})\n{:#?}", code, frame);
 }
 
@@ -198,6 +233,11 @@ extern "x86-interrupt" fn page_fault_handler(
     if code.contains(PageFaultErrorCode::USER_MODE) {
         let tid = crate::sched::current_tid().map(|t| t.0).unwrap_or(0);
         let cr3 = crate::mm::paging::read_cr3();
+        // Log ALL user page faults to trace CoW child behavior
+        kprintln!(
+            "#PF tid={} addr={:#x} code={:#x} rip={:#x}",
+            tid, addr, code.bits(), frame.instruction_pointer.as_u64()
+        );
         // Log null-pointer faults (addr=0 or rip=0) to reduce noise
         if addr == 0 || frame.instruction_pointer.as_u64() == 0 {
             kprintln!(
@@ -227,11 +267,23 @@ extern "x86-interrupt" fn page_fault_handler(
 // ---------------------------------------------------------------------------
 
 extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
+    if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        let tid = crate::sched::current_tid().map(|t| t.0).unwrap_or(0);
+        kprintln!("#DE tid={} rip={:#x} (user) — killing thread",
+            tid, frame.instruction_pointer.as_u64());
+        crate::sched::exit_current();
+    }
     panic!("EXCEPTION: #DE divide error at rip={:#x}\n{:#?}",
         frame.instruction_pointer.as_u64(), frame);
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
+    if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        let tid = crate::sched::current_tid().map(|t| t.0).unwrap_or(0);
+        kprintln!("#UD tid={} rip={:#x} (user) — killing thread",
+            tid, frame.instruction_pointer.as_u64());
+        crate::sched::exit_current();
+    }
     panic!("EXCEPTION: #UD invalid opcode at rip={:#x}\n{:#?}",
         frame.instruction_pointer.as_u64(), frame);
 }

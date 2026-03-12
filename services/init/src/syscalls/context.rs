@@ -20,8 +20,9 @@ pub(crate) struct SyscallContext<'a> {
     pub my_brk_base: u64,
     pub my_mmap_base: u64,
 
-    // FD tables (shared via GRP_ arrays)
+    // FD tables (shared via THREAD_GROUPS)
     pub child_fds: &'a mut [u8; GRP_MAX_FDS],
+    pub fd_cloexec: &'a mut u32,
     pub initrd_files: &'a mut [[u64; 4]; GRP_MAX_INITRD],
     pub initrd_file_buf_base: u64,
     pub vfs_files: &'a mut [[u64; 4]; GRP_MAX_VFS],
@@ -32,6 +33,8 @@ pub(crate) struct SyscallContext<'a> {
     pub dir_pos: &'a mut usize,
     pub cwd: &'a mut [u8; GRP_CWD_MAX],
 
+    // Per-fd open flags (O_NONBLOCK etc.)
+    pub fd_flags: &'a mut [u32; GRP_MAX_FDS],
     // Socket metadata (parallel arrays indexed by FD)
     pub sock_conn_id: &'a mut [u32; GRP_MAX_FDS],
     pub sock_udp_local_port: &'a mut [u16; GRP_MAX_FDS],
@@ -136,7 +139,5 @@ impl SyscallContext<'_> {
     }
 }
 
-pub(crate) const MAX_EVENTFDS: usize = 16;
-pub(crate) const MAX_TIMERFDS: usize = 8;
-pub(crate) const MAX_MEMFDS: usize = 8;
-pub(crate) const MAX_EPOLL_ENTRIES: usize = 64;
+// Constants re-exported from fd.rs (authoritative source)
+pub(crate) use crate::fd::{MAX_EVENTFDS, MAX_TIMERFDS, MAX_MEMFDS, MAX_EPOLL_ENTRIES};

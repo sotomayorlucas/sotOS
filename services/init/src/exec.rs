@@ -361,13 +361,31 @@ pub(crate) fn exec_from_vfs(path: &[u8]) -> Result<(u64, u64), i64> {
 /// Load an ELF from VFS with argv support.
 /// Caller must hold EXEC_LOCK.
 pub(crate) fn exec_from_vfs_argv(path: &[u8], argv: &[[u8; MAX_EXEC_ARG_LEN]], envp: &[[u8; MAX_EXEC_ARG_LEN]]) -> Result<(u64, u64), i64> {
+    for &b in b"VFS-EX:1\n" { sys::debug_print(b); }
+
+    // PWC checkpoint: before map_temp_buf
+    let pwc_a = crate::fd::PIPE_WRITE_CLOSED[1].load(core::sync::atomic::Ordering::Relaxed);
+
     // Step 1: Map temp buffer and read main ELF from VFS
     map_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES)?;
+
+    let pwc_b = crate::fd::PIPE_WRITE_CLOSED[1].load(core::sync::atomic::Ordering::Relaxed);
+    if pwc_a != pwc_b {
+        crate::framebuffer::print(b"!! EXEC-MAPBUF-CORRUPT: PWC[1] ");
+        crate::framebuffer::print_u64(pwc_a);
+        crate::framebuffer::print(b"->");
+        crate::framebuffer::print_u64(pwc_b);
+        crate::framebuffer::print(b"\n");
+    }
+
+    for &b in b"VFS-EX:2\n" { sys::debug_print(b); }
 
     let buf_cap = (EXEC_BUF_PAGES * 0x1000) as usize;
     let file_size: usize;
 
+    for &b in b"VFS-EX:vfslock\n" { sys::debug_print(b); }
     vfs_lock();
+    for &b in b"VFS-EX:locked\n" { sys::debug_print(b); }
     let vfs_result = unsafe { shared_store() }.and_then(|store| {
         use sotos_objstore::ROOT_OID;
         let oid = store.resolve_path(path, ROOT_OID).ok()?;
@@ -375,10 +393,24 @@ pub(crate) fn exec_from_vfs_argv(path: &[u8], argv: &[[u8; MAX_EXEC_ARG_LEN]], e
         let size = entry.size as usize;
         if size > buf_cap { return None; }
         let dst = unsafe { core::slice::from_raw_parts_mut(EXEC_BUF_BASE as *mut u8, size) };
+
+        // PWC checkpoint: before read_obj
+        let pwc_c = crate::fd::PIPE_WRITE_CLOSED[1].load(core::sync::atomic::Ordering::Relaxed);
+        for &b in b"VFS-EX:read\n" { sys::debug_print(b); }
         store.read_obj(oid, dst).ok()?;
+        let pwc_d = crate::fd::PIPE_WRITE_CLOSED[1].load(core::sync::atomic::Ordering::Relaxed);
+        if pwc_c != pwc_d {
+            crate::framebuffer::print(b"!! EXEC-VFSRD-CORRUPT: PWC[1] ");
+            crate::framebuffer::print_u64(pwc_c);
+            crate::framebuffer::print(b"->");
+            crate::framebuffer::print_u64(pwc_d);
+            crate::framebuffer::print(b"\n");
+        }
+        for &b in b"VFS-EX:done\n" { sys::debug_print(b); }
         Some(size)
     });
     vfs_unlock();
+    for &b in b"VFS-EX:unlocked\n" { sys::debug_print(b); }
 
     match vfs_result {
         Some(sz) => file_size = sz,
@@ -426,6 +458,9 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
         0
     };
 
+    // PWC checkpoint: before unmap_free loop
+    let pwc_pre_unmap = crate::fd::PIPE_WRITE_CLOSED[1].load(Ordering::Relaxed);
+
     // Unmap previous binary's ELF pages (leftover from prior exec)
     // Scan segments to determine the full range and free it
     {
@@ -447,10 +482,31 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
             }
         }
     }
+    // PWC checkpoint: after unmap_free, before map_elf_segments
+    let pwc_post_unmap = crate::fd::PIPE_WRITE_CLOSED[1].load(Ordering::Relaxed);
+    if pwc_pre_unmap != pwc_post_unmap {
+        crate::framebuffer::print(b"!! EXEC-UNMAP-CORRUPT: PWC[1] ");
+        crate::framebuffer::print_u64(pwc_pre_unmap);
+        crate::framebuffer::print(b"->");
+        crate::framebuffer::print_u64(pwc_post_unmap);
+        crate::framebuffer::print(b"\n");
+    }
+
     for &b in b"EL:2\n" { sys::debug_print(b); }
     if let Err(e) = map_elf_segments(EXEC_BUF_BASE, &elf_info, &segments, seg_count, main_base) {
         unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
         return Err(e);
+    }
+    // PWC checkpoint: after map_elf_segments
+    let pwc_post_map = crate::fd::PIPE_WRITE_CLOSED[1].load(Ordering::Relaxed);
+    if pwc_post_unmap != pwc_post_map {
+        crate::framebuffer::print(b"!! EXEC-MAPSEG-CORRUPT: PWC[1] ");
+        crate::framebuffer::print_u64(pwc_post_unmap);
+        crate::framebuffer::print(b"->");
+        crate::framebuffer::print_u64(pwc_post_map);
+        crate::framebuffer::print(b" base=0x");
+        crate::framebuffer::print_hex64(main_base);
+        crate::framebuffer::print(b"\n");
     }
     for &b in b"EL:3\n" { sys::debug_print(b); }
 
@@ -561,7 +617,7 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
 
     // Build Linux-style initial stack
     let stack_top = stack_addr + CHILD_STACK_SIZE;
-    let str_area = stack_top - 2048;
+    let str_area = stack_top - 4096; // 4K for argv/envp strings + AT_RANDOM
     let mut spos: usize = 0;
 
     let argc: usize = if argv.is_empty() { 1 } else { argv.len() };
@@ -643,8 +699,9 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
         }
     }
 
-    // Auxv: 10 pairs for dynamic, 9 for static (added AT_UID/AT_GID/AT_CLKTCK)
-    let auxv_pairs: u64 = if is_dynamic { 12 } else { 11 };
+    // Auxv pairs: PHDR+PHENT+PHNUM+PAGESZ+RANDOM+ENTRY+SYSINFO_EHDR
+    //             +UID+EUID+GID+EGID+CLKTCK+NULL = 13 (static), +AT_BASE = 14 (dynamic)
+    let auxv_pairs: u64 = if is_dynamic { 14 } else { 13 };
     let entries: u64 = 1 + argc as u64 + 1 + env_count as u64 + 1 + auxv_pairs * 2;
     let rsp = (str_area - entries as u64 * 8) & !0xF;
 
@@ -653,55 +710,95 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
         let mut i: usize = 0;
         *sp.add(i) = argc as u64; i += 1;
         for a in 0..argc { *sp.add(i) = argv_addrs[a]; i += 1; }
-        *sp.add(i) = 0; i += 1;
+        *sp.add(i) = 0; i += 1; // argv NULL terminator
         for e in 0..env_count { *sp.add(i) = env_addrs[e]; i += 1; }
-        *sp.add(i) = 0; i += 1;
-        // AT_PHDR(3)
+        *sp.add(i) = 0; i += 1; // envp NULL terminator
+        // AT_PHDR(3) — pointer to program headers in mapped memory
         *sp.add(i) = 3; i += 1; *sp.add(i) = phdr_vaddr; i += 1;
-        // AT_PHENT(4)
+        // AT_PHENT(4) — size of each program header entry
         *sp.add(i) = 4; i += 1; *sp.add(i) = 56; i += 1;
-        // AT_PHNUM(5)
+        // AT_PHNUM(5) — number of program headers
         *sp.add(i) = 5; i += 1; *sp.add(i) = elf_info.phnum as u64; i += 1;
         // AT_PAGESZ(6)
         *sp.add(i) = 6; i += 1; *sp.add(i) = 4096; i += 1;
-        // AT_RANDOM(25)
+        // AT_RANDOM(25) — 16 bytes of random data
         *sp.add(i) = 25; i += 1; *sp.add(i) = random_addr; i += 1;
-        // AT_ENTRY(9)
+        // AT_ENTRY(9) — main binary's entry point (NOT interpreter)
         *sp.add(i) = 9; i += 1; *sp.add(i) = main_base + elf_info.entry; i += 1;
-        // AT_SYSINFO_EHDR(33)
+        // AT_SYSINFO_EHDR(33) — vDSO base
         *sp.add(i) = 33; i += 1; *sp.add(i) = vdso::VDSO_BASE; i += 1;
         // AT_UID(11), AT_EUID(12), AT_GID(13), AT_EGID(14)
-        *sp.add(i) = 11; i += 1; *sp.add(i) = 0; i += 1;
-        *sp.add(i) = 13; i += 1; *sp.add(i) = 0; i += 1;
+        // All four required: musl checks UID==EUID && GID==EGID for secure mode
+        *sp.add(i) = 11; i += 1; *sp.add(i) = 0; i += 1; // AT_UID
+        *sp.add(i) = 12; i += 1; *sp.add(i) = 0; i += 1; // AT_EUID
+        *sp.add(i) = 13; i += 1; *sp.add(i) = 0; i += 1; // AT_GID
+        *sp.add(i) = 14; i += 1; *sp.add(i) = 0; i += 1; // AT_EGID
         // AT_CLKTCK(17) — clock ticks per second
         *sp.add(i) = 17; i += 1; *sp.add(i) = 100; i += 1;
-        // AT_BASE(7) for dynamic binaries
+        // AT_BASE(7) — interpreter load base (dynamic binaries only)
         if is_dynamic {
             *sp.add(i) = 7; i += 1; *sp.add(i) = interp_base; i += 1;
         }
-        // AT_NULL(0)
+        // AT_NULL(0) — auxv terminator
         *sp.add(i) = 0; i += 1;
-        *sp.add(i) = 0;
+        *sp.add(i) = 0; i += 1;
+        // Verify: written entries must match the calculated count
+        if i != entries as usize {
+            print(b"EXEC BUG: auxv entries mismatch! wrote=");
+            print_hex64(i as u64);
+            print(b" expected=");
+            print_hex64(entries);
+            print(b"\n");
+        }
     }
 
     print(b"EXEC: entry=0x");
     print_hex64(exec_entry);
     print(b" rsp=0x");
     print_hex64(rsp);
+    print(b" align=");
+    print_hex64(rsp & 0xF); // should be 0
+    print(b"\n");
+    print(b"  AT_PHDR=0x");
+    print_hex64(phdr_vaddr);
+    print(b" AT_PHNUM=");
+    print_hex64(elf_info.phnum as u64);
+    print(b" AT_ENTRY=0x");
+    print_hex64(main_base + elf_info.entry);
     if is_dynamic {
-        print(b" [dynamic] AT_BASE=0x");
+        print(b" AT_BASE=0x");
         print_hex64(interp_base);
-        print(b" AT_ENTRY=0x");
-        print_hex64(main_base + elf_info.entry);
     }
     print(b"\n");
+    // Verify AT_PHDR points to accessible memory with valid ELF phdr content
+    print(b"  elf_base=0x");
+    print_hex64(elf_base);
+    print(b" phoff=0x");
+    print_hex64(elf_info.phoff as u64);
+    print(b" seg0_vaddr=0x");
+    if seg_count > 0 { print_hex64(segments[0].vaddr); } else { print(b"NONE"); }
+    print(b"\n");
+    // Stack layout: entries count and auxv_pairs
+    print(b"  stk: argc=");
+    print_hex64(argc as u64);
+    print(b" envc=");
+    print_hex64(env_count as u64);
+    print(b" auxv=");
+    print_hex64(auxv_pairs);
+    print(b" entries=");
+    print_hex64(entries);
+    print(b"\n");
 
-    // Pre-TLS for glibc: allocate a page, write the AT_RANDOM canary at +0x28.
+    // Pre-TLS for glibc: write the AT_RANDOM canary at PRE_TLS+0x28.
     // glibc's ld-linux has stack-protector-enabled functions that run before
     // arch_prctl(ARCH_SET_FS) — they read fs:0x28 as the canary. By setting
     // FS_BASE to this pre-TLS page (via a trampoline), the canary is consistent
     // before and after glibc's own TLS setup.
+    //
+    // CRITICAL: On nested exec, this page is already mapped from a previous exec.
+    // We must unmap+remap to get a fresh page (avoids frame leak and stale canary).
     const PRE_TLS_ADDR: u64 = 0xB70000; // below vDSO (0xB80000)
+    let _ = sys::unmap_free(PRE_TLS_ADDR); // free old page if any (no-op on first exec)
     if let Ok(f) = sys::frame_alloc() {
         if sys::map(PRE_TLS_ADDR, f, MAP_WRITABLE).is_ok() {
             unsafe {
@@ -719,18 +816,19 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
         }
     }
 
-    // Write a trampoline at the vDSO pre-TLS setup stub (0xB80740):
+    // Write a trampoline at the vDSO pre-TLS setup stub.
+    // MUST NOT overlap COW_FORK_RESTORE (0xB80740) or FORK_TLS_TRAMPOLINE (0xB80760).
     //   mov edi, 0x1002        ; ARCH_SET_FS
     //   mov rsi, PRE_TLS_ADDR  ; pre-TLS address
     //   mov eax, 158           ; SYS_arch_prctl
     //   syscall
     //   mov rax, <exec_entry>
     //   jmp rax
-    const TRAMPOLINE_ADDR: u64 = 0xB80740;
+    let trampoline_addr = crate::vdso::PRE_TLS_TRAMPOLINE_ADDR;
     // Make vDSO page writable before updating trampoline (may be RX from previous exec)
-    let _ = sys::protect(TRAMPOLINE_ADDR & !0xFFF, MAP_WRITABLE); // 2 = writable
+    let _ = sys::protect(trampoline_addr & !0xFFF, MAP_WRITABLE); // 2 = writable
     unsafe {
-        let p = TRAMPOLINE_ADDR as *mut u8;
+        let p = trampoline_addr as *mut u8;
         // mov edi, 0x1002 (5 bytes: BF 02 10 00 00)
         *p = 0xBF; *p.add(1) = 0x02; *p.add(2) = 0x10; *p.add(3) = 0x00; *p.add(4) = 0x00;
         // movabs rsi, PRE_TLS_ADDR (10 bytes: 48 BE xx xx xx xx xx xx xx xx)
@@ -748,9 +846,9 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
     }
 
     // Make trampoline page executable (VMM demand-pages as RW+NX; we need RX)
-    let _ = sys::protect(TRAMPOLINE_ADDR & !0xFFF, 0); // 0 = read+execute (no write)
+    let _ = sys::protect(trampoline_addr & !0xFFF, 0); // 0 = read+execute (no write)
 
-    let child_entry = TRAMPOLINE_ADDR;
+    let child_entry = trampoline_addr;
 
     let new_ep = match sys::endpoint_create() {
         Ok(e) => e,

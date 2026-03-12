@@ -195,7 +195,6 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         if frame.rax == 158 {
             match frame.rdi {
                 0x1002 => { // ARCH_SET_FS
-                    kdebug!("arch_prctl(ARCH_SET_FS, {:#x})", frame.rsi);
                     sched::set_current_fs_base(frame.rsi);
                     frame.rax = 0;
                 }
@@ -274,6 +273,19 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         sched::save_current_redirect_regs(frame, saved_user_rsp);
 
         let tid = sched::current_tid().map(|t| t.0 as u64).unwrap_or(0);
+
+        // Periodic HLT so QEMU TCG can process its event loop (virtio TX/RX,
+        // timers). Without this, non-pipe syscall loops (e.g. libcurl's
+        // non-blocking recv→poll→recv cycle) starve QEMU's I/O backend.
+        // NOTE: SYSCALL masks IF via SFMASK, so we must STI before HLT.
+        {
+            static REDIRECT_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let n = REDIRECT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n & 255 == 0 {
+                unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
+            }
+        }
+
         let msg = Message {
             tag: frame.rax, // Linux syscall number
             regs: [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9, tid, saved_user_rsp],
@@ -289,13 +301,13 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
                 Ok(reply) => {
                     if reply.tag == sotos_common::PIPE_RETRY_TAG {
                         retries += 1;
-                        if retries < 500_000 {
-                            sched::schedule(); // yield to let other threads run
-                            continue; // re-send message to init
+                        sched::schedule(); // yield to let other threads run
+                        // Every 4096 retries, briefly HLT so QEMU TCG can
+                        // process its event loop (network I/O, timers).
+                        if retries & 4095 == 0 {
+                            unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
                         }
-                        // Retry limit hit — return 0 (EOF) to the child
-                        frame.rax = 0;
-                        break;
+                        continue; // re-send message to init (no limit — init handles deadlocks)
                     } else if reply.tag == sotos_common::SIG_REDIRECT_TAG {
                         // Signal delivery: LUCAS built a signal frame on the child's
                         // stack and wants to redirect execution to the signal handler.
@@ -310,16 +322,6 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
                         break;
                     } else {
                         frame.rax = reply.regs[0]; // return value
-                        // For SYS_read (tag=0): if handler returned inline byte
-                        // data in regs[1], write it to the user buffer from kernel
-                        // context as insurance (redundant with handler's write).
-                        if msg.tag == 0 && reply.regs[0] > 0 {
-                            let buf_ptr = frame.rsi;
-                            let byte_count = reply.regs[0] as usize;
-                            if buf_ptr != 0 && buf_ptr < USER_ADDR_LIMIT && byte_count == 1 {
-                                unsafe { core::ptr::write_volatile(buf_ptr as *mut u8, reply.regs[1] as u8); }
-                            }
-                        }
                         break;
                     }
                 }
@@ -1705,7 +1707,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
             let as_cap_id = frame.rdi as u32;
             let remote_vaddr = frame.rsi;
             let local_buf = frame.rdx;
-            let len = frame.r10 as usize;
+            let len = frame.r8 as usize;
             if len > 4096 {
                 frame.rax = SysError::InvalidArg as i64 as u64;
             } else {
@@ -1742,13 +1744,13 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         }
 
         // SYS_VM_WRITE — write bytes from caller's buffer into a target AS
-        // rdi = as_cap, rsi = remote_vaddr, rdx = local_buf, r10 = len
+        // rdi = as_cap, rsi = remote_vaddr, rdx = local_buf, r8 = len
         // Handles CoW: if the target page is read-only, does copy-on-write.
         SYS_VM_WRITE => {
             let as_cap_id = frame.rdi as u32;
             let remote_vaddr = frame.rsi;
             let local_buf = frame.rdx;
-            let len = frame.r10 as usize;
+            let len = frame.r8 as usize;
             if len > 4096 {
                 frame.rax = SysError::InvalidArg as i64 as u64;
             } else {

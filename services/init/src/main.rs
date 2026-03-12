@@ -191,6 +191,17 @@ pub extern "C" fn _start() -> ! {
     print_u64(cap_count);
     print(b" caps received\n");
 
+    // Diagnostic: print addresses of pipe state for corruption analysis
+    print(b"PIPE-ADDRS: PWC=");
+    print_u64(fd::PIPE_WRITE_CLOSED.as_ptr() as u64);
+    print(b" WREFS=");
+    print_u64(fd::PIPE_WRITE_REFS.as_ptr() as u64);
+    print(b" RREFS=");
+    print_u64(fd::PIPE_READ_REFS.as_ptr() as u64);
+    print(b" TG=");
+    print_u64(unsafe { fd::THREAD_GROUPS.as_ptr() as u64 });
+    print(b"\n");
+
     // Store init's own AS cap for CoW fork support.
     if boot_info.self_as_cap != 0 {
         crate::process::INIT_SELF_AS_CAP.store(boot_info.self_as_cap, core::sync::atomic::Ordering::Release);

@@ -504,11 +504,39 @@ fn spawn_user_opt(user_rip: u64, user_rsp: u64, cr3: u64, redirect_ep: Option<u3
     let slot = handle.index();
     sched.register_tid(tid, slot);
     sched.enqueue(slot);
+    if redirect_ep.is_some() && id >= 16 {
+        crate::kprintln!("SPAWN-REDIR: tid={} rip={:#x} cr3={:#x} ep={:?}", tid.0, user_rip, cr3, redirect_ep);
+    }
     tid
 }
 
 /// Terminate the current thread and switch away.
 pub fn exit_current() -> ! {
+    // Check for redirect endpoint BEFORE acquiring scheduler lock,
+    // since send() acquires the endpoint lock (avoid nesting).
+    let redirect_ep = {
+        let percpu = percpu::current_percpu();
+        let idx = percpu.current_thread;
+        if idx != usize::MAX {
+            let sched = SCHEDULER.lock();
+            sched.threads.get_by_index(idx as u32)
+                .and_then(|t| t.redirect_ep)
+        } else {
+            None
+        }
+    };
+    // Send synthetic SYS_EXIT_GROUP to the handler so it can clean up
+    // (pipe refs, memory, etc.) instead of blocking on recv forever.
+    if let Some(ep_raw) = redirect_ep {
+        let exit_msg = crate::ipc::endpoint::Message {
+            tag: 231, // SYS_EXIT_GROUP
+            regs: [139, 0, 0, 0, 0, 0, 0, 0], // status=139 (SIGSEGV-like)
+            cap_transfer: None,
+        };
+        let ep_handle = crate::pool::PoolHandle::from_raw(ep_raw);
+        let _ = crate::ipc::endpoint::send(ep_handle, exit_msg);
+    }
+    // Now mark the thread as Dead.
     {
         let percpu = percpu::current_percpu();
         let idx = percpu.current_thread;

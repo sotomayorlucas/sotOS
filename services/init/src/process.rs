@@ -11,67 +11,92 @@ use ufmt::uwrite;
 use crate::fd::fd_grp_init;
 
 // ---------------------------------------------------------------------------
-// LUCAS process table (Phase 10.5) -- shared between handler threads
+// Process table constants
 // ---------------------------------------------------------------------------
 
 pub(crate) const MAX_PROCS: usize = 16;
+
+// ---------------------------------------------------------------------------
+// ProcessState: all per-process metadata in one struct.
+// Uses AtomicU64 fields for lock-free concurrent access.
+// ---------------------------------------------------------------------------
+
+pub(crate) struct ProcessState {
+    // Core process info
+    pub state: AtomicU64,       // 0=Free, 1=Running, 2=Zombie
+    pub exit_code: AtomicU64,   // exit status (valid when Zombie)
+    pub parent: AtomicU64,      // parent PID (0=none)
+    pub kernel_tid: AtomicU64,  // raw kernel thread ID (for async signal injection)
+
+    // Thread group / resource sharing
+    pub tgid: AtomicU64,        // thread group ID
+    pub fd_group: AtomicU64,    // FD group index (into THREAD_GROUPS)
+    pub mem_group: AtomicU64,   // memory group index (into THREAD_GROUPS)
+    pub sig_group: AtomicU64,   // signal handler group index
+    pub clear_tid: AtomicU64,   // CLONE_CHILD_CLEARTID pointer
+
+    // Stack tracking
+    pub stack_base: AtomicU64,
+    pub stack_pages: AtomicU64,
+
+    // ELF load range (page-aligned)
+    pub elf_lo: AtomicU64,
+    pub elf_hi: AtomicU64,
+    pub has_interp: AtomicU64,
+
+    // brk/mmap per-process tracking (for cleanup on exit)
+    pub brk_base: AtomicU64,
+    pub brk_current: AtomicU64,
+    pub mmap_base: AtomicU64,
+    pub mmap_next: AtomicU64,
+
+    // Signals
+    pub sig_pending: AtomicU64,         // pending signals bitmask
+    pub sig_blocked: AtomicU64,         // blocked signals bitmask
+    pub sig_handler: [AtomicU64; 32],   // handler addr per signal (0=SIG_DFL, 1=SIG_IGN)
+    pub sig_flags: [AtomicU64; 32],     // SA_* flags per signal
+    pub sig_restorer: [AtomicU64; 32],  // sa_restorer per signal
+}
+
+impl ProcessState {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: AtomicU64::new(0),
+            exit_code: AtomicU64::new(0),
+            parent: AtomicU64::new(0),
+            kernel_tid: AtomicU64::new(0),
+            tgid: AtomicU64::new(0),
+            fd_group: AtomicU64::new(0),
+            mem_group: AtomicU64::new(0),
+            sig_group: AtomicU64::new(0),
+            clear_tid: AtomicU64::new(0),
+            stack_base: AtomicU64::new(0),
+            stack_pages: AtomicU64::new(0),
+            elf_lo: AtomicU64::new(0),
+            elf_hi: AtomicU64::new(0),
+            has_interp: AtomicU64::new(0),
+            brk_base: AtomicU64::new(0),
+            brk_current: AtomicU64::new(0),
+            mmap_base: AtomicU64::new(0),
+            mmap_next: AtomicU64::new(0),
+            sig_pending: AtomicU64::new(0),
+            sig_blocked: AtomicU64::new(0),
+            sig_handler: [const { AtomicU64::new(0) }; 32],
+            sig_flags: [const { AtomicU64::new(0) }; 32],
+            sig_restorer: [const { AtomicU64::new(0) }; 32],
+        }
+    }
+}
+
+/// Consolidated per-process state. Indexed by pid-1 (0-based).
+pub(crate) static PROCESSES: [ProcessState; MAX_PROCS] =
+    [const { ProcessState::new() }; MAX_PROCS];
 
 /// Init's own address space capability (from BootInfo.self_as_cap).
 /// Set once at startup, read by child_handler for CoW fork.
 pub(crate) static INIT_SELF_AS_CAP: AtomicU64 = AtomicU64::new(0);
 
-/// Process state: 0=Free, 1=Running, 2=Zombie.
-pub(crate) static PROC_STATE: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// Exit status (valid when Zombie).
-pub(crate) static PROC_EXIT: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// Parent PID (0=none).
-pub(crate) static PROC_PARENT: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// Kernel thread ID (raw) for each LUCAS pid (for async signal injection).
-pub(crate) static PROC_KERNEL_TID: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// Pending signals bitmask per process (bit N = signal N pending).
-pub(crate) static SIG_PENDING: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// Blocked signals bitmask per process (bit N = signal N blocked).
-pub(crate) static SIG_BLOCKED: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// Signal handler addresses per process, 32 signals each.
-/// 0 = SIG_DFL, 1 = SIG_IGN, else = user handler address.
-pub(crate) static SIG_HANDLER: [[AtomicU64; 32]; MAX_PROCS] = {
-    const H: AtomicU64 = AtomicU64::new(0);
-    const ROW: [AtomicU64; 32] = [H; 32];
-    [ROW; MAX_PROCS]
-};
-/// Signal flags (SA_RESTART etc.) per process per signal.
-pub(crate) static SIG_FLAGS: [[AtomicU64; 32]; MAX_PROCS] = {
-    const H: AtomicU64 = AtomicU64::new(0);
-    const ROW: [AtomicU64; 32] = [H; 32];
-    [ROW; MAX_PROCS]
-};
-/// Signal handler masks per process per signal (blocked during handler).
-pub(crate) static SIG_RESTORER: [[AtomicU64; 32]; MAX_PROCS] = {
-    const H: AtomicU64 = AtomicU64::new(0);
-    const ROW: [AtomicU64; 32] = [H; 32];
-    [ROW; MAX_PROCS]
-};
-
 // Signal constants
-// Signal/sigaction constants — sourced from linux_abi (linux-raw-sys)
 pub(crate) const _SA_NOCLDSTOP: u64 = 1;
 pub(crate) const _SA_NOCLDWAIT: u64 = 2;
 
@@ -81,7 +106,6 @@ pub(crate) static BOOT_TSC: AtomicU64 = AtomicU64::new(0);
 /// Next PID to allocate (monotonically increasing, starts at 1).
 pub(crate) static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 /// Next vaddr for child stacks (guest + handler interleaved, 0x2000 apart).
-/// Range: 0xE80000..0x2000000 (safe: BRK_BASE is at 0x2000000).
 pub(crate) static NEXT_CHILD_STACK: AtomicU64 = AtomicU64::new(0xE80000);
 
 // Handshake statics for passing setup info to child handler thread.
@@ -99,77 +123,6 @@ pub(crate) static CHILD_SETUP_AS_CAP: AtomicU64 = AtomicU64::new(0);
 // Clone flag constants — sourced from linux_abi (linux-raw-sys)
 pub(crate) use linux_abi::{CLONE_VM, CLONE_FILES, CLONE_SIGHAND, CLONE_THREAD,
                            CLONE_SETTLS, CLONE_PARENT_SETTID, CLONE_CHILD_CLEARTID};
-
-/// Thread group ID per process slot. tgid = pid for leaders, tgid = leader's pid for threads.
-pub(crate) static PROC_TGID: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// FD group index for each process (threads with CLONE_FILES share the same group).
-pub(crate) static PROC_FD_GROUP: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// Memory group index (threads with CLONE_VM share brk/mmap state).
-pub(crate) static PROC_MEM_GROUP: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// Signal handler group (threads with CLONE_SIGHAND share signal handlers).
-pub(crate) static PROC_SIG_GROUP: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// clear_child_tid pointer (CLONE_CHILD_CLEARTID): on exit, *ptr = 0 + futex_wake.
-pub(crate) static PROC_CLEAR_TID: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// Per-process stack base (for freeing on exit).
-pub(crate) static PROC_STACK_BASE: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// Per-process stack page count.
-pub(crate) static PROC_STACK_PAGES: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// Per-process ELF load range low address (page-aligned).
-pub(crate) static PROC_ELF_LO: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// Per-process ELF load range high address (page-aligned, exclusive).
-pub(crate) static PROC_ELF_HI: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// Whether the process used a dynamic interpreter (INTERP_LOAD_BASE).
-pub(crate) static PROC_HAS_INTERP: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// Per-process brk base address (start of brk region).
-pub(crate) static PROC_BRK_BASE: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// Per-process current brk address (end of allocated brk region).
-pub(crate) static PROC_BRK_CURRENT: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// Per-process mmap base address (start of mmap region).
-pub(crate) static PROC_MMAP_BASE: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
-/// Per-process mmap next address (end of allocated mmap region).
-pub(crate) static PROC_MMAP_NEXT: [AtomicU64; MAX_PROCS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCS]
-};
 
 // ---------------------------------------------------------------------------
 // Futex wait queue (Phase 4)
@@ -222,14 +175,15 @@ pub(crate) fn sig_default_action(sig: u64) -> u8 {
 /// Deliver a signal to a process. Sets the pending bit.
 pub(crate) fn sig_send(pid: usize, sig: u64) {
     if sig == 0 || sig >= 32 || pid == 0 || pid > MAX_PROCS { return; }
-    SIG_PENDING[pid - 1].fetch_or(1 << sig, Ordering::Release);
+    let p = &PROCESSES[pid - 1];
+    p.sig_pending.fetch_or(1 << sig, Ordering::Release);
     // SIGKILL always terminates immediately
     if sig == linux_abi::SIGKILL as u64 {
-        PROC_EXIT[pid - 1].store(128 + sig, Ordering::Release);
-        PROC_STATE[pid - 1].store(2, Ordering::Release);
+        p.exit_code.store(128 + sig, Ordering::Release);
+        p.state.store(2, Ordering::Release);
     }
-    // Inject into kernel for async delivery (timer interrupt will redirect to trampoline)
-    let tc = PROC_KERNEL_TID[pid - 1].load(Ordering::Acquire);
+    // Inject into kernel for async delivery
+    let tc = p.kernel_tid.load(Ordering::Acquire);
     if tc != 0 {
         let _ = sys::signal_inject(tc, sig);
     }
@@ -239,15 +193,13 @@ pub(crate) fn sig_send(pid: usize, sig: u64) {
 /// should be acted on, or 0 if none. Clears the signal from pending.
 pub(crate) fn sig_dequeue(pid: usize) -> u64 {
     if pid == 0 || pid > MAX_PROCS { return 0; }
-    let idx = pid - 1;
-    let pending = SIG_PENDING[idx].load(Ordering::Acquire);
-    let blocked = SIG_BLOCKED[idx].load(Ordering::Acquire);
+    let p = &PROCESSES[pid - 1];
+    let pending = p.sig_pending.load(Ordering::Acquire);
+    let blocked = p.sig_blocked.load(Ordering::Acquire);
     let actionable = pending & !blocked;
     if actionable == 0 { return 0; }
-    // Find lowest set bit
     let sig = actionable.trailing_zeros() as u64;
-    // Clear it
-    SIG_PENDING[idx].fetch_and(!(1 << sig), Ordering::AcqRel);
+    p.sig_pending.fetch_and(!(1 << sig), Ordering::AcqRel);
     sig
 }
 
@@ -258,80 +210,61 @@ pub(crate) fn sig_dequeue(pid: usize) -> u64 {
 /// - 3: signal has a user handler -> caller should call signal_deliver()
 pub(crate) fn sig_dispatch(pid: usize, sig: u64) -> u8 {
     if sig == 0 || sig >= 32 || pid == 0 || pid > MAX_PROCS { return 0; }
-    let idx = pid - 1;
+    let p = &PROCESSES[pid - 1];
 
     // SIGKILL/SIGSTOP cannot be caught or ignored
     if sig == linux_abi::SIGKILL as u64 {
-        PROC_EXIT[idx].store(128 + sig, Ordering::Release);
-        PROC_STATE[idx].store(2, Ordering::Release);
+        p.exit_code.store(128 + sig, Ordering::Release);
+        p.state.store(2, Ordering::Release);
         return 1;
     }
 
-    let handler = SIG_HANDLER[idx][sig as usize].load(Ordering::Acquire);
+    let handler = p.sig_handler[sig as usize].load(Ordering::Acquire);
 
     match handler {
         linux_abi::SIG_DFL => {
-            // Apply default action
             match sig_default_action(sig) {
                 0 => {
-                    // Terminate
-                    PROC_EXIT[idx].store(128 + sig, Ordering::Release);
-                    PROC_STATE[idx].store(2, Ordering::Release);
+                    p.exit_code.store(128 + sig, Ordering::Release);
+                    p.state.store(2, Ordering::Release);
                     1
                 }
-                1 => 0, // Ignore
-                2 => 0, // Stop (not implemented, treat as ignore)
-                3 => 0, // Continue (not implemented, treat as ignore)
+                1 => 0,
+                2 => 0,
+                3 => 0,
                 _ => 0,
             }
         }
-        linux_abi::SIG_IGN => 0, // Explicitly ignored
-        _handler_addr => {
-            // User handler registered -- deliver via signal frame injection
-            3
-        }
+        linux_abi::SIG_IGN => 0,
+        _handler_addr => 3,
     }
 }
 
 /// Deliver a signal to a child process by building a SignalFrame on the
 /// child's user stack and replying with SIG_REDIRECT_TAG.
-///
-/// `ep_cap`: the IPC endpoint to reply on
-/// `pid`: process slot (1-based)
-/// `sig`: signal number to deliver
-/// `child_tid`: kernel thread ID of the child
-/// `syscall_ret`: the original syscall return value (saved in signal frame)
-///
-/// Returns true if delivery succeeded (caller should NOT send another reply).
 pub(crate) fn signal_deliver(ep_cap: u64, pid: usize, sig: u64, child_tid: u64, syscall_ret: i64, is_async: bool) -> bool {
     if sig == 0 || sig >= 32 || pid == 0 || pid > MAX_PROCS { return false; }
-    let idx = pid - 1;
+    let p = &PROCESSES[pid - 1];
 
-    let handler = SIG_HANDLER[idx][sig as usize].load(Ordering::Acquire);
-    let restorer = SIG_RESTORER[idx][sig as usize].load(Ordering::Acquire);
+    let handler = p.sig_handler[sig as usize].load(Ordering::Acquire);
+    let restorer = p.sig_restorer[sig as usize].load(Ordering::Acquire);
 
-    if handler <= 1 { return false; } // SIG_DFL or SIG_IGN -- can't deliver
+    if handler <= 1 { return false; }
 
-    // Need a restorer (sa_restorer) -- musl always sets one via SA_RESTORER.
-    // If not set, we can't return from the handler. Use a fallback that just
-    // calls rt_sigreturn directly.
     let restorer_addr = if restorer != 0 {
         restorer
     } else {
-        // No restorer -- the handler can't return cleanly. Skip delivery.
         return false;
     };
 
-    // Read the child's saved register state from the kernel
     let mut saved_regs = [0u64; 18];
     if sys::get_thread_regs(child_tid, &mut saved_regs).is_err() {
         return false;
     }
 
-    // saved_regs layout: [rax,rbx,rcx,rdx,rsi,rdi,rbp,r8..r15,rsp,fs_base,rflags_or_0]
     let saved_rax = saved_regs[0];
     let saved_rbx = saved_regs[1];
-    let saved_rcx = saved_regs[2]; // user RIP (from SYSCALL: rcx = rip)
+    let saved_rcx = saved_regs[2];
     let saved_rdx = saved_regs[3];
     let saved_rsi = saved_regs[4];
     let saved_rdi = saved_regs[5];
@@ -339,77 +272,65 @@ pub(crate) fn signal_deliver(ep_cap: u64, pid: usize, sig: u64, child_tid: u64, 
     let saved_r8  = saved_regs[7];
     let saved_r9  = saved_regs[8];
     let saved_r10 = saved_regs[9];
-    let saved_r11 = saved_regs[10]; // user RFLAGS (from SYSCALL: r11 = rflags)
+    let saved_r11 = saved_regs[10];
     let saved_r12 = saved_regs[11];
     let saved_r13 = saved_regs[12];
     let saved_r14 = saved_regs[13];
     let saved_r15 = saved_regs[14];
     let saved_rsp = saved_regs[15];
     let saved_fsbase = saved_regs[16];
-    // saved_regs[17] may hold rflags for async signals
 
-    // For the signal frame, rip and rflags:
-    let saved_rip = saved_rcx;    // rcx holds user RIP for SYSCALL
-    let saved_rflags = saved_r11; // r11 holds user RFLAGS for SYSCALL
-
-    // For sync signals: use the syscall return value (what rax would have been).
-    // For async signals: use the actual user rax at interrupt time.
+    let saved_rip = saved_rcx;
+    let saved_rflags = saved_r11;
     let frame_rax = if is_async { saved_rax } else { syscall_ret as u64 };
 
-    // Compute frame RSP: 16-byte aligned, frame data starts here.
-    // The handler's return address (restorer) is placed 8 bytes below at entry_rsp.
-    // After handler `ret`, RSP = frame_rsp → kernel rt_sigreturn reads frame correctly.
     let frame_size = SIGNAL_FRAME_SIZE as u64;
-    let frame_rsp = (saved_rsp - frame_size) & !0xF;   // 16-byte aligned
-    let entry_rsp = frame_rsp - 8;                      // handler entry: RSP % 16 == 8
+    let frame_rsp = (saved_rsp - frame_size) & !0xF;
+    let entry_rsp = frame_rsp - 8;
 
-    // Write the handler's return address at entry_rsp
     unsafe {
         core::ptr::write_volatile(entry_rsp as *mut u64, restorer_addr);
     }
 
-    // Write the SignalFrame at frame_rsp (where RSP will be after handler `ret`)
     let frame_ptr = frame_rsp as *mut u64;
     unsafe {
-        core::ptr::write_volatile(frame_ptr.add(0),  restorer_addr);  // restorer (kernel skips)
-        core::ptr::write_volatile(frame_ptr.add(1),  sig);            // signo (kernel skips)
-        core::ptr::write_volatile(frame_ptr.add(2),  frame_rax);      // rax (syscall return)
-        core::ptr::write_volatile(frame_ptr.add(3),  saved_rbx);      // rbx
-        core::ptr::write_volatile(frame_ptr.add(4),  saved_rcx);      // rcx
-        core::ptr::write_volatile(frame_ptr.add(5),  saved_rdx);      // rdx
-        core::ptr::write_volatile(frame_ptr.add(6),  saved_rsi);      // rsi
-        core::ptr::write_volatile(frame_ptr.add(7),  saved_rdi);      // rdi
-        core::ptr::write_volatile(frame_ptr.add(8),  saved_rbp);      // rbp
-        core::ptr::write_volatile(frame_ptr.add(9),  saved_r8);       // r8
-        core::ptr::write_volatile(frame_ptr.add(10), saved_r9);       // r9
-        core::ptr::write_volatile(frame_ptr.add(11), saved_r10);      // r10
-        core::ptr::write_volatile(frame_ptr.add(12), saved_r11);      // r11
-        core::ptr::write_volatile(frame_ptr.add(13), saved_r12);      // r12
-        core::ptr::write_volatile(frame_ptr.add(14), saved_r13);      // r13
-        core::ptr::write_volatile(frame_ptr.add(15), saved_r14);      // r14
-        core::ptr::write_volatile(frame_ptr.add(16), saved_r15);      // r15
-        core::ptr::write_volatile(frame_ptr.add(17), saved_rip);      // rip
-        core::ptr::write_volatile(frame_ptr.add(18), saved_rsp);      // rsp
-        core::ptr::write_volatile(frame_ptr.add(19), saved_rflags);   // rflags
-        core::ptr::write_volatile(frame_ptr.add(20), saved_fsbase);   // fs_base
-        // old_sigmask: save current mask, then apply sa_mask
-        let old_mask = SIG_BLOCKED[idx].load(Ordering::Acquire);
-        core::ptr::write_volatile(frame_ptr.add(21), old_mask);       // old_sigmask
+        core::ptr::write_volatile(frame_ptr.add(0),  restorer_addr);
+        core::ptr::write_volatile(frame_ptr.add(1),  sig);
+        core::ptr::write_volatile(frame_ptr.add(2),  frame_rax);
+        core::ptr::write_volatile(frame_ptr.add(3),  saved_rbx);
+        core::ptr::write_volatile(frame_ptr.add(4),  saved_rcx);
+        core::ptr::write_volatile(frame_ptr.add(5),  saved_rdx);
+        core::ptr::write_volatile(frame_ptr.add(6),  saved_rsi);
+        core::ptr::write_volatile(frame_ptr.add(7),  saved_rdi);
+        core::ptr::write_volatile(frame_ptr.add(8),  saved_rbp);
+        core::ptr::write_volatile(frame_ptr.add(9),  saved_r8);
+        core::ptr::write_volatile(frame_ptr.add(10), saved_r9);
+        core::ptr::write_volatile(frame_ptr.add(11), saved_r10);
+        core::ptr::write_volatile(frame_ptr.add(12), saved_r11);
+        core::ptr::write_volatile(frame_ptr.add(13), saved_r12);
+        core::ptr::write_volatile(frame_ptr.add(14), saved_r13);
+        core::ptr::write_volatile(frame_ptr.add(15), saved_r14);
+        core::ptr::write_volatile(frame_ptr.add(16), saved_r15);
+        core::ptr::write_volatile(frame_ptr.add(17), saved_rip);
+        core::ptr::write_volatile(frame_ptr.add(18), saved_rsp);
+        core::ptr::write_volatile(frame_ptr.add(19), saved_rflags);
+        core::ptr::write_volatile(frame_ptr.add(20), saved_fsbase);
+        let old_mask = p.sig_blocked.load(Ordering::Acquire);
+        core::ptr::write_volatile(frame_ptr.add(21), old_mask);
     }
 
-    // Block the signal during handler execution (add to blocked mask)
-    let cur_mask = SIG_BLOCKED[idx].load(Ordering::Acquire);
-    SIG_BLOCKED[idx].store(cur_mask | (1 << sig), Ordering::Release);
+    // Block the signal during handler execution
+    let cur_mask = p.sig_blocked.load(Ordering::Acquire);
+    p.sig_blocked.store(cur_mask | (1 << sig), Ordering::Release);
 
-    // Reply with SIG_REDIRECT_TAG to redirect the child to the handler
     let reply = IpcMsg {
         tag: SIG_REDIRECT_TAG,
         regs: [
-            handler,      // regs[0] = new RIP (handler address)
-            sig,          // regs[1] = signal number (RDI = arg0)
-            0,            // regs[2] = &siginfo (RSI = arg1, 0 for now)
-            0,            // regs[3] = &ucontext (RDX = arg2, 0 for now)
-            entry_rsp,    // regs[4] = handler entry RSP (return addr at *RSP)
+            handler,
+            sig,
+            0,
+            0,
+            entry_rsp,
             0, 0, 0,
         ],
     };
@@ -424,11 +345,12 @@ pub(crate) fn signal_deliver(ep_cap: u64, pid: usize, sig: u64, child_tid: u64, 
 /// Initialize process group state for a new process (leader).
 pub(crate) fn proc_group_init(pid: usize) {
     let idx = pid - 1;
-    PROC_TGID[idx].store(pid as u64, Ordering::Release);
-    PROC_FD_GROUP[idx].store(idx as u64, Ordering::Release);
-    PROC_MEM_GROUP[idx].store(idx as u64, Ordering::Release);
-    PROC_SIG_GROUP[idx].store(idx as u64, Ordering::Release);
-    PROC_CLEAR_TID[idx].store(0, Ordering::Release);
+    let p = &PROCESSES[idx];
+    p.tgid.store(pid as u64, Ordering::Release);
+    p.fd_group.store(idx as u64, Ordering::Release);
+    p.mem_group.store(idx as u64, Ordering::Release);
+    p.sig_group.store(idx as u64, Ordering::Release);
+    p.clear_tid.store(0, Ordering::Release);
     fd_grp_init(idx);
 }
 
@@ -437,50 +359,51 @@ pub(crate) fn proc_group_init(pid: usize) {
 pub(crate) fn proc_thread_init(child_pid: usize, parent_pid: usize, flags: u64) {
     let cidx = child_pid - 1;
     let pidx = parent_pid - 1;
+    let child = &PROCESSES[cidx];
+    let parent = &PROCESSES[pidx];
 
     // Thread group: if CLONE_THREAD, share parent's tgid
     if flags & CLONE_THREAD != 0 {
-        let parent_tgid = PROC_TGID[pidx].load(Ordering::Acquire);
-        PROC_TGID[cidx].store(parent_tgid, Ordering::Release);
+        let parent_tgid = parent.tgid.load(Ordering::Acquire);
+        child.tgid.store(parent_tgid, Ordering::Release);
     } else {
-        PROC_TGID[cidx].store(child_pid as u64, Ordering::Release);
+        child.tgid.store(child_pid as u64, Ordering::Release);
     }
 
     // FD group: if CLONE_FILES, share parent's FD table
     if flags & CLONE_FILES != 0 {
-        let parent_fdg = PROC_FD_GROUP[pidx].load(Ordering::Acquire);
-        PROC_FD_GROUP[cidx].store(parent_fdg, Ordering::Release);
+        let parent_fdg = parent.fd_group.load(Ordering::Acquire);
+        child.fd_group.store(parent_fdg, Ordering::Release);
     } else {
-        PROC_FD_GROUP[cidx].store(cidx as u64, Ordering::Release);
+        child.fd_group.store(cidx as u64, Ordering::Release);
         fd_grp_init(cidx);
     }
 
     // Memory group: if CLONE_VM, share parent's brk/mmap state
     if flags & CLONE_VM != 0 {
-        let parent_memg = PROC_MEM_GROUP[pidx].load(Ordering::Acquire);
-        PROC_MEM_GROUP[cidx].store(parent_memg, Ordering::Release);
+        let parent_memg = parent.mem_group.load(Ordering::Acquire);
+        child.mem_group.store(parent_memg, Ordering::Release);
     } else {
-        PROC_MEM_GROUP[cidx].store(cidx as u64, Ordering::Release);
+        child.mem_group.store(cidx as u64, Ordering::Release);
     }
 
     // Signal handler group: if CLONE_SIGHAND, share parent's signal handlers
     if flags & CLONE_SIGHAND != 0 {
-        let parent_sigg = PROC_SIG_GROUP[pidx].load(Ordering::Acquire);
-        PROC_SIG_GROUP[cidx].store(parent_sigg, Ordering::Release);
+        let parent_sigg = parent.sig_group.load(Ordering::Acquire);
+        child.sig_group.store(parent_sigg, Ordering::Release);
     } else {
-        PROC_SIG_GROUP[cidx].store(cidx as u64, Ordering::Release);
+        child.sig_group.store(cidx as u64, Ordering::Release);
     }
 
-    PROC_CLEAR_TID[cidx].store(0, Ordering::Release);
+    child.clear_tid.store(0, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------
 // Futex operations
 // ---------------------------------------------------------------------------
 
-/// FUTEX_WAIT: if *addr == expected, block until woken. Returns 0 on wake, -EAGAIN if mismatch.
+/// FUTEX_WAIT: if *addr == expected, block until woken.
 pub(crate) fn futex_wait(addr: u64, expected: u32) -> i64 {
-    // Find a free slot and register
     let mut slot = usize::MAX;
     for i in 0..MAX_FUTEX_WAITERS {
         if FUTEX_ADDR[i].compare_exchange(0, addr, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
@@ -493,31 +416,27 @@ pub(crate) fn futex_wait(addr: u64, expected: u32) -> i64 {
         return -(linux_abi::ENOMEM);
     }
 
-    // Check the value AFTER registering (to avoid missing a wake between check and register)
     let current = unsafe { core::ptr::read_volatile(addr as *const u32) };
     if current != expected {
         FUTEX_ADDR[slot].store(0, Ordering::Release);
         return -(linux_abi::EAGAIN);
     }
 
-    // Spin-wait until woken (with yield to avoid burning CPU)
     let mut spins = 0u64;
     while FUTEX_WOKEN[slot].load(Ordering::Acquire) == 0 {
         sys::yield_now();
         spins += 1;
-        // Safety timeout: ~10 seconds at 100Hz scheduler
         if spins > 10_000 {
             FUTEX_ADDR[slot].store(0, Ordering::Release);
             return -(linux_abi::ETIMEDOUT);
         }
     }
 
-    // Clean up slot
     FUTEX_ADDR[slot].store(0, Ordering::Release);
     0
 }
 
-/// FUTEX_WAKE: wake up to `count` waiters on addr. Returns number actually woken.
+/// FUTEX_WAKE: wake up to `count` waiters on addr.
 pub(crate) fn futex_wake(addr: u64, count: u32) -> i64 {
     let mut woken = 0u32;
     for i in 0..MAX_FUTEX_WAITERS {
@@ -548,10 +467,11 @@ pub(crate) fn parse_u64_from(s: &[u8]) -> (u64, usize) {
 /// Format /proc/N/status content into buf. Returns bytes written.
 pub(crate) fn format_proc_status(buf: &mut [u8], pid: usize) -> usize {
     let mut w = BufWriter::new(buf);
-    let state_str = match PROC_STATE[pid - 1].load(Ordering::Acquire) {
+    let p = &PROCESSES[pid - 1];
+    let state_str = match p.state.load(Ordering::Acquire) {
         1 => "R", 2 => "Z", _ => "?",
     };
-    let ppid = PROC_PARENT[pid - 1].load(Ordering::Acquire);
+    let ppid = p.parent.load(Ordering::Acquire);
     let _ = uwrite!(w, "Name:\tprocess_{}\nState:\t{}\nPid:\t{}\nPPid:\t{}\n",
                     pid, state_str, pid, ppid);
     w.pos()

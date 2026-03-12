@@ -199,7 +199,12 @@ impl VirtioBlk {
 
     /// Read a 512-byte sector into the data buffer at DATA_VADDR.
     pub fn read_sector(&mut self, sector: u64) -> Result<(), &'static str> {
-        // Write request header (volatile — DMA shared memory).
+        self.read_sectors_multi(sector, 1)
+    }
+
+    /// Read `count` contiguous sectors (max 8 = 4KB) into DATA_VADDR.
+    pub fn read_sectors_multi(&mut self, sector: u64, count: u32) -> Result<(), &'static str> {
+        let count = count.min(8); // data page is 4KB = 8 sectors max
         let hdr = HDR_VADDR as *mut VirtioBlkReqHeader;
         unsafe {
             core::ptr::write_volatile(&raw mut (*hdr).req_type, VIRTIO_BLK_T_IN);
@@ -207,36 +212,29 @@ impl VirtioBlk {
             core::ptr::write_volatile(&raw mut (*hdr).sector, sector);
         }
 
-        // Clear status byte.
         unsafe { core::ptr::write_volatile(STATUS_VADDR as *mut u8, 0xFF); }
 
-        // Allocate 3 descriptors: header(RO) → data(WO) → status(WO).
         let d0 = self.vq.alloc_desc().ok_or("no desc for header")?;
         let d1 = self.vq.alloc_desc().ok_or("no desc for data")?;
         let d2 = self.vq.alloc_desc().ok_or("no desc for status")?;
 
         self.vq.set_buf_ro(d0, self.hdr_phys, 16);
-        self.vq.set_buf_wo(d1, self.data_phys, 512);
+        self.vq.set_buf_wo(d1, self.data_phys, 512 * count as u32);
         self.vq.set_buf_wo(d2, self.status_phys, 1);
 
         self.vq.chain(d0, d1);
         self.vq.chain(d1, d2);
 
-        // Submit and notify device.
         self.vq.submit(d0);
         unsafe { core::arch::asm!("mfence", options(nostack, preserves_flags)); }
         let _ = sys::port_out16(self.bar_cap, self.bar_base + VIRTIO_QUEUE_NOTIFY, 0);
 
-        // Wait for completion.
         self.wait_completion()?;
-
-        // Free descriptor chain.
         self.vq.free_chain(d0);
 
-        // Check status byte.
         let status = unsafe { core::ptr::read_volatile(STATUS_VADDR as *const u8) };
         if status != 0 {
-            return Err("read_sector: device returned error status");
+            return Err("read_sectors_multi: device returned error status");
         }
 
         Ok(())

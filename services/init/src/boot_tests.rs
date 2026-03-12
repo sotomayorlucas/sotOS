@@ -304,9 +304,9 @@ pub(crate) fn run_linux_test() {
                     let buf = unsafe { core::slice::from_raw_parts_mut(oldact as *mut u8, ksa_size) };
                     for b in buf.iter_mut() { *b = 0; }
                     if signo > 0 && signo < 32 {
-                        let old_h = SIG_HANDLER[idx][signo].load(Ordering::Acquire);
-                        let old_f = SIG_FLAGS[idx][signo].load(Ordering::Acquire);
-                        let old_r = SIG_RESTORER[idx][signo].load(Ordering::Acquire);
+                        let old_h = PROCESSES[idx].sig_handler[signo].load(Ordering::Acquire);
+                        let old_f = PROCESSES[idx].sig_flags[signo].load(Ordering::Acquire);
+                        let old_r = PROCESSES[idx].sig_restorer[signo].load(Ordering::Acquire);
                         buf[0..8].copy_from_slice(&old_h.to_le_bytes());
                         buf[8..16].copy_from_slice(&old_f.to_le_bytes());
                         buf[16..24].copy_from_slice(&old_r.to_le_bytes());
@@ -316,9 +316,9 @@ pub(crate) fn run_linux_test() {
                     let handler = unsafe { *(act_ptr as *const u64) };
                     let flags = unsafe { *((act_ptr + 8) as *const u64) };
                     let restorer = unsafe { *((act_ptr + 16) as *const u64) };
-                    SIG_HANDLER[idx][signo].store(handler, Ordering::Release);
-                    SIG_FLAGS[idx][signo].store(flags, Ordering::Release);
-                    SIG_RESTORER[idx][signo].store(restorer, Ordering::Release);
+                    PROCESSES[idx].sig_handler[signo].store(handler, Ordering::Release);
+                    PROCESSES[idx].sig_flags[signo].store(flags, Ordering::Release);
+                    PROCESSES[idx].sig_restorer[signo].store(restorer, Ordering::Release);
                 }
                 reply_val(ep_cap, 0);
             }
@@ -328,7 +328,7 @@ pub(crate) fn run_linux_test() {
                 let set_ptr = msg.regs[1];
                 let oldset = msg.regs[2];
                 let idx = test_pid - 1;
-                let cur_mask = SIG_BLOCKED[idx].load(Ordering::Acquire);
+                let cur_mask = PROCESSES[idx].sig_blocked.load(Ordering::Acquire);
                 if oldset != 0 && oldset < 0x0000_8000_0000_0000 {
                     unsafe { *(oldset as *mut u64) = cur_mask; }
                 }
@@ -336,9 +336,9 @@ pub(crate) fn run_linux_test() {
                     let new_set = unsafe { *(set_ptr as *const u64) };
                     let safe_set = new_set & !((1 << SIGKILL) | (1 << 19));
                     match how {
-                        0 => SIG_BLOCKED[idx].store(cur_mask | safe_set, Ordering::Release),
-                        1 => SIG_BLOCKED[idx].store(cur_mask & !safe_set, Ordering::Release),
-                        2 => SIG_BLOCKED[idx].store(safe_set, Ordering::Release),
+                        0 => PROCESSES[idx].sig_blocked.store(cur_mask | safe_set, Ordering::Release),
+                        1 => PROCESSES[idx].sig_blocked.store(cur_mask & !safe_set, Ordering::Release),
+                        2 => PROCESSES[idx].sig_blocked.store(safe_set, Ordering::Release),
                         _ => {}
                     }
                 }
@@ -533,8 +533,8 @@ pub(crate) fn run_musl_test() {
                     let buf = unsafe { core::slice::from_raw_parts_mut(oldact as *mut u8, ksa_size.min(64)) };
                     for b in buf.iter_mut() { *b = 0; }
                     if signo > 0 && signo < 32 {
-                        let h = SIG_HANDLER[idx][signo].load(Ordering::Acquire);
-                        let f = SIG_FLAGS[idx][signo].load(Ordering::Acquire);
+                        let h = PROCESSES[idx].sig_handler[signo].load(Ordering::Acquire);
+                        let f = PROCESSES[idx].sig_flags[signo].load(Ordering::Acquire);
                         buf[0..8].copy_from_slice(&h.to_le_bytes());
                         buf[8..16].copy_from_slice(&f.to_le_bytes());
                     }
@@ -542,8 +542,8 @@ pub(crate) fn run_musl_test() {
                 if act_ptr != 0 && act_ptr < 0x0000_8000_0000_0000 && signo > 0 && signo < 32 {
                     let handler = unsafe { *(act_ptr as *const u64) };
                     let flags = unsafe { *((act_ptr + 8) as *const u64) };
-                    SIG_HANDLER[idx][signo].store(handler, Ordering::Release);
-                    SIG_FLAGS[idx][signo].store(flags, Ordering::Release);
+                    PROCESSES[idx].sig_handler[signo].store(handler, Ordering::Release);
+                    PROCESSES[idx].sig_flags[signo].store(flags, Ordering::Release);
                 }
                 reply_val(ep_cap, 0);
             }
@@ -553,7 +553,7 @@ pub(crate) fn run_musl_test() {
                 let set_ptr = msg.regs[1];
                 let oldset = msg.regs[2];
                 let idx = test_pid - 1;
-                let cur = SIG_BLOCKED[idx].load(Ordering::Acquire);
+                let cur = PROCESSES[idx].sig_blocked.load(Ordering::Acquire);
                 if oldset != 0 && oldset < 0x0000_8000_0000_0000 {
                     unsafe { *(oldset as *mut u64) = cur; }
                 }
@@ -561,9 +561,9 @@ pub(crate) fn run_musl_test() {
                     let new_set = unsafe { *(set_ptr as *const u64) };
                     let safe = new_set & !((1 << SIGKILL) | (1 << 19));
                     match how {
-                        0 => SIG_BLOCKED[idx].store(cur | safe, Ordering::Release),
-                        1 => SIG_BLOCKED[idx].store(cur & !safe, Ordering::Release),
-                        2 => SIG_BLOCKED[idx].store(safe, Ordering::Release),
+                        0 => PROCESSES[idx].sig_blocked.store(cur | safe, Ordering::Release),
+                        1 => PROCESSES[idx].sig_blocked.store(cur & !safe, Ordering::Release),
+                        2 => PROCESSES[idx].sig_blocked.store(safe, Ordering::Release),
                         _ => {}
                     }
                 }

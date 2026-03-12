@@ -200,6 +200,20 @@ impl ObjectStore {
         // Read snapshot metadata.
         store.read_snap_meta()?;
 
+        // Fix next_oid: scan all entries to ensure next_oid > max(existing OIDs).
+        // Protects against torn writes when QEMU is killed mid-operation.
+        let mut max_oid: u64 = store.sb.next_oid;
+        for i in 0..DIR_ENTRY_COUNT {
+            if !store.dir[i].is_free() && store.dir[i].oid >= max_oid {
+                max_oid = store.dir[i].oid + 1;
+            }
+        }
+        if max_oid != store.sb.next_oid {
+            dbg(b"MOUNT: next_oid fixed "); dbg_u64(store.sb.next_oid);
+            dbg(b" -> "); dbg_u64(max_oid); dbg(b"\n");
+            store.sb.next_oid = max_oid;
+        }
+
         Ok(store)
     }
 
@@ -243,6 +257,20 @@ impl ObjectStore {
 
         // Fill directory entry.
         let oid = self.sb.next_oid;
+        // DIAG: check for pre-existing OID collision
+        if let Some(cslot) = self.find_slot(oid) {
+            let ce = &self.dir[cslot];
+            dbg(b"OID-COLLISION! next_oid="); dbg_u64(oid);
+            dbg(b" collision_slot="); dbg_u64(cslot as u64);
+            dbg(b" flags="); dbg_u64(ce.flags as u64);
+            dbg(b" parent="); dbg_u64(ce.parent_oid);
+            dbg(b" name=["); dbg(ce.name_as_str()); dbg(b"]");
+            dbg(b" new_slot="); dbg_u64(slot as u64);
+            dbg(b" new_name=["); dbg(name); dbg(b"]\n");
+        }
+        dbg(b"CREAT-OID: next="); dbg_u64(oid);
+        dbg(b" slot="); dbg_u64(slot as u64);
+        dbg(b" name=["); dbg(name); dbg(b"]\n");
         self.dir[slot] = DirEntry::zeroed();
         self.dir[slot].oid = oid;
         let copy_len = name.len().min(MAX_NAME_LEN - 1);
@@ -260,9 +288,11 @@ impl ObjectStore {
         // Update superblock.
         self.sb.next_oid += 1;
         self.sb.obj_count += 1;
+        dbg(b"CREAT-POST: next="); dbg_u64(self.sb.next_oid); dbg(b"\n");
 
         // WAL commit: bitmap sector(s) + directory sector + superblock.
         self.wal_commit_metadata(slot)?;
+        dbg(b"CREAT-WAL: next="); dbg_u64(self.sb.next_oid); dbg(b"\n");
         self.flush_refcount()?;
 
         Ok(oid)
@@ -341,21 +371,28 @@ impl ObjectStore {
 
         let first_sector = offset / SECTOR_SIZE;
         let last_sector = (end - 1) / SECTOR_SIZE;
+        let data_base = self.sb.data_start + entry.sector_start;
 
         let mut buf_pos = 0;
-        for s in first_sector..=last_sector {
-            let abs_sector = self.sb.data_start + entry.sector_start + s as u32;
-            self.blk.read_sector(abs_sector as u64)?;
-            let src = unsafe { core::slice::from_raw_parts(self.blk.data_ptr(), SECTOR_SIZE) };
-            self.sector_buf.copy_from_slice(src);
+        let mut s = first_sector;
+        while s <= last_sector {
+            // Read up to 8 contiguous sectors at once (4KB bulk read)
+            let remaining = last_sector - s + 1;
+            let chunk = remaining.min(8);
+            self.blk.read_sectors_multi((data_base + s as u32) as u64, chunk as u32)?;
+            let src = unsafe { core::slice::from_raw_parts(self.blk.data_ptr(), chunk * SECTOR_SIZE) };
 
-            let sec_start = s * SECTOR_SIZE;
-            let copy_from = if s == first_sector { offset - sec_start } else { 0 };
-            let copy_to = if s == last_sector { end - sec_start } else { SECTOR_SIZE };
-            let copy_len = copy_to - copy_from;
-
-            buf[buf_pos..buf_pos + copy_len].copy_from_slice(&self.sector_buf[copy_from..copy_to]);
-            buf_pos += copy_len;
+            for i in 0..chunk {
+                let cur = s + i;
+                let sec_start = cur * SECTOR_SIZE;
+                let copy_from = if cur == first_sector { offset - sec_start } else { 0 };
+                let copy_to = if cur == last_sector { end - sec_start } else { SECTOR_SIZE };
+                let copy_len = copy_to - copy_from;
+                let src_off = i * SECTOR_SIZE + copy_from;
+                buf[buf_pos..buf_pos + copy_len].copy_from_slice(&src[src_off..src_off + copy_len]);
+                buf_pos += copy_len;
+            }
+            s += chunk;
         }
 
         Ok(total)
@@ -484,7 +521,8 @@ impl ObjectStore {
 
     /// Rename an object: change its name and optionally move it to a new parent.
     pub fn rename(&mut self, old_oid: u64, new_name: &[u8], new_parent: u64) -> Result<(), &'static str> {
-        let _slot = self.find_slot(old_oid).ok_or("object not found")?;
+        let slot0 = self.find_slot(old_oid).ok_or("object not found")?;
+        let flags_before = self.dir[slot0].flags;
         if new_name.is_empty() || new_name.len() >= MAX_NAME_LEN {
             return Err("invalid name");
         }
@@ -492,15 +530,71 @@ impl ObjectStore {
         if let Some(existing) = self.find_in(new_name, new_parent) {
             if existing != old_oid {
                 self.delete(existing)?;
+                // Check if delete corrupted the source entry
+                if let Some(s) = self.find_slot(old_oid) {
+                    if self.dir[s].flags != flags_before {
+                        dbg(b"REN-DEL-CORRUPT: oid=");
+                        dbg_u64(old_oid);
+                        dbg(b" flags ");
+                        dbg_u64(flags_before as u64);
+                        dbg(b"->");
+                        dbg_u64(self.dir[s].flags as u64);
+                        dbg(b" del=");
+                        dbg_u64(existing);
+                        dbg(b" slot=");
+                        dbg_u64(s as u64);
+                        dbg(b"/");
+                        dbg_u64(slot0 as u64);
+                        dbg(b"\n");
+                    }
+                }
             }
         }
         // Re-find slot (delete may have shifted things, but find_slot uses oid)
         let slot = self.find_slot(old_oid).ok_or("object not found after delete")?;
+        // DIAG: snapshot flags at every step
+        let flags_after_delete = self.dir[slot].flags;
+        if flags_after_delete != flags_before {
+            dbg(b"REN-FLAGS-MOVED: oid=");
+            dbg_u64(old_oid);
+            dbg(b" slot0=");
+            dbg_u64(slot0 as u64);
+            dbg(b" slot=");
+            dbg_u64(slot as u64);
+            dbg(b" flags ");
+            dbg_u64(flags_before as u64);
+            dbg(b"->");
+            dbg_u64(flags_after_delete as u64);
+            dbg(b"\n");
+        }
         self.dir[slot].name = [0u8; MAX_NAME_LEN];
         let copy_len = new_name.len().min(MAX_NAME_LEN - 1);
         self.dir[slot].name[..copy_len].copy_from_slice(&new_name[..copy_len]);
         self.dir[slot].parent_oid = new_parent;
         self.wal_commit_metadata(slot)?;
+        // Final check: flags and name must be correct after WAL commit
+        if self.dir[slot].flags != flags_before {
+            dbg(b"REN-FINAL-CORRUPT: oid=");
+            dbg_u64(old_oid);
+            dbg(b" flags ");
+            dbg_u64(flags_before as u64);
+            dbg(b"->");
+            dbg_u64(self.dir[slot].flags as u64);
+            dbg(b"\n");
+        }
+        // Verify name was actually changed
+        let actual_name = self.dir[slot].name_as_str();
+        if actual_name != new_name {
+            dbg(b"REN-NAME-MISMATCH: oid=");
+            dbg_u64(old_oid);
+            dbg(b" slot=");
+            dbg_u64(slot as u64);
+            dbg(b" expected=[");
+            dbg(new_name);
+            dbg(b"] got=[");
+            dbg(actual_name);
+            dbg(b"]\n");
+        }
         Ok(())
     }
 
@@ -574,6 +668,20 @@ impl ObjectStore {
             .ok_or("directory full")?;
 
         let oid = self.sb.next_oid;
+        // DIAG: check for pre-existing OID collision
+        if let Some(cslot) = self.find_slot(oid) {
+            let ce = &self.dir[cslot];
+            dbg(b"OID-COLLISION-MK! next_oid="); dbg_u64(oid);
+            dbg(b" collision_slot="); dbg_u64(cslot as u64);
+            dbg(b" flags="); dbg_u64(ce.flags as u64);
+            dbg(b" parent="); dbg_u64(ce.parent_oid);
+            dbg(b" name=["); dbg(ce.name_as_str()); dbg(b"]");
+            dbg(b" new_slot="); dbg_u64(slot as u64);
+            dbg(b" new_name=["); dbg(name); dbg(b"]\n");
+        }
+        dbg(b"MKDIR-OID: next="); dbg_u64(oid);
+        dbg(b" slot="); dbg_u64(slot as u64);
+        dbg(b" name=["); dbg(name); dbg(b"]\n");
         self.dir[slot] = DirEntry::zeroed();
         self.dir[slot].oid = oid;
         let copy_len = name.len().min(MAX_NAME_LEN - 1);
@@ -588,8 +696,10 @@ impl ObjectStore {
 
         self.sb.next_oid += 1;
         self.sb.obj_count += 1;
+        dbg(b"MKDIR-POST: next="); dbg_u64(self.sb.next_oid); dbg(b"\n");
 
         self.wal_commit_metadata(slot)?;
+        dbg(b"MKDIR-WAL: next="); dbg_u64(self.sb.next_oid); dbg(b"\n");
 
         Ok(oid)
     }
@@ -914,6 +1024,10 @@ impl ObjectStore {
     /// WAL-commit metadata changes (superblock + directory entry sector).
     /// Bitmap is flushed separately (too large for WAL with 128 sectors).
     fn wal_commit_metadata(&mut self, dir_slot: usize) -> Result<(), &'static str> {
+        // Snapshot flags before WAL
+        let flags_pre = self.dir[dir_slot].flags;
+        let oid_pre = self.dir[dir_slot].oid;
+
         wal::begin(&mut self.wal);
 
         // Stage superblock.
@@ -929,6 +1043,19 @@ impl ObjectStore {
         wal::stage(&mut self.wal, &mut self.wal_buf, dir_abs_sector, &dir_buf)?;
 
         wal::commit(&mut self.blk, &mut self.wal, &self.wal_buf)?;
+
+        // Check if WAL commit corrupted the entry
+        if self.dir[dir_slot].flags != flags_pre {
+            dbg(b"WAL-CORRUPT: slot=");
+            dbg_u64(dir_slot as u64);
+            dbg(b" oid=");
+            dbg_u64(oid_pre);
+            dbg(b" flags ");
+            dbg_u64(flags_pre as u64);
+            dbg(b"->");
+            dbg_u64(self.dir[dir_slot].flags as u64);
+            dbg(b"\n");
+        }
 
         // Flush bitmap separately (non-WAL — too many sectors for WAL staging).
         self.flush_bitmap()?;
@@ -1088,13 +1215,16 @@ fn flush_sectors(blk: &mut VirtioBlk, data: &[u8], base_sector: u32, count: u32)
     Ok(())
 }
 
-/// Read multiple sectors into a contiguous byte array.
+/// Read multiple sectors into a contiguous byte array (uses bulk reads of 8 sectors).
 fn read_sectors(blk: &mut VirtioBlk, data: &mut [u8], base_sector: u32, count: u32) -> Result<(), &'static str> {
-    for i in 0..count {
-        blk.read_sector((base_sector + i) as u64)?;
+    let mut i = 0u32;
+    while i < count {
+        let chunk = (count - i).min(8);
+        blk.read_sectors_multi((base_sector + i) as u64, chunk)?;
+        let src = unsafe { core::slice::from_raw_parts(blk.data_ptr(), chunk as usize * SECTOR_SIZE) };
         let offset = i as usize * SECTOR_SIZE;
-        let src = unsafe { core::slice::from_raw_parts(blk.data_ptr(), SECTOR_SIZE) };
-        data[offset..offset + SECTOR_SIZE].copy_from_slice(src);
+        data[offset..offset + chunk as usize * SECTOR_SIZE].copy_from_slice(src);
+        i += chunk;
     }
     Ok(())
 }

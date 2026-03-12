@@ -28,6 +28,14 @@ pub(crate) fn check_pending_signals(
     if sig == 0 {
         return None;
     }
+    // DIAG: log signal delivery during pipe retry
+    if pid >= 3 && pid <= 5 {
+        crate::framebuffer::print(b"SIG-CHK P");
+        crate::framebuffer::print_u64(pid as u64);
+        crate::framebuffer::print(b" sig=");
+        crate::framebuffer::print_u64(sig);
+        crate::framebuffer::print(b"\n");
+    }
     match sig_dispatch(pid, sig) {
         1 => Some(SyscallAction::Break),        // terminated
         2 => {
@@ -65,15 +73,27 @@ pub(crate) fn sys_rt_sigaction(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let idx = ctx.pid - 1;
     // Write old handler to oldact
     if oldact != 0 && oldact < 0x0000_8000_0000_0000 {
+        // PWC watchpoint: check around oldact write
+        let pwc_pre = crate::fd::PIPE_WRITE_CLOSED[1].load(Ordering::Relaxed);
         let buf = unsafe { core::slice::from_raw_parts_mut(oldact as *mut u8, ksa_size) };
         for b in buf.iter_mut() { *b = 0; }
         if signo > 0 && signo < 32 {
-            let old_h = SIG_HANDLER[idx][signo].load(Ordering::Acquire);
-            let old_f = SIG_FLAGS[idx][signo].load(Ordering::Acquire);
-            let old_r = SIG_RESTORER[idx][signo].load(Ordering::Acquire);
+            let old_h = PROCESSES[idx].sig_handler[signo].load(Ordering::Acquire);
+            let old_f = PROCESSES[idx].sig_flags[signo].load(Ordering::Acquire);
+            let old_r = PROCESSES[idx].sig_restorer[signo].load(Ordering::Acquire);
             buf[0..8].copy_from_slice(&old_h.to_le_bytes());
             buf[8..16].copy_from_slice(&old_f.to_le_bytes());
             buf[16..24].copy_from_slice(&old_r.to_le_bytes());
+        }
+        let pwc_post = crate::fd::PIPE_WRITE_CLOSED[1].load(Ordering::Relaxed);
+        if pwc_pre != pwc_post {
+            crate::framebuffer::print(b"!! SIGACT-CORRUPT P");
+            crate::framebuffer::print_u64(ctx.pid as u64);
+            crate::framebuffer::print(b" oldact=0x");
+            crate::framebuffer::print_hex64(oldact);
+            crate::framebuffer::print(b" ksa=");
+            crate::framebuffer::print_u64(ksa_size as u64);
+            crate::framebuffer::print(b"\n");
         }
     }
     // Install new handler from act
@@ -81,9 +101,9 @@ pub(crate) fn sys_rt_sigaction(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let handler = unsafe { *(act_ptr as *const u64) };
         let flags = unsafe { *((act_ptr + 8) as *const u64) };
         let restorer = unsafe { *((act_ptr + 16) as *const u64) };
-        SIG_HANDLER[idx][signo].store(handler, Ordering::Release);
-        SIG_FLAGS[idx][signo].store(flags, Ordering::Release);
-        SIG_RESTORER[idx][signo].store(restorer, Ordering::Release);
+        PROCESSES[idx].sig_handler[signo].store(handler, Ordering::Release);
+        PROCESSES[idx].sig_flags[signo].store(flags, Ordering::Release);
+        PROCESSES[idx].sig_restorer[signo].store(restorer, Ordering::Release);
     }
     reply_val(ctx.ep_cap, 0);
 }
@@ -96,7 +116,7 @@ pub(crate) fn sys_rt_sigprocmask(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let set_ptr = msg.regs[1];
     let oldset = msg.regs[2];
     let idx = ctx.pid - 1;
-    let cur_mask = SIG_BLOCKED[idx].load(Ordering::Acquire);
+    let cur_mask = PROCESSES[idx].sig_blocked.load(Ordering::Acquire);
     // Write old mask
     if oldset != 0 && oldset < 0x0000_8000_0000_0000 {
         unsafe { *(oldset as *mut u64) = cur_mask; }
@@ -107,9 +127,9 @@ pub(crate) fn sys_rt_sigprocmask(ctx: &mut SyscallContext, msg: &IpcMsg) {
         // Can't block SIGKILL or SIGSTOP
         let safe_set = new_set & !((1 << SIGKILL) | (1 << 19));
         match how {
-            0 => SIG_BLOCKED[idx].store(cur_mask | safe_set, Ordering::Release),  // SIG_BLOCK
-            1 => SIG_BLOCKED[idx].store(cur_mask & !safe_set, Ordering::Release), // SIG_UNBLOCK
-            2 => SIG_BLOCKED[idx].store(safe_set, Ordering::Release),             // SIG_SETMASK
+            0 => PROCESSES[idx].sig_blocked.store(cur_mask | safe_set, Ordering::Release),  // SIG_BLOCK
+            1 => PROCESSES[idx].sig_blocked.store(cur_mask & !safe_set, Ordering::Release), // SIG_UNBLOCK
+            2 => PROCESSES[idx].sig_blocked.store(safe_set, Ordering::Release),             // SIG_SETMASK
             _ => {}
         }
     }

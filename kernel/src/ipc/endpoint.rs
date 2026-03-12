@@ -89,6 +89,9 @@ struct Endpoint {
     send_queue_len: usize,
     /// Thread that has sent a message and is waiting for a reply (from call()).
     caller: Option<ThreadId>,
+    /// Set when cancel_caller clears a caller — the next send() should discard
+    /// its reply instead of blocking (the server doesn't know the caller left).
+    reply_cancelled: bool,
 }
 
 impl Endpoint {
@@ -99,6 +102,7 @@ impl Endpoint {
             send_queue: [None; MAX_SEND_QUEUE],
             send_queue_len: 0,
             caller: None,
+            reply_cancelled: false,
         }
     }
 
@@ -264,6 +268,11 @@ pub fn send(ep_handle: PoolHandle, msg: Message) -> Result<(), SysError> {
 
         if let Some(caller_tid) = ep.caller.take() {
             SendAction::ReplyToCaller(caller_tid)
+        } else if ep.reply_cancelled {
+            // The caller timed out and was removed by cancel_caller.
+            // Discard this late reply instead of blocking the sender.
+            ep.reply_cancelled = false;
+            SendAction::Discard
         } else {
             match ep.state {
                 EndpointState::RecvWait => {
@@ -295,6 +304,9 @@ pub fn send(ep_handle: PoolHandle, msg: Message) -> Result<(), SysError> {
             sched::set_current_ipc(ep_handle.raw(), sched::IpcRole::Sender, msg);
             sched::block_current();
             sched::clear_current_ipc();
+        }
+        SendAction::Discard => {
+            // Late reply to a cancelled caller — silently drop it.
         }
     }
     Ok(())
@@ -567,9 +579,11 @@ fn cancel_caller(ep_raw: u32, tid: ThreadId) {
     let (core_id, local) = decode_handle(ep_raw);
     let mut pool = PER_CORE_ENDPOINTS[core_id].lock();
     if let Some(ep) = pool.get_mut(local) {
-        // Clear from caller slot.
+        // Clear from caller slot. Mark reply_cancelled so the server's
+        // subsequent send() discards its reply instead of blocking forever.
         if ep.caller == Some(tid) {
             ep.caller = None;
+            ep.reply_cancelled = true;
         }
         // Remove from send queue.
         let mut i = 0;
@@ -598,6 +612,8 @@ enum SendAction {
     ReplyToCaller(ThreadId),
     Rendezvous(ThreadId),
     Block,
+    /// Caller timed out — discard the reply silently.
+    Discard,
 }
 
 /// Internal action after inspecting endpoint state in recv().

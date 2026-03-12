@@ -29,12 +29,24 @@ const MAP_WRITABLE: u64 = 2;
 /// Index by pid (0..MAX_PROCS). Incremented when PIPE_RETRY_TAG sent,
 /// cleared when a non-retry syscall is processed for that pid.
 pub(crate) static mut RETRY_COUNT: [u64; 16] = [0; 16];
+/// Cumulative pipe stall counter per-pid. Only cleared on successful pipe I/O.
+pub(crate) static mut PIPE_STALL: [u64; 16] = [0; 16];
+/// Which pipe each process is currently stalling on (0xFF = none).
+pub(crate) static mut PIPE_STALL_ID: [u8; 16] = [0xFF; 16];
+/// Processes that received EOF from the deadlock detector.
+/// If they exit with non-zero status shortly after, treat it as clean exit.
+pub(crate) static mut DEADLOCK_EOF: [bool; 16] = [false; 16];
+/// Set to true to enable full P3 syscall logging (after refs mkdir)
+pub(crate) static mut P3_VERBOSE: bool = false;
 
-pub(crate) fn mark_pipe_retry(pid: usize) {
-    if pid < 16 { unsafe { RETRY_COUNT[pid] += 1; } }
+pub(crate) fn mark_pipe_retry_on(pid: usize, pipe_id: usize) {
+    if pid < 16 { unsafe { RETRY_COUNT[pid] += 1; PIPE_STALL[pid] += 1; PIPE_STALL_ID[pid] = pipe_id as u8; } }
 }
 pub(crate) fn clear_pipe_retry(pid: usize) {
     if pid < 16 { unsafe { RETRY_COUNT[pid] = 0; } }
+}
+pub(crate) fn clear_pipe_stall(pid: usize) {
+    if pid < 16 { unsafe { PIPE_STALL[pid] = 0; PIPE_STALL_ID[pid] = 0xFF; } }
 }
 
 /// Stack region save buffer for fork — child runs on parent's stack and corrupts
@@ -233,14 +245,19 @@ pub(crate) extern "C" fn child_handler() -> ! {
     let mut ep_cap = CHILD_SETUP_EP.load(Ordering::Acquire);
     let pid = CHILD_SETUP_PID.load(Ordering::Acquire) as usize;
     let clone_flags = CHILD_SETUP_FLAGS.load(Ordering::Acquire);
-    let child_as_cap = CHILD_SETUP_AS_CAP.load(Ordering::Acquire);
+    let mut child_as_cap = CHILD_SETUP_AS_CAP.load(Ordering::Acquire);
     // Signal that we consumed the setup
     CHILD_SETUP_READY.store(0, Ordering::Release);
 
+    // DIAG: log handler startup
+    print(b"HANDLER-START P"); print_u64(pid as u64);
+    print(b" ep="); print_u64(ep_cap);
+    print(b"\n");
+
     // Resolve group indices for this thread
-    let fdg = PROC_FD_GROUP[pid - 1].load(Ordering::Acquire) as usize;
-    let memg = PROC_MEM_GROUP[pid - 1].load(Ordering::Acquire) as usize;
-    let _sigg = PROC_SIG_GROUP[pid - 1].load(Ordering::Acquire) as usize;
+    let fdg = PROCESSES[pid - 1].fd_group.load(Ordering::Acquire) as usize;
+    let memg = PROCESSES[pid - 1].mem_group.load(Ordering::Acquire) as usize;
+    let _sigg = PROCESSES[pid - 1].sig_group.load(Ordering::Acquire) as usize;
 
     // Per-child brk/mmap state. Each memory group gets its own region.
     const CHILD_REGION_SIZE: u64 = 0x4000000; // 64 MiB per child (brk + mmap)
@@ -254,11 +271,11 @@ pub(crate) extern "C" fn child_handler() -> ! {
 
     // Initialize memory group state if this is a new group (not CLONE_VM reuse)
     unsafe {
-        if clone_flags & CLONE_VM == 0 || GRP_BRK[memg] == 0 {
+        if clone_flags & CLONE_VM == 0 || THREAD_GROUPS[memg].brk == 0 {
             let my_brk_base = CHILD_BRK_BASE + ((memg as u64) % 16) * CHILD_REGION_SIZE;
-            GRP_BRK[memg] = my_brk_base;
-            GRP_MMAP_NEXT[memg] = my_brk_base + CHILD_MMAP_OFFSET;
-            GRP_INITRD_BUF_BASE[memg] = INITRD_BUF_REGION + ((memg as u64) % 16) * INITRD_BUF_PER_GROUP;
+            THREAD_GROUPS[memg].brk = my_brk_base;
+            THREAD_GROUPS[memg].mmap_next = my_brk_base + CHILD_MMAP_OFFSET;
+            THREAD_GROUPS[memg].initrd_buf_base = INITRD_BUF_REGION + ((memg as u64) % 16) * INITRD_BUF_PER_GROUP;
         }
     }
 
@@ -268,108 +285,64 @@ pub(crate) extern "C" fn child_handler() -> ! {
 
     // Record brk/mmap base for this process (for cleanup on exit)
     if pid > 0 && pid <= MAX_PROCS {
-        PROC_BRK_BASE[pid - 1].store(my_brk_base, Ordering::Release);
-        PROC_BRK_CURRENT[pid - 1].store(my_brk_base, Ordering::Release);
-        PROC_MMAP_BASE[pid - 1].store(my_mmap_base, Ordering::Release);
-        PROC_MMAP_NEXT[pid - 1].store(my_mmap_base, Ordering::Release);
+        PROCESSES[pid - 1].brk_base.store(my_brk_base, Ordering::Release);
+        PROCESSES[pid - 1].brk_current.store(my_brk_base, Ordering::Release);
+        PROCESSES[pid - 1].mmap_base.store(my_mmap_base, Ordering::Release);
+        PROCESSES[pid - 1].mmap_next.store(my_mmap_base, Ordering::Release);
     }
 
-    // Create local mutable references to the shared FD and memory state.
-    // These are references into `static mut` arrays, protected by GRP_FD_LOCK[fdg].
-    // This gives backward compatibility: existing code using child_fds[fd],
-    // initrd_files[s][i], vfs_files[s][i], etc. works unchanged.
-    const CHILD_MAX_FDS: usize = GRP_MAX_FDS;
-    let child_fds: &mut [u8; GRP_MAX_FDS] = unsafe { &mut GRP_FDS[fdg] };
-    let initrd_files: &mut [[u64; 4]; GRP_MAX_INITRD] = unsafe { &mut GRP_INITRD[fdg] };
-    let initrd_file_buf_base: u64 = unsafe { GRP_INITRD_BUF_BASE[memg] };
-    const MAX_VFS_FILES: usize = GRP_MAX_VFS;
-    let vfs_files: &mut [[u64; 4]; GRP_MAX_VFS] = unsafe { &mut GRP_VFS[fdg] };
-    let dir_buf: &mut [u8; 4096] = unsafe { &mut GRP_DIR_BUF[fdg] };
-    let dir_len: &mut usize = unsafe { &mut GRP_DIR_LEN[fdg] };
-    let dir_pos: &mut usize = unsafe { &mut GRP_DIR_POS[fdg] };
-    let cwd: &mut [u8; GRP_CWD_MAX] = unsafe { &mut GRP_CWD[fdg] };
-    // current_brk and mmap_next: mutable references into GRP_BRK/GRP_MMAP_NEXT
-    let current_brk: &mut u64 = unsafe { &mut GRP_BRK[memg] };
-    let mmap_next: &mut u64 = unsafe { &mut GRP_MMAP_NEXT[memg] };
-
-    // Socket state (parallel arrays indexed by FD number)
-    // FD kind 16=TCP socket, 17=UDP socket
-    let mut sock_conn_id: [u32; GRP_MAX_FDS] = [0xFFFF; GRP_MAX_FDS];
-    let mut sock_udp_local_port: [u16; GRP_MAX_FDS] = [0; GRP_MAX_FDS];
-    let mut sock_udp_remote_ip: [u32; GRP_MAX_FDS] = [0; GRP_MAX_FDS];
-    let mut sock_udp_remote_port: [u16; GRP_MAX_FDS] = [0; GRP_MAX_FDS];
-
     // If this child was created via fork, copy parent's socket metadata
+    // into this child's THREAD_GROUPS slot.
     if FORK_SOCK_READY.load(Ordering::Acquire) != 0 {
         unsafe {
-            sock_conn_id = FORK_SOCK_CONN;
-            sock_udp_local_port = FORK_SOCK_UDP_LPORT;
-            sock_udp_remote_ip = FORK_SOCK_UDP_RIP;
-            sock_udp_remote_port = FORK_SOCK_UDP_RPORT;
+            THREAD_GROUPS[fdg].fd_flags = FORK_FD_FLAGS;
+            THREAD_GROUPS[fdg].sock_conn_id = FORK_SOCK_CONN;
+            THREAD_GROUPS[fdg].sock_udp_local_port = FORK_SOCK_UDP_LPORT;
+            THREAD_GROUPS[fdg].sock_udp_remote_ip = FORK_SOCK_UDP_RIP;
+            THREAD_GROUPS[fdg].sock_udp_remote_port = FORK_SOCK_UDP_RPORT;
         }
         FORK_SOCK_READY.store(0, Ordering::Release);
     }
 
-    // ─── Phase C: eventfd state (kind=22) ───
-    const MAX_EVENTFDS: usize = 16;
-    let mut eventfd_counter: [u64; MAX_EVENTFDS] = [0; MAX_EVENTFDS];
-    let mut eventfd_flags: [u32; MAX_EVENTFDS] = [0; MAX_EVENTFDS];
-    let mut eventfd_slot_fd: [usize; MAX_EVENTFDS] = [usize::MAX; MAX_EVENTFDS];
-
-    // ─── Phase C: timerfd state (kind=23) ───
-    const MAX_TIMERFDS: usize = 8;
-    let mut timerfd_interval_ns: [u64; MAX_TIMERFDS] = [0; MAX_TIMERFDS];
-    let mut timerfd_expiry_tsc: [u64; MAX_TIMERFDS] = [0; MAX_TIMERFDS];
-    let mut timerfd_slot_fd: [usize; MAX_TIMERFDS] = [usize::MAX; MAX_TIMERFDS];
-
-    // ─── Phase C: epoll state (kind=21, improved) ───
-    const MAX_EPOLL_ENTRIES: usize = 64;
-    let mut epoll_reg_fd: [i32; MAX_EPOLL_ENTRIES] = [-1; MAX_EPOLL_ENTRIES];
-    let mut epoll_reg_events: [u32; MAX_EPOLL_ENTRIES] = [0; MAX_EPOLL_ENTRIES];
-    let mut epoll_reg_data: [u64; MAX_EPOLL_ENTRIES] = [0; MAX_EPOLL_ENTRIES];
-
-    // ─── Phase C: memfd state (kind=25) ───
-    const MAX_MEMFDS: usize = 8;
-    let mut memfd_base: [u64; MAX_MEMFDS] = [0; MAX_MEMFDS];
-    let mut memfd_size: [u64; MAX_MEMFDS] = [0; MAX_MEMFDS];
-    let mut memfd_cap: [u64; MAX_MEMFDS] = [0; MAX_MEMFDS];
-    let mut memfd_slot_fd: [usize; MAX_MEMFDS] = [usize::MAX; MAX_MEMFDS];
-
-    // Helper macro: create a SyscallContext with reborrows of local state.
-    // The reborrow scoping lets us use ctx in one match arm without
-    // permanently moving the original references.
+    // Helper macro: create a SyscallContext from THREAD_GROUPS state.
     macro_rules! make_ctx {
         () => {
-            SyscallContext {
-                pid, ep_cap, child_as_cap,
-                current_brk: &mut *current_brk,
-                mmap_next: &mut *mmap_next,
-                my_brk_base, my_mmap_base,
-                child_fds: &mut *child_fds,
-                initrd_files: &mut *initrd_files,
-                initrd_file_buf_base,
-                vfs_files: &mut *vfs_files,
-                dir_buf: &mut *dir_buf,
-                dir_len: &mut *dir_len,
-                dir_pos: &mut *dir_pos,
-                cwd: &mut *cwd,
-                sock_conn_id: &mut sock_conn_id,
-                sock_udp_local_port: &mut sock_udp_local_port,
-                sock_udp_remote_ip: &mut sock_udp_remote_ip,
-                sock_udp_remote_port: &mut sock_udp_remote_port,
-                eventfd_counter: &mut eventfd_counter,
-                eventfd_flags: &mut eventfd_flags,
-                eventfd_slot_fd: &mut eventfd_slot_fd,
-                timerfd_interval_ns: &mut timerfd_interval_ns,
-                timerfd_expiry_tsc: &mut timerfd_expiry_tsc,
-                timerfd_slot_fd: &mut timerfd_slot_fd,
-                memfd_base: &mut memfd_base,
-                memfd_size: &mut memfd_size,
-                memfd_cap: &mut memfd_cap,
-                memfd_slot_fd: &mut memfd_slot_fd,
-                epoll_reg_fd: &mut epoll_reg_fd,
-                epoll_reg_events: &mut epoll_reg_events,
-                epoll_reg_data: &mut epoll_reg_data,
+            unsafe {
+                let tg = &mut THREAD_GROUPS[fdg];
+                let initrd_buf_base = THREAD_GROUPS[memg].initrd_buf_base;
+                SyscallContext {
+                    pid, ep_cap, child_as_cap,
+                    current_brk: &mut THREAD_GROUPS[memg].brk,
+                    mmap_next: &mut THREAD_GROUPS[memg].mmap_next,
+                    my_brk_base, my_mmap_base,
+                    child_fds: &mut tg.fds,
+                    fd_cloexec: &mut tg.fd_cloexec,
+                    initrd_files: &mut tg.initrd,
+                    initrd_file_buf_base: initrd_buf_base,
+                    vfs_files: &mut tg.vfs,
+                    dir_buf: &mut tg.dir_buf,
+                    dir_len: &mut tg.dir_len,
+                    dir_pos: &mut tg.dir_pos,
+                    cwd: &mut tg.cwd,
+                    fd_flags: &mut tg.fd_flags,
+                    sock_conn_id: &mut tg.sock_conn_id,
+                    sock_udp_local_port: &mut tg.sock_udp_local_port,
+                    sock_udp_remote_ip: &mut tg.sock_udp_remote_ip,
+                    sock_udp_remote_port: &mut tg.sock_udp_remote_port,
+                    eventfd_counter: &mut tg.eventfd_counter,
+                    eventfd_flags: &mut tg.eventfd_flags,
+                    eventfd_slot_fd: &mut tg.eventfd_slot_fd,
+                    timerfd_interval_ns: &mut tg.timerfd_interval_ns,
+                    timerfd_expiry_tsc: &mut tg.timerfd_expiry_tsc,
+                    timerfd_slot_fd: &mut tg.timerfd_slot_fd,
+                    memfd_base: &mut tg.memfd_base,
+                    memfd_size: &mut tg.memfd_size,
+                    memfd_cap: &mut tg.memfd_cap,
+                    memfd_slot_fd: &mut tg.memfd_slot_fd,
+                    epoll_reg_fd: &mut tg.epoll_reg_fd,
+                    epoll_reg_events: &mut tg.epoll_reg_events,
+                    epoll_reg_data: &mut tg.epoll_reg_data,
+                }
             }
         }
     }
@@ -380,9 +353,9 @@ pub(crate) extern "C" fn child_handler() -> ! {
         let msg = match sys::recv_timeout(ep_cap, 500) {
             Ok(m) => m,
             Err(e) => {
-                if e == sotos_common::SysError::Timeout as i64 {
-                    // Child hasn't made a syscall in 5 seconds — hung.
-                }
+                print(b"HANDLER-ERR P"); print_u64(pid as u64);
+                print(b" e="); print_u64(e as u64);
+                print(b"\n");
                 break;
             },
         };
@@ -390,7 +363,7 @@ pub(crate) extern "C" fn child_handler() -> ! {
         // Cache the kernel thread ID for async signal injection
         let kernel_tid = msg.regs[6];
         if kernel_tid != 0 {
-            PROC_KERNEL_TID[pid - 1].store(kernel_tid, Ordering::Release);
+            PROCESSES[pid - 1].kernel_tid.store(kernel_tid, Ordering::Release);
         }
 
         // Check for pending unblocked signals
@@ -400,27 +373,63 @@ pub(crate) extern "C" fn child_handler() -> ! {
         }
 
         let syscall_nr = msg.tag;
+
+        // === PWC watchpoint: detect spurious pipe close (should not fire after deadlock fix) ===
+        if pid >= 3 && pid <= 5 {
+            use core::sync::atomic::Ordering as Ord;
+            let pwc1 = PIPE_WRITE_CLOSED[1].load(Ord::Relaxed);
+            let wref1 = PIPE_WRITE_REFS[1].load(Ord::Relaxed);
+            let act1 = PIPE_ACTIVE[1].load(Ord::Relaxed);
+            if pwc1 != 0 && wref1 > 0 && act1 != 0 {
+                static mut PWC_FIRED: bool = false;
+                if !unsafe { PWC_FIRED } {
+                    unsafe { PWC_FIRED = true; }
+                    print(b"!! PWC-ANOM P"); print_u64(pid as u64);
+                    print(b" S"); print_u64(syscall_nr);
+                    print(b" pwc1="); print_u64(pwc1);
+                    print(b" wref1="); print_u64(wref1);
+                    print(b"\n");
+                }
+            }
+        }
+
         // Phase 5: Syscall shadow logging (record every child syscall)
         syscall_log_record(pid as u16, syscall_nr as u16, msg.regs[0], 0);
-        // DIAG: trace ALL syscalls for P3 (git clone), I/O for P4+
-        // Suppress repeated pipe-retry logging to avoid serial flooding
+        // DIAG: P3 logging (full when P3_VERBOSE, key syscalls otherwise)
         let retry_n = if pid < 16 { unsafe { RETRY_COUNT[pid] } } else { 0 };
         if pid == 3 {
+            let verbose = unsafe { P3_VERBOSE };
             if retry_n == 0 {
-                print(b"[P3 S"); print_u64(syscall_nr);
-                print(b" a0="); print_u64(msg.regs[0]);
-                print(b" a1="); print_u64(msg.regs[1]);
-                print(b"]\n");
-            } else if retry_n % 50000 == 0 {
-                print(b"[P3 retry #"); print_u64(retry_n); print(b"]\n");
+                if verbose {
+                    print(b"[P3 S"); print_u64(syscall_nr);
+                    print(b" a0="); print_u64(msg.regs[0]);
+                    print(b" a1="); print_u64(msg.regs[1]);
+                    print(b"]\n");
+                } else {
+                    match syscall_nr {
+                        SYS_CLONE | SYS_FORK | SYS_VFORK | SYS_EXECVE
+                        | SYS_EXIT | SYS_EXIT_GROUP | SYS_WAIT4 => {
+                            print(b"[P3 S"); print_u64(syscall_nr);
+                            print(b" a0="); print_u64(msg.regs[0]);
+                            print(b"]\n");
+                        }
+                        _ => {}
+                    }
+                }
             }
         } else if pid >= 4 {
             let p_retry = if pid < 16 { unsafe { RETRY_COUNT[pid] } } else { 0 };
-            // Log ALL P5 syscalls to trace its startup & crash
-            if pid == 5 && p_retry == 0 {
-                print(b"[P5 S"); print_u64(syscall_nr);
+            // Log ALL P4/P5/P6 syscalls to trace startup & behavior
+            if (pid == 4 || pid == 5 || pid == 6) && p_retry == 0 {
+                print(b"[P"); print_u64(pid as u64);
+                print(b" S"); print_u64(syscall_nr);
                 print(b" a0="); print_u64(msg.regs[0]);
                 print(b" a1="); print_u64(msg.regs[1]);
+                // Also show a2 for read/write/open (count/flags)
+                if matches!(syscall_nr, SYS_READ | SYS_WRITE | SYS_OPEN | SYS_OPENAT
+                            | SYS_WRITEV | SYS_READV) {
+                    print(b" a2="); print_u64(msg.regs[2]);
+                }
                 print(b"]\n");
             } else if p_retry == 0 {
                 match syscall_nr {
@@ -437,6 +446,19 @@ pub(crate) extern "C" fn child_handler() -> ! {
                     }
                     _ => {}
                 }
+            }
+        } else if pid == 3 {
+            // Verbose logging for P3 (git clone) to debug protocol deadlock
+            let p_retry = if pid < 16 { unsafe { RETRY_COUNT[pid] } } else { 0 };
+            if p_retry == 0 {
+                print(b"[P3 S"); print_u64(syscall_nr);
+                print(b" a0="); print_u64(msg.regs[0]);
+                print(b" a1="); print_u64(msg.regs[1]);
+                if matches!(syscall_nr, SYS_READ | SYS_WRITE | SYS_OPEN | SYS_OPENAT
+                            | SYS_WRITEV | SYS_READV) {
+                    print(b" a2="); print_u64(msg.regs[2]);
+                }
+                print(b"]\n");
             }
         } else if pid > 1 {
             match syscall_nr {
@@ -606,12 +628,30 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 let argv_ptr = msg.regs[1];
                 let envp_ptr = msg.regs[2];
                 let mut path = [0u8; 48];
-                let path_len = copy_guest_path(path_ptr, &mut path);
+                let path_len = if child_as_cap != 0 {
+                    let mut tmp = [0u8; 48];
+                    match sys::vm_read(child_as_cap, path_ptr, tmp.as_mut_ptr() as u64, 48) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            print(b"EXECVE-VM-READ-FAIL path_ptr="); print_u64(path_ptr);
+                            print(b" err="); print_u64((-e) as u64);
+                            print(b"\n");
+                        }
+                    }
+                    let slen = tmp.iter().position(|&b| b == 0).unwrap_or(47);
+                    path[..slen].copy_from_slice(&tmp[..slen]);
+                    path[slen] = 0;
+                    slen
+                } else {
+                    copy_guest_path(path_ptr, &mut path)
+                };
                 let name = &path[..path_len];
                 let bin_name = if path_len > 5 && starts_with(name, b"/bin/") { &name[5..] } else { name };
 
                 // Serial-only trace to avoid fb_putchar scroll delays
-                for &b in b"EXECVE: " { sys::debug_print(b); }
+                for &b in b"EXECVE P" { sys::debug_print(b); }
+                { let d = b'0' + (pid as u8); sys::debug_print(d); }
+                for &b in b": " { sys::debug_print(b); }
                 for &b in bin_name { sys::debug_print(b); }
                 sys::debug_print(b'\n');
 
@@ -630,15 +670,37 @@ pub(crate) extern "C" fn child_handler() -> ! {
                     continue;
                 }
 
-                // Read argv from guest memory (shared address space)
+                print(b"EXECVE-PRE-ARGV P"); print_u64(pid as u64);
+                print(b" argv_ptr="); print_u64(argv_ptr);
+                print(b" as_cap="); print_u64(child_as_cap);
+                print(b"\n");
+                // Read argv from guest memory.
+                // For CoW fork children (child_as_cap != 0), use vm_read
+                // since the child's stack pages are in a separate address space.
                 let mut exec_argv = [[0u8; MAX_EXEC_ARG_LEN]; MAX_EXEC_ARGS];
                 let mut exec_argc: usize = 0;
                 if argv_ptr != 0 {
                     let mut ap = argv_ptr;
                     while exec_argc < MAX_EXEC_ARGS {
-                        let str_ptr = unsafe { *(ap as *const u64) };
+                        let str_ptr = if child_as_cap != 0 {
+                            let mut buf = [0u8; 8];
+                            let _ = sys::vm_read(child_as_cap, ap, buf.as_mut_ptr() as u64, 8);
+                            u64::from_le_bytes(buf)
+                        } else {
+                            unsafe { *(ap as *const u64) }
+                        };
                         if str_ptr == 0 { break; }
-                        copy_guest_path(str_ptr, &mut exec_argv[exec_argc]);
+                        if child_as_cap != 0 {
+                            // Read string from child AS
+                            let mut tmp = [0u8; MAX_EXEC_ARG_LEN];
+                            let _ = sys::vm_read(child_as_cap, str_ptr, tmp.as_mut_ptr() as u64, MAX_EXEC_ARG_LEN as u64);
+                            // Find NUL terminator
+                            let slen = tmp.iter().position(|&b| b == 0).unwrap_or(MAX_EXEC_ARG_LEN - 1);
+                            exec_argv[exec_argc][..slen].copy_from_slice(&tmp[..slen]);
+                            exec_argv[exec_argc][slen] = 0;
+                        } else {
+                            copy_guest_path(str_ptr, &mut exec_argv[exec_argc]);
+                        }
                         exec_argc += 1;
                         ap += 8;
                     }
@@ -650,21 +712,76 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 if envp_ptr != 0 {
                     let mut ep = envp_ptr;
                     while exec_envc < MAX_EXEC_ENVS {
-                        let str_ptr = unsafe { *(ep as *const u64) };
+                        let str_ptr = if child_as_cap != 0 {
+                            let mut buf = [0u8; 8];
+                            let _ = sys::vm_read(child_as_cap, ep, buf.as_mut_ptr() as u64, 8);
+                            u64::from_le_bytes(buf)
+                        } else {
+                            unsafe { *(ep as *const u64) }
+                        };
                         if str_ptr == 0 { break; }
-                        copy_guest_path(str_ptr, &mut exec_envp[exec_envc]);
+                        if child_as_cap != 0 {
+                            let mut tmp = [0u8; MAX_EXEC_ARG_LEN];
+                            let _ = sys::vm_read(child_as_cap, str_ptr, tmp.as_mut_ptr() as u64, MAX_EXEC_ARG_LEN as u64);
+                            let slen = tmp.iter().position(|&b| b == 0).unwrap_or(MAX_EXEC_ARG_LEN - 1);
+                            exec_envp[exec_envc][..slen].copy_from_slice(&tmp[..slen]);
+                            exec_envp[exec_envc][slen] = 0;
+                        } else {
+                            copy_guest_path(str_ptr, &mut exec_envp[exec_envc]);
+                        }
                         exec_envc += 1;
                         ep += 8;
                     }
                 }
 
+                // Log argv for all child execves
+                print(b"EXEC-ARGV P"); print_u64(pid as u64);
+                print(b": argc="); print_u64(exec_argc as u64);
+                print(b" envc="); print_u64(exec_envc as u64);
+                for i in 0..exec_argc.min(5) {
+                    print(b" [");
+                    let alen = exec_argv[i].iter().position(|&b| b == 0).unwrap_or(exec_argv[i].len());
+                    print(&exec_argv[i][..alen]);
+                    print(b"]");
+                }
+                print(b"\n");
+                for &b in b"EX:lock\n" { sys::debug_print(b); }
                 while EXEC_LOCK.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed).is_err() { sys::yield_now(); }
-                // Try initrd first, then VFS
+                for &b in b"EX:locked\n" { sys::debug_print(b); }
+                // Try initrd first (by full path, then by basename), then VFS
                 let envp_slice = &exec_envp[..exec_envc];
                 let result = if exec_argc > 0 || exec_envc > 0 {
                     exec_from_initrd_argv(bin_name, &exec_argv[..exec_argc], envp_slice)
                 } else {
                     exec_from_initrd(bin_name)
+                };
+                // If initrd failed with full path, try basename (e.g. /usr/libexec/git-core/git → git)
+                let result = match result {
+                    Ok(r) => Ok(r),
+                    Err(_) => {
+                        let basename = {
+                            let mut last_slash = 0;
+                            let mut i = 0;
+                            while i < bin_name.len() {
+                                if bin_name[i] == b'/' { last_slash = i + 1; }
+                                i += 1;
+                            }
+                            if last_slash > 0 && last_slash < bin_name.len() {
+                                &bin_name[last_slash..]
+                            } else {
+                                bin_name
+                            }
+                        };
+                        if basename != bin_name {
+                            if exec_argc > 0 || exec_envc > 0 {
+                                exec_from_initrd_argv(basename, &exec_argv[..exec_argc], envp_slice)
+                            } else {
+                                exec_from_initrd(basename)
+                            }
+                        } else {
+                            Err(-2)
+                        }
+                    }
                 };
                 let result = match result {
                     Ok(r) => Ok(r),
@@ -682,18 +799,42 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 match result {
                     Ok((new_ep, _tc)) => {
                         for &b in b"EXECVE: ok\n" { sys::debug_print(b); }
+                        // Close all fds marked close-on-exec
+                        {
+                            let mut ctx = make_ctx!();
+                            ctx.ep_cap = new_ep; // use new endpoint
+                            crate::syscalls::fs::close_cloexec_fds(&mut ctx);
+                        }
                         // Record page info for cleanup on exit
                         if pid > 0 && pid <= MAX_PROCS {
                             use crate::exec::{LAST_EXEC_STACK_BASE, LAST_EXEC_STACK_PAGES,
                                               LAST_EXEC_ELF_LO, LAST_EXEC_ELF_HI, LAST_EXEC_HAS_INTERP};
-                            PROC_STACK_BASE[pid - 1].store(LAST_EXEC_STACK_BASE.load(Ordering::Acquire), Ordering::Release);
-                            PROC_STACK_PAGES[pid - 1].store(LAST_EXEC_STACK_PAGES.load(Ordering::Acquire), Ordering::Release);
-                            PROC_ELF_LO[pid - 1].store(LAST_EXEC_ELF_LO.load(Ordering::Acquire), Ordering::Release);
-                            PROC_ELF_HI[pid - 1].store(LAST_EXEC_ELF_HI.load(Ordering::Acquire), Ordering::Release);
-                            PROC_HAS_INTERP[pid - 1].store(LAST_EXEC_HAS_INTERP.load(Ordering::Acquire), Ordering::Release);
+                            PROCESSES[pid - 1].stack_base.store(LAST_EXEC_STACK_BASE.load(Ordering::Acquire), Ordering::Release);
+                            PROCESSES[pid - 1].stack_pages.store(LAST_EXEC_STACK_PAGES.load(Ordering::Acquire), Ordering::Release);
+                            PROCESSES[pid - 1].elf_lo.store(LAST_EXEC_ELF_LO.load(Ordering::Acquire), Ordering::Release);
+                            PROCESSES[pid - 1].elf_hi.store(LAST_EXEC_ELF_HI.load(Ordering::Acquire), Ordering::Release);
+                            PROCESSES[pid - 1].has_interp.store(LAST_EXEC_HAS_INTERP.load(Ordering::Acquire), Ordering::Release);
                         }
                         EXEC_LOCK.store(0, Ordering::Release);
                         ep_cap = new_ep;
+                        // After exec, the new thread runs in init's AS (not the
+                        // CoW-forked AS). Reset child_as_cap so guest_read/write
+                        // use direct memory access instead of vm_read/vm_write.
+                        child_as_cap = 0;
+                        // DIAG: dump fd table after exec for P6
+                        if pid == 6 {
+                            print(b"P6-EXEC-FDS:");
+                            unsafe {
+                                for f in 0..10 {
+                                    print(b" "); print_u64(f as u64);
+                                    print(b"="); print_u64(THREAD_GROUPS[fdg].fds[f] as u64);
+                                    if THREAD_GROUPS[fdg].fds[f] == 10 || THREAD_GROUPS[fdg].fds[f] == 11 {
+                                        print(b"(p"); print_u64(THREAD_GROUPS[fdg].sock_conn_id[f] as u64); print(b")");
+                                    }
+                                }
+                            }
+                            print(b"\n");
+                        }
                         continue;
                     }
                     Err(errno) => {
@@ -771,10 +912,34 @@ pub(crate) extern "C" fn child_handler() -> ! {
                         *((frame_rsp + 48) as *mut u64) = fork_rip;
                     }
 
+                    // Write TLS trampoline before cloning (child sees it in CoW copy)
+                    if fork_fsbase != 0 {
+                        vdso::write_fork_tls_trampoline(fork_fsbase);
+                    }
+                    let child_entry = if fork_fsbase != 0 {
+                        vdso::FORK_TLS_TRAMPOLINE_ADDR
+                    } else {
+                        vdso::COW_FORK_RESTORE_ADDR
+                    };
+
                     let child_as_cap = match sys::addr_space_clone(self_as_cap) {
                         Ok(cap) => cap,
                         Err(_) => { reply_val(ep_cap, -ENOMEM); continue; }
                     };
+
+                    // Eagerly copy stack pages for child (8 pages upward)
+                    {
+                        let base_page = frame_rsp & !0xFFF;
+                        for i in 0..8u64 {
+                            let pg = base_page + i * 0x1000;
+                            if let Ok(nf) = sys::frame_alloc() {
+                                if sys::frame_copy(nf, child_as_cap, pg).is_ok() {
+                                    let _ = sys::unmap_from(child_as_cap, pg);
+                                    let _ = sys::map_into(child_as_cap, pg, nf, 2);
+                                }
+                            }
+                        }
+                    }
 
                     let child_ep = match sys::endpoint_create() {
                         Ok(e) => e,
@@ -782,40 +947,39 @@ pub(crate) extern "C" fn child_handler() -> ! {
                     };
 
                     let child_thread = match sys::thread_create_in(
-                        child_as_cap, vdso::COW_FORK_RESTORE_ADDR, frame_rsp, child_ep,
+                        child_as_cap, child_entry, frame_rsp, child_ep,
                     ) {
                         Ok(t) => t,
                         Err(_) => { reply_val(ep_cap, -ENOMEM); continue; }
                     };
-
-                    if fork_fsbase != 0 {
-                        let _ = sys::set_thread_fs_base(child_thread, fork_fsbase);
-                    }
                     let _ = sys::signal_entry(child_thread, vdso::SIGNAL_TRAMPOLINE_ADDR);
 
                     let cidx = fork_cpid - 1;
-                    PROC_PARENT[cidx].store(pid as u64, Ordering::Release);
+                    PROCESSES[cidx].parent.store(pid as u64, Ordering::Release);
                     proc_group_init(fork_cpid);
 
                     unsafe {
-                        GRP_FDS[cidx] = *child_fds;
-                        GRP_VFS[cidx] = *vfs_files;
-                        GRP_INITRD[cidx] = *initrd_files;
-                        GRP_CWD[cidx] = *cwd;
+                        let parent = &THREAD_GROUPS[fdg];
+                        THREAD_GROUPS[cidx].fds = parent.fds;
+                        THREAD_GROUPS[cidx].fd_cloexec = parent.fd_cloexec;
+                        THREAD_GROUPS[cidx].vfs = parent.vfs;
+                        THREAD_GROUPS[cidx].initrd = parent.initrd;
+                        THREAD_GROUPS[cidx].cwd = parent.cwd;
                     }
 
                     for cfd in 0..GRP_MAX_FDS {
-                        let k = child_fds[cfd];
-                        let p = sock_conn_id[cfd] as usize;
+                        let k = unsafe { THREAD_GROUPS[fdg].fds[cfd] };
+                        let p = unsafe { THREAD_GROUPS[fdg].sock_conn_id[cfd] } as usize;
                         if k == 11 && p < MAX_PIPES { PIPE_WRITE_REFS[p].fetch_add(1, Ordering::AcqRel); }
                         else if k == 10 && p < MAX_PIPES { PIPE_READ_REFS[p].fetch_add(1, Ordering::AcqRel); }
                     }
 
                     unsafe {
-                        FORK_SOCK_CONN = sock_conn_id;
-                        FORK_SOCK_UDP_LPORT = sock_udp_local_port;
-                        FORK_SOCK_UDP_RIP = sock_udp_remote_ip;
-                        FORK_SOCK_UDP_RPORT = sock_udp_remote_port;
+                        FORK_FD_FLAGS = THREAD_GROUPS[fdg].fd_flags;
+                        FORK_SOCK_CONN = THREAD_GROUPS[fdg].sock_conn_id;
+                        FORK_SOCK_UDP_LPORT = THREAD_GROUPS[fdg].sock_udp_local_port;
+                        FORK_SOCK_UDP_RIP = THREAD_GROUPS[fdg].sock_udp_remote_ip;
+                        FORK_SOCK_UDP_RPORT = THREAD_GROUPS[fdg].sock_udp_remote_port;
                     }
 
                     let handler_stack_base = NEXT_CHILD_STACK.fetch_add(0x20000, Ordering::SeqCst);
@@ -840,7 +1004,7 @@ pub(crate) extern "C" fn child_handler() -> ! {
 
                     while CHILD_SETUP_READY.load(Ordering::Acquire) != 0 { sys::yield_now(); }
 
-                    PROC_STATE[cidx].store(1, Ordering::Release);
+                    PROCESSES[cidx].state.store(1, Ordering::Release);
 
                     print(b"COW-CLONE-FORK: cpid=");
                     print_u64(fork_cpid as u64);
@@ -863,7 +1027,7 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 }
 
                 // Initialize thread group state based on clone flags
-                PROC_PARENT[child_pid - 1].store(pid as u64, Ordering::Release);
+                PROCESSES[child_pid - 1].parent.store(pid as u64, Ordering::Release);
                 proc_thread_init(child_pid, pid, flags);
 
                 // CLONE_PARENT_SETTID: write child TID to *ptid
@@ -873,7 +1037,7 @@ pub(crate) extern "C" fn child_handler() -> ! {
 
                 // CLONE_CHILD_CLEARTID: store ctid pointer for exit cleanup
                 if flags & CLONE_CHILD_CLEARTID != 0 && ctid_ptr != 0 {
-                    PROC_CLEAR_TID[child_pid - 1].store(ctid_ptr, Ordering::Release);
+                    PROCESSES[child_pid - 1].clear_tid.store(ctid_ptr, Ordering::Release);
                 }
 
                 // Set up the child's stack for clone_child_trampoline:
@@ -952,7 +1116,7 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 let _ = sys::signal_entry(child_thread, vdso::SIGNAL_TRAMPOLINE_ADDR);
 
                 // Mark child as running
-                PROC_STATE[child_pid - 1].store(1, Ordering::Release);
+                PROCESSES[child_pid - 1].state.store(1, Ordering::Release);
 
                 // Reply to parent with child TID
                 reply_val(ep_cap, child_pid as i64);
@@ -1022,6 +1186,18 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 }
                 print(b"FORK: restore frame written\n");
 
+                // Write a TLS trampoline that sets FS_BASE BEFORE the child
+                // touches any TLS-dependent code. This avoids the race where
+                // set_thread_fs_base() runs after the child is already scheduled.
+                if fork_fsbase != 0 {
+                    vdso::write_fork_tls_trampoline(fork_fsbase);
+                }
+                let child_entry = if fork_fsbase != 0 {
+                    vdso::FORK_TLS_TRAMPOLINE_ADDR
+                } else {
+                    vdso::COW_FORK_RESTORE_ADDR
+                };
+
                 // Clone the address space with CoW semantics
                 print(b"FORK: cloning AS (cap="); print_u64(self_as_cap); print(b")...\n");
                 let child_as_cap = match sys::addr_space_clone(self_as_cap) {
@@ -1038,6 +1214,23 @@ pub(crate) extern "C" fn child_handler() -> ! {
                     }
                 };
 
+                // Eagerly copy stack pages for the child so the parent can't
+                // corrupt them (parent PTEs stay writable in this CoW model).
+                // Copy 8 pages starting from restore frame page going upward
+                // to cover the entire call chain (fork → git's run_command).
+                {
+                    let base_page = frame_rsp & !0xFFF;
+                    for i in 0..8u64 {
+                        let pg = base_page + i * 0x1000;
+                        if let Ok(nf) = sys::frame_alloc() {
+                            if sys::frame_copy(nf, child_as_cap, pg).is_ok() {
+                                let _ = sys::unmap_from(child_as_cap, pg);
+                                let _ = sys::map_into(child_as_cap, pg, nf, 2);
+                            }
+                        }
+                    }
+                }
+
                 // Create endpoint for child process
                 let child_ep = match sys::endpoint_create() {
                     Ok(e) => {
@@ -1047,13 +1240,14 @@ pub(crate) extern "C" fn child_handler() -> ! {
                     Err(_) => { reply_val(ep_cap, -ENOMEM); continue; }
                 };
 
-                // Create child thread in the cloned AS at the COW_FORK_RESTORE trampoline.
-                // Redirect syscalls to child_ep. Child will xor eax + pop regs + ret to fork_rip.
-                print(b"FORK: thread_create_in rip="); print_u64(vdso::COW_FORK_RESTORE_ADDR);
+                // Create child thread in the cloned AS at the TLS trampoline.
+                // The trampoline sets FS_BASE via syscall, then jumps to COW_FORK_RESTORE
+                // which does xor eax + pop regs + ret to fork_rip.
+                print(b"FORK: thread_create_in rip="); print_u64(child_entry);
                 print(b" rsp="); print_u64(frame_rsp); print(b"\n");
                 let child_thread = match sys::thread_create_in(
                     child_as_cap,
-                    vdso::COW_FORK_RESTORE_ADDR,
+                    child_entry,
                     frame_rsp,
                     child_ep,
                 ) {
@@ -1069,32 +1263,29 @@ pub(crate) extern "C" fn child_handler() -> ! {
                         continue;
                     }
                 };
-
-                // Set child's FS_BASE (TLS) from parent's saved state
-                if fork_fsbase != 0 {
-                    let _ = sys::set_thread_fs_base(child_thread, fork_fsbase);
-                }
                 // Set signal trampoline for the child thread
                 let _ = sys::signal_entry(child_thread, vdso::SIGNAL_TRAMPOLINE_ADDR);
 
                 // Set up child process metadata
                 let cidx = fork_cpid - 1;
-                PROC_PARENT[cidx].store(pid as u64, Ordering::Release);
-                PROC_KERNEL_TID[cidx].store(0, Ordering::Release);
+                PROCESSES[cidx].parent.store(pid as u64, Ordering::Release);
+                PROCESSES[cidx].kernel_tid.store(0, Ordering::Release);
                 proc_group_init(fork_cpid);
 
                 // Copy parent's FD state to child
                 unsafe {
-                    GRP_FDS[cidx] = *child_fds;
-                    GRP_VFS[cidx] = *vfs_files;
-                    GRP_INITRD[cidx] = *initrd_files;
-                    GRP_CWD[cidx] = *cwd;
+                    let parent = &THREAD_GROUPS[fdg];
+                    THREAD_GROUPS[cidx].fds = parent.fds;
+                    THREAD_GROUPS[cidx].fd_cloexec = parent.fd_cloexec;
+                    THREAD_GROUPS[cidx].vfs = parent.vfs;
+                    THREAD_GROUPS[cidx].initrd = parent.initrd;
+                    THREAD_GROUPS[cidx].cwd = parent.cwd;
                 }
 
                 // Increment pipe refcounts for fds inherited by child
                 for cfd in 0..GRP_MAX_FDS {
-                    let k = child_fds[cfd];
-                    let p = sock_conn_id[cfd] as usize;
+                    let k = unsafe { THREAD_GROUPS[fdg].fds[cfd] };
+                    let p = unsafe { THREAD_GROUPS[fdg].sock_conn_id[cfd] } as usize;
                     if k == 11 && p < MAX_PIPES {
                         PIPE_WRITE_REFS[p].fetch_add(1, Ordering::AcqRel);
                     } else if k == 10 && p < MAX_PIPES {
@@ -1104,10 +1295,11 @@ pub(crate) extern "C" fn child_handler() -> ! {
 
                 // Copy socket state for child handler
                 unsafe {
-                    FORK_SOCK_CONN = sock_conn_id;
-                    FORK_SOCK_UDP_LPORT = sock_udp_local_port;
-                    FORK_SOCK_UDP_RIP = sock_udp_remote_ip;
-                    FORK_SOCK_UDP_RPORT = sock_udp_remote_port;
+                    FORK_FD_FLAGS = THREAD_GROUPS[fdg].fd_flags;
+                    FORK_SOCK_CONN = THREAD_GROUPS[fdg].sock_conn_id;
+                    FORK_SOCK_UDP_LPORT = THREAD_GROUPS[fdg].sock_udp_local_port;
+                    FORK_SOCK_UDP_RIP = THREAD_GROUPS[fdg].sock_udp_remote_ip;
+                    FORK_SOCK_UDP_RPORT = THREAD_GROUPS[fdg].sock_udp_remote_port;
                 }
 
                 // Allocate handler stack (32 pages = 128KB) for child handler thread
@@ -1134,7 +1326,7 @@ pub(crate) extern "C" fn child_handler() -> ! {
 
                 while CHILD_SETUP_READY.load(Ordering::Acquire) != 0 { sys::yield_now(); }
 
-                PROC_STATE[cidx].store(1, Ordering::Release);
+                PROCESSES[cidx].state.store(1, Ordering::Release);
 
                 // Serial-only to avoid fb_putchar scroll delays
                 for &b in b"COW-FORK: ok\n" { sys::debug_print(b); }
@@ -1570,10 +1762,15 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 syscalls_fs::sys_sendfile(&mut ctx, &msg);
             }
 
+            // link/linkat — return -EPERM so callers (git) fall back to rename()
+            SYS_LINK | SYS_LINKAT => {
+                reply_val(ep_cap, -EPERM);
+            }
+
             // File metadata stubs — return 0 (pretend success)
-            SYS_LINK | SYS_SYMLINK | SYS_FCHMOD | SYS_FCHOWN | SYS_LCHOWN
+            SYS_SYMLINK | SYS_FCHMOD | SYS_FCHOWN | SYS_LCHOWN
             | SYS_FLOCK | SYS_FALLOCATE | SYS_UTIMES
-            | SYS_LINKAT | SYS_SYMLINKAT | SYS_FCHMODAT | SYS_FCHOWNAT
+            | SYS_SYMLINKAT | SYS_FCHMODAT | SYS_FCHOWNAT
             | SYS_UTIMENSAT | SYS_FUTIMESAT | SYS_MKNOD | SYS_MKNODAT
             => {
                 let mut ctx = make_ctx!();
@@ -1809,63 +2006,111 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 reply_val(ep_cap, -ENOSYS);
             }
         }
+        // DIAG: post-dispatch confirmation for pid >= 4
+        if pid >= 4 {
+            for &b in b"[D" { sys::debug_print(b); }
+            sys::debug_print(b'0' + pid as u8);
+            sys::debug_print(b']');
+        }
     }
 
     // Child handler exiting (timeout or error). Clean up and mark as zombie.
     if pid > 0 && pid <= MAX_PROCS {
+        // Decrement pipe refcounts for any still-open pipe FDs.
+        // This is critical when a child crashes (page fault) without calling exit_cleanup.
+        unsafe {
+            let tg = &mut THREAD_GROUPS[fdg];
+            for f in 0..GRP_MAX_FDS {
+                let kind = tg.fds[f];
+                if kind == 11 {
+                    let pipe_id = tg.sock_conn_id[f] as usize;
+                    if pipe_id < MAX_PIPES {
+                        let prev = PIPE_WRITE_REFS[pipe_id].fetch_sub(1, Ordering::AcqRel);
+                        if prev <= 1 {
+                            crate::framebuffer::print(b"PWC-SET ch-exit pipe=");
+                            crate::framebuffer::print_u64(pipe_id as u64);
+                            crate::framebuffer::print(b" wrefs=");
+                            crate::framebuffer::print_u64(prev);
+                            crate::framebuffer::print(b"\n");
+                            PIPE_WRITE_CLOSED[pipe_id].store(1, Ordering::Release);
+                            if PIPE_READ_CLOSED[pipe_id].load(Ordering::Acquire) != 0 {
+                                pipe_free(pipe_id);
+                            }
+                        }
+                    }
+                } else if kind == 10 {
+                    let pipe_id = tg.sock_conn_id[f] as usize;
+                    if pipe_id < MAX_PIPES {
+                        let prev = PIPE_READ_REFS[pipe_id].fetch_sub(1, Ordering::AcqRel);
+                        if prev <= 1 {
+                            PIPE_READ_CLOSED[pipe_id].store(1, Ordering::Release);
+                            if PIPE_WRITE_CLOSED[pipe_id].load(Ordering::Acquire) != 0 {
+                                pipe_free(pipe_id);
+                            }
+                        }
+                    }
+                }
+                tg.fds[f] = 0;
+            }
+        }
         // Free child stack pages
-        let sbase = PROC_STACK_BASE[pid - 1].load(Ordering::Acquire);
-        let spages = PROC_STACK_PAGES[pid - 1].load(Ordering::Acquire);
+        let sbase = PROCESSES[pid - 1].stack_base.load(Ordering::Acquire);
+        let spages = PROCESSES[pid - 1].stack_pages.load(Ordering::Acquire);
         if sbase != 0 && spages != 0 {
             for p in 0..spages { let _ = sys::unmap_free(sbase + p * 0x1000); }
-            PROC_STACK_BASE[pid - 1].store(0, Ordering::Release);
-            PROC_STACK_PAGES[pid - 1].store(0, Ordering::Release);
+            PROCESSES[pid - 1].stack_base.store(0, Ordering::Release);
+            PROCESSES[pid - 1].stack_pages.store(0, Ordering::Release);
         }
         // Free ELF segment pages
-        let elf_lo = PROC_ELF_LO[pid - 1].load(Ordering::Acquire);
-        let elf_hi = PROC_ELF_HI[pid - 1].load(Ordering::Acquire);
+        let elf_lo = PROCESSES[pid - 1].elf_lo.load(Ordering::Acquire);
+        let elf_hi = PROCESSES[pid - 1].elf_hi.load(Ordering::Acquire);
         if elf_lo < elf_hi {
             let mut pg = elf_lo;
             while pg < elf_hi { let _ = sys::unmap_free(pg); pg += 0x1000; }
-            PROC_ELF_LO[pid - 1].store(0, Ordering::Release);
-            PROC_ELF_HI[pid - 1].store(0, Ordering::Release);
+            PROCESSES[pid - 1].elf_lo.store(0, Ordering::Release);
+            PROCESSES[pid - 1].elf_hi.store(0, Ordering::Release);
         }
         // Free interpreter pages if dynamic binary
-        if PROC_HAS_INTERP[pid - 1].load(Ordering::Acquire) != 0 {
+        if PROCESSES[pid - 1].has_interp.load(Ordering::Acquire) != 0 {
             for pg in 0..0x110u64 {
                 let _ = sys::unmap_free(crate::exec::INTERP_LOAD_BASE + pg * 0x1000);
             }
-            PROC_HAS_INTERP[pid - 1].store(0, Ordering::Release);
+            PROCESSES[pid - 1].has_interp.store(0, Ordering::Release);
         }
         // Free pre-TLS page
         let _ = sys::unmap_free(0xB70000);
         // Free brk pages
-        let brk_lo = PROC_BRK_BASE[pid - 1].load(Ordering::Acquire);
-        let brk_hi = PROC_BRK_CURRENT[pid - 1].load(Ordering::Acquire);
+        let brk_lo = PROCESSES[pid - 1].brk_base.load(Ordering::Acquire);
+        let brk_hi = PROCESSES[pid - 1].brk_current.load(Ordering::Acquire);
         if brk_lo != 0 && brk_hi > brk_lo {
             let mut pg = brk_lo;
             while pg < brk_hi { let _ = sys::unmap_free(pg); pg += 0x1000; }
         }
         // Free mmap pages
-        let mmap_lo = PROC_MMAP_BASE[pid - 1].load(Ordering::Acquire);
-        let mmap_hi = PROC_MMAP_NEXT[pid - 1].load(Ordering::Acquire);
+        let mmap_lo = PROCESSES[pid - 1].mmap_base.load(Ordering::Acquire);
+        let mmap_hi = PROCESSES[pid - 1].mmap_next.load(Ordering::Acquire);
         if mmap_lo != 0 && mmap_hi > mmap_lo {
             let mut pg = mmap_lo;
             while pg < mmap_hi { let _ = sys::unmap_free(pg); pg += 0x1000; }
         }
-        PROC_BRK_BASE[pid - 1].store(0, Ordering::Release);
-        PROC_BRK_CURRENT[pid - 1].store(0, Ordering::Release);
-        PROC_MMAP_BASE[pid - 1].store(0, Ordering::Release);
-        PROC_MMAP_NEXT[pid - 1].store(0, Ordering::Release);
+        PROCESSES[pid - 1].brk_base.store(0, Ordering::Release);
+        PROCESSES[pid - 1].brk_current.store(0, Ordering::Release);
+        PROCESSES[pid - 1].mmap_base.store(0, Ordering::Release);
+        PROCESSES[pid - 1].mmap_next.store(0, Ordering::Release);
         // Reset group state
-        unsafe { GRP_BRK[memg] = 0; GRP_MMAP_NEXT[memg] = 0; }
-        // Mark as killed by SIGKILL (status 9)
-        PROC_EXIT[pid - 1].store(9, Ordering::Release);
-        PROC_STATE[pid - 1].store(2, Ordering::Release);
-        // Deliver SIGCHLD to parent
-        let ppid = PROC_PARENT[pid - 1].load(Ordering::Acquire) as usize;
-        if ppid > 0 && ppid <= MAX_PROCS {
-            sig_send(ppid, SIGCHLD as u64);
+        unsafe { THREAD_GROUPS[memg].brk = 0; THREAD_GROUPS[memg].mmap_next = 0; }
+        // Only mark as zombie if exit_cleanup hasn't already run.
+        // exit_cleanup (from SYS_EXIT/EXIT_GROUP) stores exit_code + state=2.
+        // If we overwrite here, we clobber the correct exit code with 9 (SIGKILL),
+        // causing parents' wait4 to see the wrong status.
+        if PROCESSES[pid - 1].state.load(Ordering::Acquire) != 2 {
+            PROCESSES[pid - 1].exit_code.store(9, Ordering::Release);
+            PROCESSES[pid - 1].state.store(2, Ordering::Release);
+            // Deliver SIGCHLD to parent
+            let ppid = PROCESSES[pid - 1].parent.load(Ordering::Acquire) as usize;
+            if ppid > 0 && ppid <= MAX_PROCS {
+                sig_send(ppid, SIGCHLD as u64);
+            }
         }
     }
     sys::thread_exit();

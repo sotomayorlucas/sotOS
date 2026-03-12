@@ -306,17 +306,21 @@ impl AddressSpace {
         Some(pte_ptr)
     }
 
-    /// Clone this address space with Copy-on-Write semantics.
+    /// Clone this address space for fork (parent-writable CoW).
     ///
     /// Creates a new PML4, walks all user-half page tables (entries 0..256),
     /// and for each present leaf PTE:
-    ///   1. Remove WRITABLE from BOTH parent and child PTEs
-    ///   2. Copy the PTE (same physical frame) to child
+    ///   1. Copy PTE to child with WRITABLE removed (child triggers CoW on write)
+    ///   2. Parent PTE is LEFT UNCHANGED (parent keeps writing freely)
     ///   3. Increment refcount for the physical frame
     /// Kernel-half entries (256..512) are shared as usual.
-    /// Returns the new AddressSpace.
     ///
-    /// Caller must flush the TLB after this call if the parent is the current CR3.
+    /// Parent stays writable because init runs handler threads in its AS;
+    /// marking parent read-only breaks virtio DMA (device DMA uses original
+    /// physical addresses; CoW resolution remaps to new frames).
+    ///
+    /// The caller must eagerly copy pages the child needs before the parent
+    /// can overwrite them (restore frame page + surrounding stack pages).
     pub fn clone_cow(&self) -> Self {
         use super::frame_refcount_inc;
 
@@ -382,12 +386,10 @@ impl AddressSpace {
 
                         let phys = pte & 0x000F_FFFF_FFFF_F000;
 
-                        // Remove WRITABLE from parent PTE (CoW protect)
-                        let cow_pte = pte & !PAGE_WRITABLE;
-                        unsafe { *src_pt.add(pt_i) = cow_pte; }
-
-                        // Copy to child with same CoW flags
-                        unsafe { *new_pt.add(pt_i) = cow_pte; }
+                        // Child gets read-only PTE (CoW on write).
+                        // Parent PTE is NOT modified — stays writable.
+                        let child_pte = pte & !PAGE_WRITABLE;
+                        unsafe { *new_pt.add(pt_i) = child_pte; }
 
                         // Increment refcount: if frame was previously untracked (rc=0),
                         // set to 2 (parent + child). If already tracked, just +1.
@@ -406,7 +408,7 @@ impl AddressSpace {
             }
         }
 
-        crate::kdebug!("clone_cow: {} pages, {} tables", total_pages, total_tables);
+        crate::kprintln!("clone_cow: {} pages, {} tables", total_pages, total_tables);
         Self { pml4_phys: new_pml4_phys }
     }
 

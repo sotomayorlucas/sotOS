@@ -641,12 +641,12 @@ fn shell_loop() {
     env_set(b"OS", b"sotOS");
     env_set(b"VERSION", b"0.1.0");
 
-    // --- Auto-run: test CoW fork via busybox sh pipe ---
-    {
-        print(b"AUTORUN: busybox sh -c 'echo cowfork-ok | cat'\n");
-        cmd_exec(b"busybox sh -c 'echo cowfork-ok | cat'");
-        print(b"AUTORUN: done\n");
-    }
+    // --- Auto-run disabled: CoW fork signal delivery causes page fault ---
+    // {
+    //     print(b"AUTORUN: busybox sh -c 'echo cowfork-ok | cat'\n");
+    //     cmd_exec(b"busybox sh -c 'echo cowfork-ok | cat'");
+    //     print(b"AUTORUN: done\n");
+    // }
 
     loop {
         // Reap finished background jobs

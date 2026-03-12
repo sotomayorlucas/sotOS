@@ -301,9 +301,20 @@ impl VirtioNet {
         self.rx_vq.submit(d);
     }
 
-    /// Wait for TX completion via IRQ.
+    /// Wait for TX completion.
+    /// In QEMU TCG, the used ring is updated synchronously after notify,
+    /// so poll first before blocking on IRQ wait.
     fn wait_tx_completion(&mut self) -> Result<(), &'static str> {
+        // Fast path: TCG processes TX synchronously on port_out16(NOTIFY).
+        if self.tx_vq.poll_used().is_some() {
+            return Ok(());
+        }
+        // Slow path: wait for IRQ notification (KVM or batched TX).
         for _ in 0..1000 {
+            sys::yield_now();
+            if self.tx_vq.poll_used().is_some() {
+                return Ok(());
+            }
             sys::notify_wait(self.notify_cap);
             let _ = sys::port_in(self.bar_cap, self.bar_base + VIRTIO_ISR_STATUS);
             let _ = sys::irq_ack(self.irq_cap);
