@@ -56,6 +56,11 @@ pub(crate) struct ProcessState {
     pub sig_handler: [AtomicU64; 32],   // handler addr per signal (0=SIG_DFL, 1=SIG_IGN)
     pub sig_flags: [AtomicU64; 32],     // SA_* flags per signal
     pub sig_restorer: [AtomicU64; 32],  // sa_restorer per signal
+
+    // Alternate signal stack (sigaltstack)
+    pub sig_alt_sp: AtomicU64,          // ss_sp (stack base pointer)
+    pub sig_alt_size: AtomicU64,        // ss_size (stack size in bytes)
+    pub sig_alt_flags: AtomicU64,       // ss_flags (0=enabled, SS_ONSTACK=1, SS_DISABLE=2)
 }
 
 impl ProcessState {
@@ -84,6 +89,9 @@ impl ProcessState {
             sig_handler: [const { AtomicU64::new(0) }; 32],
             sig_flags: [const { AtomicU64::new(0) }; 32],
             sig_restorer: [const { AtomicU64::new(0) }; 32],
+            sig_alt_sp: AtomicU64::new(0),
+            sig_alt_size: AtomicU64::new(0),
+            sig_alt_flags: AtomicU64::new(2), // SS_DISABLE
         }
     }
 }
@@ -242,12 +250,15 @@ pub(crate) fn sig_dispatch(pid: usize, sig: u64) -> u8 {
 
 /// Deliver a signal to a child process by building a SignalFrame on the
 /// child's user stack and replying with SIG_REDIRECT_TAG.
+/// Supports SA_ONSTACK (alternate signal stack) and SA_SIGINFO (3-arg handler
+/// with siginfo_t + ucontext_t).
 pub(crate) fn signal_deliver(ep_cap: u64, pid: usize, sig: u64, child_tid: u64, syscall_ret: i64, is_async: bool) -> bool {
     if sig == 0 || sig >= 32 || pid == 0 || pid > MAX_PROCS { return false; }
     let p = &PROCESSES[pid - 1];
 
     let handler = p.sig_handler[sig as usize].load(Ordering::Acquire);
     let restorer = p.sig_restorer[sig as usize].load(Ordering::Acquire);
+    let sig_fl = p.sig_flags[sig as usize].load(Ordering::Acquire);
 
     if handler <= 1 { return false; }
 
@@ -284,8 +295,106 @@ pub(crate) fn signal_deliver(ep_cap: u64, pid: usize, sig: u64, child_tid: u64, 
     let saved_rflags = saved_r11;
     let frame_rax = if is_async { saved_rax } else { syscall_ret as u64 };
 
+    // ── Determine base RSP: use alt stack if SA_ONSTACK + alt stack enabled ──
+    let use_altstack = {
+        let has_sa_onstack = sig_fl & linux_abi::SA_ONSTACK != 0;
+        let alt_flags = p.sig_alt_flags.load(Ordering::Acquire);
+        let alt_enabled = alt_flags != linux_abi::SS_DISABLE;
+        if has_sa_onstack && alt_enabled {
+            let alt_sp = p.sig_alt_sp.load(Ordering::Acquire);
+            let alt_size = p.sig_alt_size.load(Ordering::Acquire);
+            // Don't switch if already on the alt stack (RSP within [sp, sp+size))
+            let already_on = saved_rsp >= alt_sp && saved_rsp < alt_sp + alt_size;
+            !already_on && alt_sp != 0 && alt_size != 0
+        } else {
+            false
+        }
+    };
+
+    let base_rsp = if use_altstack {
+        let alt_sp = p.sig_alt_sp.load(Ordering::Acquire);
+        let alt_size = p.sig_alt_size.load(Ordering::Acquire);
+        // Top of alt stack (stack grows down)
+        alt_sp + alt_size
+    } else {
+        saved_rsp
+    };
+
+    // ── SA_SIGINFO: allocate siginfo_t + ucontext_t on stack ──
+    let has_siginfo = sig_fl & linux_abi::SA_SIGINFO != 0;
+
+    // siginfo_t is 128 bytes, ucontext_t is 936 bytes on x86_64
+    const SIGINFO_SIZE: u64 = 128;
+    const UCONTEXT_SIZE: u64 = 936;
+    // gregset starts at offset 40 in ucontext_t (uc_flags=8, uc_link=8, uc_stack=24 → 40)
+    const UC_MCONTEXT_GREGS_OFF: u64 = 40;
+
+    let (siginfo_ptr, ucontext_ptr, stack_after_extras) = if has_siginfo {
+        // Layout on stack (growing down from base_rsp):
+        //   [ucontext_t] [siginfo_t] [SignalFrame] [return addr]
+        let uc_rsp = (base_rsp - UCONTEXT_SIZE) & !0xF;
+        let si_rsp = (uc_rsp - SIGINFO_SIZE) & !0xF;
+
+        // Zero and fill siginfo_t
+        unsafe {
+            let si = si_rsp as *mut u8;
+            core::ptr::write_bytes(si, 0, SIGINFO_SIZE as usize);
+            // si_signo at offset 0 (i32)
+            core::ptr::write_volatile(si as *mut i32, sig as i32);
+            // si_errno at offset 4 (i32) = 0
+            // si_code at offset 8 (i32) = SI_USER (0)
+        }
+
+        // Zero and fill ucontext_t
+        unsafe {
+            let uc = uc_rsp as *mut u8;
+            core::ptr::write_bytes(uc, 0, UCONTEXT_SIZE as usize);
+
+            // uc_stack (offset 16, sizeof stack_t = 24): fill with current alt stack info
+            if use_altstack {
+                let alt_sp = p.sig_alt_sp.load(Ordering::Acquire);
+                let alt_size = p.sig_alt_size.load(Ordering::Acquire);
+                core::ptr::write_volatile((uc_rsp + 16) as *mut u64, alt_sp);        // ss_sp
+                core::ptr::write_volatile((uc_rsp + 24) as *mut u64, linux_abi::SS_ONSTACK); // ss_flags
+                core::ptr::write_volatile((uc_rsp + 32) as *mut u64, alt_size);       // ss_size
+            }
+
+            // uc_mcontext.gregs (23 entries of 8 bytes each, at offset 40)
+            // Linux gregset layout: R8,R9,R10,R11,R12,R13,R14,R15,
+            //   RDI,RSI,RBP,RBX,RDX,RCX,RAX, trapno,err,RIP,CS,EFLAGS,RSP,SS
+            let gregs = (uc_rsp + UC_MCONTEXT_GREGS_OFF) as *mut u64;
+            core::ptr::write_volatile(gregs.add(0),  saved_r8);
+            core::ptr::write_volatile(gregs.add(1),  saved_r9);
+            core::ptr::write_volatile(gregs.add(2),  saved_r10);
+            core::ptr::write_volatile(gregs.add(3),  saved_r11);
+            core::ptr::write_volatile(gregs.add(4),  saved_r12);
+            core::ptr::write_volatile(gregs.add(5),  saved_r13);
+            core::ptr::write_volatile(gregs.add(6),  saved_r14);
+            core::ptr::write_volatile(gregs.add(7),  saved_r15);
+            core::ptr::write_volatile(gregs.add(8),  saved_rdi);
+            core::ptr::write_volatile(gregs.add(9),  saved_rsi);
+            core::ptr::write_volatile(gregs.add(10), saved_rbp);
+            core::ptr::write_volatile(gregs.add(11), saved_rbx);
+            core::ptr::write_volatile(gregs.add(12), saved_rdx);
+            core::ptr::write_volatile(gregs.add(13), saved_rcx);
+            core::ptr::write_volatile(gregs.add(14), frame_rax);
+            core::ptr::write_volatile(gregs.add(15), 0);          // trapno
+            core::ptr::write_volatile(gregs.add(16), 0);          // err
+            core::ptr::write_volatile(gregs.add(17), saved_rip);
+            core::ptr::write_volatile(gregs.add(18), 0x33);       // CS (user code segment)
+            core::ptr::write_volatile(gregs.add(19), saved_rflags);
+            core::ptr::write_volatile(gregs.add(20), saved_rsp);
+            core::ptr::write_volatile(gregs.add(21), 0x2B);       // SS (user data segment)
+        }
+
+        (si_rsp, uc_rsp, si_rsp)
+    } else {
+        (0u64, 0u64, base_rsp)
+    };
+
+    // ── Build SignalFrame below the extras (or directly below base_rsp) ──
     let frame_size = SIGNAL_FRAME_SIZE as u64;
-    let frame_rsp = (saved_rsp - frame_size) & !0xF;
+    let frame_rsp = (stack_after_extras - frame_size) & !0xF;
     let entry_rsp = frame_rsp - 8;
 
     unsafe {
@@ -323,13 +432,20 @@ pub(crate) fn signal_deliver(ep_cap: u64, pid: usize, sig: u64, child_tid: u64, 
     let cur_mask = p.sig_blocked.load(Ordering::Acquire);
     p.sig_blocked.store(cur_mask | (1 << sig), Ordering::Release);
 
+    // ── SIG_REDIRECT_TAG reply ──
+    // regs[0] = handler (→ RCX/RIP)
+    // regs[1] = sig (→ RDI, arg0)
+    // regs[2] = &siginfo (→ RSI, arg1) — 0 if not SA_SIGINFO
+    // regs[3] = &ucontext (→ RDX, arg2) — 0 if not SA_SIGINFO
+    // regs[4] = entry_rsp (→ RSP)
+    // regs[5] = RAX (0 for signals)
     let reply = IpcMsg {
         tag: SIG_REDIRECT_TAG,
         regs: [
             handler,
             sig,
-            0,
-            0,
+            siginfo_ptr,
+            ucontext_ptr,
             entry_rsp,
             0, 0, 0,
         ],

@@ -109,7 +109,25 @@ pub(crate) fn sys_socket(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let sock_type = msg.regs[1] as u32;
     let base_type = sock_type & 0xFF;
     let sock_nonblock = sock_type & 0x800; // SOCK_NONBLOCK
-    if domain == 2 && (base_type == 1 || base_type == 2 || base_type == 3) {
+    if domain == 1 {
+        // AF_UNIX: allocate a local-only socket FD (kind=26).
+        // No net service IPC needed — Wine just needs a valid FD.
+        let mut fd = None;
+        for f in 3..GRP_MAX_FDS {
+            if ctx.child_fds[f] == 0 { fd = Some(f); break; }
+        }
+        match fd {
+            Some(f) => {
+                ctx.child_fds[f] = 26; // kind 26 = AF_UNIX socket
+                if sock_nonblock != 0 {
+                    ctx.fd_flags[f] = 0x800; // O_NONBLOCK
+                }
+                ctx.sock_conn_id[f] = 0xFFFF;
+                reply_val(ep_cap, f as i64);
+            }
+            None => reply_val(ep_cap, -EMFILE),
+        }
+    } else if domain == 2 && (base_type == 1 || base_type == 2 || base_type == 3) {
         let net_cap = NET_EP_CAP.load(Ordering::Acquire);
         if net_cap == 0 {
             reply_val(ep_cap, -EADDRNOTAVAIL);
@@ -152,8 +170,11 @@ pub(crate) fn sys_connect(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let pid = ctx.pid;
     let fd = msg.regs[0] as usize;
     let sockaddr_ptr = msg.regs[1];
-    if fd >= GRP_MAX_FDS || (ctx.child_fds[fd] != 16 && ctx.child_fds[fd] != 17) {
+    if fd >= GRP_MAX_FDS || (ctx.child_fds[fd] != 16 && ctx.child_fds[fd] != 17 && ctx.child_fds[fd] != 26) {
         reply_val(ep_cap, -EBADF);
+    } else if ctx.child_fds[fd] == 26 {
+        // AF_UNIX connect: no wineserver running, return -ECONNREFUSED.
+        reply_val(ep_cap, -ECONNREFUSED);
     } else {
         let sa = unsafe { core::slice::from_raw_parts(sockaddr_ptr as *const u8, 8) };
         let port = u16::from_be_bytes([sa[2], sa[3]]);
@@ -217,7 +238,12 @@ pub(crate) fn sys_sendto(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let len = msg.regs[2] as usize;
     let dest_ptr = msg.regs[4];
 
-    if fd >= GRP_MAX_FDS || (ctx.child_fds[fd] != 16 && ctx.child_fds[fd] != 17) {
+    if fd >= GRP_MAX_FDS {
+        reply_val(ep_cap, -EBADF);
+    } else if ctx.child_fds[fd] == 26 {
+        // AF_UNIX sendto: no peer connected
+        reply_val(ep_cap, -EAGAIN);
+    } else if ctx.child_fds[fd] != 16 && ctx.child_fds[fd] != 17 {
         reply_val(ep_cap, -EBADF);
     } else if ctx.child_fds[fd] == 17 {
         // UDP sendto
@@ -290,7 +316,16 @@ pub(crate) fn sys_sendmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let fd = msg.regs[0] as usize;
     let msghdr_ptr = msg.regs[1];
 
-    if fd >= GRP_MAX_FDS || (ctx.child_fds[fd] != 16 && ctx.child_fds[fd] != 17) {
+    if fd >= GRP_MAX_FDS {
+        reply_val(ep_cap, -EBADF);
+        return;
+    }
+    // AF_UNIX socket: no peer connected, return -EAGAIN
+    if ctx.child_fds[fd] == 26 {
+        reply_val(ep_cap, -EAGAIN);
+        return;
+    }
+    if ctx.child_fds[fd] != 16 && ctx.child_fds[fd] != 17 {
         reply_val(ep_cap, -EBADF);
         return;
     }
@@ -381,7 +416,12 @@ pub(crate) fn sys_recvfrom(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let src_addr_ptr = msg.regs[4];
     let addrlen_ptr = msg.regs[5];
 
-    if fd >= GRP_MAX_FDS || (ctx.child_fds[fd] != 16 && ctx.child_fds[fd] != 17) {
+    if fd >= GRP_MAX_FDS {
+        reply_val(ep_cap, -EBADF);
+    } else if ctx.child_fds[fd] == 26 {
+        // AF_UNIX recvfrom: no data
+        reply_val(ep_cap, -EAGAIN);
+    } else if ctx.child_fds[fd] != 16 && ctx.child_fds[fd] != 17 {
         reply_val(ep_cap, -EBADF);
     } else if ctx.child_fds[fd] == 17 {
         // UDP recvfrom
@@ -479,7 +519,16 @@ pub(crate) fn sys_recvmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let fd = msg.regs[0] as usize;
     let msghdr_ptr = msg.regs[1];
 
-    if fd >= GRP_MAX_FDS || (ctx.child_fds[fd] != 16 && ctx.child_fds[fd] != 17) {
+    if fd >= GRP_MAX_FDS {
+        reply_val(ep_cap, -EBADF);
+        return;
+    }
+    // AF_UNIX socket: no data to receive
+    if ctx.child_fds[fd] == 26 {
+        reply_val(ep_cap, -EAGAIN);
+        return;
+    }
+    if ctx.child_fds[fd] != 16 && ctx.child_fds[fd] != 17 {
         reply_val(ep_cap, -EBADF);
         return;
     }
@@ -599,10 +648,31 @@ pub(crate) fn sys_bind_listen_setsockopt(ctx: &mut SyscallContext, _msg: &IpcMsg
 
 pub(crate) fn sys_getsockname(ctx: &mut SyscallContext, msg: &IpcMsg, syscall_nr: u64) {
     let ep_cap = ctx.ep_cap;
+    let fd = msg.regs[0] as usize;
     let sockaddr_ptr = msg.regs[1];
     let addrlen_ptr = msg.regs[2];
+
+    // AF_UNIX getpeername → -ENOTCONN (no peer), getsockname → 0 with zeroed addr
+    if fd < GRP_MAX_FDS && ctx.child_fds[fd] == 26 {
+        if syscall_nr == SYS_GETPEERNAME {
+            reply_val(ep_cap, -ENOTCONN);
+            return;
+        }
+        // getsockname: return zeroed AF_UNIX sockaddr
+        if sockaddr_ptr != 0 {
+            unsafe {
+                core::ptr::write_bytes(sockaddr_ptr as *mut u8, 0, 110);
+                *(sockaddr_ptr as *mut u16) = 1; // AF_UNIX
+            }
+        }
+        if addrlen_ptr != 0 {
+            unsafe { *(addrlen_ptr as *mut u32) = 2; } // just sa_family
+        }
+        reply_val(ep_cap, 0);
+        return;
+    }
+
     if sockaddr_ptr != 0 {
-        let fd = msg.regs[0] as usize;
         let sa = sockaddr_ptr as *mut u8;
         unsafe {
             core::ptr::write_bytes(sa, 0, 16);
@@ -865,6 +935,12 @@ pub(crate) fn sys_socketpair(ctx: &mut SyscallContext, msg: &IpcMsg) {
     } else { reply_val(ep_cap, -EMFILE); }
 }
 
-pub(crate) fn sys_accept(ctx: &mut SyscallContext, _msg: &IpcMsg) {
-    reply_val(ctx.ep_cap, -EAGAIN);
+pub(crate) fn sys_accept(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let fd = msg.regs[0] as usize;
+    if fd < GRP_MAX_FDS && ctx.child_fds[fd] == 26 {
+        // AF_UNIX accept: no incoming connections
+        reply_val(ctx.ep_cap, -EAGAIN);
+    } else {
+        reply_val(ctx.ep_cap, -EAGAIN);
+    }
 }

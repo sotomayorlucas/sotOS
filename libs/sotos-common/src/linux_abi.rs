@@ -188,6 +188,12 @@ pub const SIG_IGN: u64 = 1;
 pub const SA_RESTORER: u64 = k::SA_RESTORER as u64;
 pub const SA_SIGINFO: u64  = k::SA_SIGINFO as u64;
 pub const SA_RESTART: u64  = k::SA_RESTART as u64;
+pub const SA_ONSTACK: u64  = k::SA_ONSTACK as u64;
+
+// sigaltstack constants
+pub const SS_ONSTACK: u64 = 1;
+pub const SS_DISABLE: u64 = 2;
+pub const MINSIGSTKSZ: u64 = 2048;
 
 // ---------------------------------------------------------------
 // Signal numbers — sourced from linux-raw-sys
@@ -247,6 +253,7 @@ pub const EAFNOSUPPORT: i64 = e::EAFNOSUPPORT as i64;
 pub const EADDRNOTAVAIL: i64 = e::EADDRNOTAVAIL as i64;
 pub const ETIMEDOUT: i64 = e::ETIMEDOUT as i64;
 pub const ECONNREFUSED: i64 = e::ECONNREFUSED as i64;
+pub const ENOTCONN: i64 = e::ENOTCONN as i64;
 
 // ---------------------------------------------------------------
 // open(2) / openat(2) flags — sourced from linux-raw-sys

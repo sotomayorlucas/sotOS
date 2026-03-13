@@ -130,14 +130,71 @@ pub(crate) fn sys_rt_sigprocmask(ctx: &mut SyscallContext, msg: &IpcMsg) {
 
 // ─── SYS_SIGALTSTACK (131) ──────────────────────────────────────
 
-/// SYS_SIGALTSTACK (131): stub returning SS_DISABLE.
+/// SYS_SIGALTSTACK (131): get/set alternate signal stack.
+/// Linux signature: sigaltstack(const stack_t *ss, stack_t *old_ss)
+/// stack_t layout (24 bytes): { ss_sp: *mut void (8), ss_flags: i32 (padded to 8), ss_size: usize (8) }
+/// msg.regs[7] = caller's user RSP (passed by kernel in IPC redirect).
 pub(crate) fn sys_sigaltstack(ctx: &mut SyscallContext, msg: &IpcMsg) {
-    let old_ss = msg.regs[1];
+    let new_ss = msg.regs[0]; // 1st arg: pointer to new stack_t (or 0/NULL)
+    let old_ss = msg.regs[1]; // 2nd arg: pointer to old stack_t output (or 0/NULL)
+    let caller_rsp = msg.regs[7]; // user RSP at syscall entry
+    let idx = ctx.pid - 1;
+    let p = &PROCESSES[idx];
+
+    // Compute whether the caller is currently on the alt stack
+    let cur_sp = p.sig_alt_sp.load(Ordering::Acquire);
+    let cur_flags = p.sig_alt_flags.load(Ordering::Acquire);
+    let cur_size = p.sig_alt_size.load(Ordering::Acquire);
+    let on_altstack = cur_flags != SS_DISABLE
+        && cur_sp != 0 && cur_size != 0
+        && caller_rsp >= cur_sp && caller_rsp < cur_sp + cur_size;
+
+    // Write current alt stack state to old_ss if non-null
     if old_ss != 0 && old_ss < 0x0000_8000_0000_0000 {
-        let buf = unsafe { core::slice::from_raw_parts_mut(old_ss as *mut u8, 24) };
-        for b in buf.iter_mut() { *b = 0; }
-        buf[8..12].copy_from_slice(&2u32.to_le_bytes());
+        let report_flags = if cur_flags == SS_DISABLE {
+            SS_DISABLE
+        } else if on_altstack {
+            SS_ONSTACK
+        } else {
+            0 // enabled, not currently on it
+        };
+        unsafe {
+            // stack_t { ss_sp (+0), ss_flags (+8), ss_size (+16) }
+            core::ptr::write_volatile(old_ss as *mut u64, cur_sp);
+            core::ptr::write_volatile((old_ss + 8) as *mut u64, report_flags);
+            core::ptr::write_volatile((old_ss + 16) as *mut u64, cur_size);
+        }
     }
+
+    // Read and apply new alt stack from new_ss if non-null
+    if new_ss != 0 && new_ss < 0x0000_8000_0000_0000 {
+        // Cannot change alt stack while currently on it
+        if on_altstack {
+            reply_val(ctx.ep_cap, -EPERM);
+            return;
+        }
+
+        let ss_sp = unsafe { core::ptr::read_volatile(new_ss as *const u64) };
+        let ss_flags = unsafe { core::ptr::read_volatile((new_ss + 8) as *const u64) };
+        let ss_size = unsafe { core::ptr::read_volatile((new_ss + 16) as *const u64) };
+
+        if ss_flags & SS_DISABLE != 0 {
+            // Disabling alt stack
+            p.sig_alt_sp.store(0, Ordering::Release);
+            p.sig_alt_size.store(0, Ordering::Release);
+            p.sig_alt_flags.store(SS_DISABLE, Ordering::Release);
+        } else {
+            // Enabling alt stack — validate size
+            if ss_size < MINSIGSTKSZ {
+                reply_val(ctx.ep_cap, -ENOMEM);
+                return;
+            }
+            p.sig_alt_sp.store(ss_sp, Ordering::Release);
+            p.sig_alt_size.store(ss_size, Ordering::Release);
+            p.sig_alt_flags.store(0, Ordering::Release); // enabled
+        }
+    }
+
     reply_val(ctx.ep_cap, 0);
 }
 

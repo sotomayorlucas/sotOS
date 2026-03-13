@@ -25,6 +25,9 @@ pub(crate) enum FdKind {
     EpollFd = 9,     // epoll instance
     DevUrandom = 10, // /dev/urandom, /dev/random
     DevZero = 11,    // /dev/zero
+    // 12=initrd file, 13=VFS file, 14=VFS dir, 15=virtual file,
+    // 16=TCP socket, 17=UDP socket, 20=DevUrandom, 21=epoll,
+    // 22=eventfd, 23=timerfd, 25=memfd, 26=UnixSocket (AF_UNIX)
 }
 
 #[derive(Clone, Copy)]
