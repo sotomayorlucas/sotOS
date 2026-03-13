@@ -97,11 +97,35 @@ pub(crate) fn sys_setitimer(ctx: &mut SyscallContext, msg: &IpcMsg) {
 pub(crate) fn sys_sysinfo(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let buf = msg.regs[0] as *mut u8;
     if !buf.is_null() {
-        unsafe { core::ptr::write_bytes(buf, 0, 128); }
+        // struct sysinfo is 112 bytes on x86_64
+        unsafe { core::ptr::write_bytes(buf, 0, 112); }
         let tsc = rdtsc();
         let boot_tsc = BOOT_TSC.load(Ordering::Acquire);
         let secs = if tsc > boot_tsc { (tsc - boot_tsc) / 2_000_000_000 } else { 0 };
-        unsafe { *(buf as *mut u64) = secs + UPTIME_OFFSET_SECS; } // uptime with offset
+        unsafe {
+            // offset 0: uptime (i64)
+            *(buf as *mut u64) = secs + UPTIME_OFFSET_SECS;
+            // offset 32: totalram (u64) — report 1 GiB
+            *((buf.add(32)) as *mut u64) = 1024 * 1024 * 1024;
+            // offset 40: freeram (u64) — report 512 MiB
+            *((buf.add(40)) as *mut u64) = 512 * 1024 * 1024;
+            // offset 48: sharedram
+            *((buf.add(48)) as *mut u64) = 0;
+            // offset 56: bufferram
+            *((buf.add(56)) as *mut u64) = 0;
+            // offset 64: totalswap
+            *((buf.add(64)) as *mut u64) = 0;
+            // offset 72: freeswap
+            *((buf.add(72)) as *mut u64) = 0;
+            // offset 80: procs (u16)
+            *((buf.add(80)) as *mut u16) = 1;
+            // offset 88: totalhigh
+            *((buf.add(88)) as *mut u64) = 0;
+            // offset 96: freehigh
+            *((buf.add(96)) as *mut u64) = 0;
+            // offset 104: mem_unit (u32) — 1 byte
+            *((buf.add(104)) as *mut u32) = 1;
+        }
     }
     reply_val(ctx.ep_cap, 0);
 }
@@ -186,14 +210,35 @@ pub(crate) fn sys_getrandom(ctx: &mut SyscallContext, msg: &IpcMsg) {
 pub(crate) fn sys_prctl(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let option = msg.regs[0] as u32;
     match option {
-        15 => { // PR_SET_NAME: ignore
+        15 => { // PR_SET_NAME: store in proc_name
+            let buf = msg.regs[1];
+            if buf != 0 && ctx.pid > 0 && ctx.pid <= MAX_PROCS {
+                let mut raw = [0u8; 16];
+                unsafe { core::ptr::copy_nonoverlapping(buf as *const u8, raw.as_mut_ptr(), 16); }
+                // NUL-terminate at 15
+                raw[15] = 0;
+                let w0 = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+                let w1 = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+                PROCESSES[ctx.pid - 1].proc_name[0].store(w0, Ordering::Release);
+                PROCESSES[ctx.pid - 1].proc_name[1].store(w1, Ordering::Release);
+            }
             reply_val(ctx.ep_cap, 0);
         }
-        16 => { // PR_GET_NAME: return "program"
+        16 => { // PR_GET_NAME: return stored name (or "program" default)
             let buf = msg.regs[1];
-            if buf != 0 {
-                let name = b"program\0\0\0\0\0\0\0\0\0";
-                unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), buf as *mut u8, 16); }
+            if buf != 0 && ctx.pid > 0 && ctx.pid <= MAX_PROCS {
+                let w0 = PROCESSES[ctx.pid - 1].proc_name[0].load(Ordering::Acquire);
+                let w1 = PROCESSES[ctx.pid - 1].proc_name[1].load(Ordering::Acquire);
+                if w0 == 0 && w1 == 0 {
+                    // No name set — return "program"
+                    let name = b"program\0\0\0\0\0\0\0\0\0";
+                    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), buf as *mut u8, 16); }
+                } else {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(&w0 as *const u64 as *const u8, buf as *mut u8, 8);
+                        core::ptr::copy_nonoverlapping(&w1 as *const u64 as *const u8, (buf + 8) as *mut u8, 8);
+                    }
+                }
             }
             reply_val(ctx.ep_cap, 0);
         }

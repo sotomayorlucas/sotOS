@@ -2402,6 +2402,27 @@ pub(crate) fn sys_fstatat(ctx: &mut SyscallContext, msg: &IpcMsg) {
     }
 }
 
+/// Helper: get /proc/self/exe path for a given pid.
+fn proc_self_exe(pid: usize) -> [u8; 32] {
+    let mut buf = [0u8; 32];
+    if pid > 0 && pid <= MAX_PROCS {
+        let w0 = PROCESSES[pid - 1].exe_path[0].load(Ordering::Acquire);
+        let w1 = PROCESSES[pid - 1].exe_path[1].load(Ordering::Acquire);
+        let w2 = PROCESSES[pid - 1].exe_path[2].load(Ordering::Acquire);
+        let w3 = PROCESSES[pid - 1].exe_path[3].load(Ordering::Acquire);
+        if w0 != 0 {
+            buf[0..8].copy_from_slice(&w0.to_le_bytes());
+            buf[8..16].copy_from_slice(&w1.to_le_bytes());
+            buf[16..24].copy_from_slice(&w2.to_le_bytes());
+            buf[24..32].copy_from_slice(&w3.to_le_bytes());
+            return buf;
+        }
+    }
+    // Default fallback
+    buf[..12].copy_from_slice(b"/bin/program");
+    buf
+}
+
 /// SYS_READLINKAT (267): read symbolic link.
 pub(crate) fn sys_readlinkat(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let path_ptr = msg.regs[1];
@@ -2410,13 +2431,12 @@ pub(crate) fn sys_readlinkat(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let mut rpath = [0u8; 64];
     let rpath_len = copy_guest_path(path_ptr, &mut rpath);
     if rpath_len >= 14 && &rpath[..14] == b"/proc/self/exe" {
-        let exe = b"/bin/program";
-        let n = exe.len().min(bufsiz);
+        let exe = proc_self_exe(ctx.pid);
+        let elen = exe.iter().position(|&b| b == 0).unwrap_or(exe.len());
+        let n = elen.min(bufsiz);
         if out_buf != 0 && out_buf < 0x0000_8000_0000_0000 {
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    exe.as_ptr(), out_buf as *mut u8, n,
-                );
+                core::ptr::copy_nonoverlapping(exe.as_ptr(), out_buf as *mut u8, n);
             }
         }
         reply_val(ctx.ep_cap, n as i64);
@@ -2618,8 +2638,9 @@ pub(crate) fn sys_readlink(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let plen = copy_guest_path(path_ptr, &mut path);
     let name = &path[..plen];
     if name == b"/proc/self/exe" {
-        let target = b"/bin/program";
-        let n = target.len().min(bufsiz);
+        let target = proc_self_exe(ctx.pid);
+        let tlen = target.iter().position(|&b| b == 0).unwrap_or(target.len());
+        let n = tlen.min(bufsiz);
         unsafe { core::ptr::copy_nonoverlapping(target.as_ptr(), buf as *mut u8, n); }
         reply_val(ctx.ep_cap, n as i64);
     } else { reply_val(ctx.ep_cap, -EINVAL); }

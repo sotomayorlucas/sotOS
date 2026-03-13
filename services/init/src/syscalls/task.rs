@@ -94,14 +94,36 @@ pub(crate) fn sys_set_tid_address(ctx: &mut SyscallContext, msg: &IpcMsg) {
     reply_val(ctx.ep_cap, ctx.pid as i64);
 }
 
-/// SYS_SET_ROBUST_LIST (273): stub.
-pub(crate) fn sys_set_robust_list(ctx: &mut SyscallContext, _msg: &IpcMsg) {
+/// SYS_SET_ROBUST_LIST (273): store robust futex list pointer.
+pub(crate) fn sys_set_robust_list(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let head = msg.regs[0];
+    let len = msg.regs[1];
+    if ctx.pid > 0 && ctx.pid <= MAX_PROCS {
+        PROCESSES[ctx.pid - 1].robust_list_head.store(head, Ordering::Release);
+        PROCESSES[ctx.pid - 1].robust_list_len.store(len, Ordering::Release);
+    }
     reply_val(ctx.ep_cap, 0);
 }
 
-/// SYS_GET_ROBUST_LIST (274): not supported.
-pub(crate) fn sys_get_robust_list(ctx: &mut SyscallContext, _msg: &IpcMsg) {
-    reply_val(ctx.ep_cap, -ENOSYS);
+/// SYS_GET_ROBUST_LIST (274): retrieve robust futex list pointer.
+pub(crate) fn sys_get_robust_list(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let pid_arg = msg.regs[0] as usize;
+    let head_ptr = msg.regs[1]; // user pointer to write head
+    let len_ptr = msg.regs[2];  // user pointer to write len
+    let target_pid = if pid_arg == 0 { ctx.pid } else { pid_arg };
+    if target_pid == 0 || target_pid > MAX_PROCS {
+        reply_val(ctx.ep_cap, -ESRCH);
+        return;
+    }
+    let head = PROCESSES[target_pid - 1].robust_list_head.load(Ordering::Acquire);
+    let len = PROCESSES[target_pid - 1].robust_list_len.load(Ordering::Acquire);
+    if head_ptr != 0 {
+        unsafe { *(head_ptr as *mut u64) = head; }
+    }
+    if len_ptr != 0 {
+        unsafe { *(len_ptr as *mut u64) = len; }
+    }
+    reply_val(ctx.ep_cap, 0);
 }
 
 // ─── Signals ────────────────────────────────────────────────────
@@ -193,32 +215,12 @@ fn exit_cleanup(ctx: &mut SyscallContext, status: u64) {
     // makes the process exit non-zero. Treat as clean exit (0) so the
     // parent (git) sees a successful helper exit.
     let status = if status != 0 && pid < 16 && unsafe { crate::child_handler::DEADLOCK_EOF[pid] } {
-        crate::framebuffer::print(b"DL-EOF: P");
-        crate::framebuffer::print_u64(pid as u64);
-        crate::framebuffer::print(b" status ");
-        crate::framebuffer::print_u64(status);
-        crate::framebuffer::print(b"->0\n");
         unsafe { crate::child_handler::DEADLOCK_EOF[pid] = false; }
         0
     } else {
         status
     };
     let memg = PROCESSES[pid - 1].mem_group.load(Ordering::Acquire) as usize;
-    crate::framebuffer::print(b"EXIT pid=");
-    crate::framebuffer::print_u64(pid as u64);
-    crate::framebuffer::print(b" status=");
-    crate::framebuffer::print_u64(status);
-    // Dump pipe state on exit for corruption diagnosis
-    crate::framebuffer::print(b" pipes:[");
-    for pp in 0..MAX_PIPES {
-        crate::framebuffer::print_u64(pp as u64);
-        crate::framebuffer::print(b"=W");
-        crate::framebuffer::print_u64(PIPE_WRITE_REFS[pp].load(Ordering::Acquire));
-        crate::framebuffer::print(b"/C");
-        crate::framebuffer::print_u64(PIPE_WRITE_CLOSED[pp].load(Ordering::Acquire));
-        if pp < MAX_PIPES - 1 { crate::framebuffer::print(b" "); }
-    }
-    crate::framebuffer::print(b"]\n");
     if memg >= MAX_PROCS { return; }
 
     // CLONE_CHILD_CLEARTID: write 0 to *clear_child_tid + futex_wake
@@ -303,10 +305,6 @@ fn exit_cleanup(ctx: &mut SyscallContext, status: u64) {
             if pipe_id < MAX_PIPES {
                 let prev = PIPE_WRITE_REFS[pipe_id].fetch_sub(1, Ordering::AcqRel);
                 if prev <= 1 {
-                    crate::framebuffer::print(b"PWC-SET exit P"); crate::framebuffer::print_u64(ctx.pid as u64);
-                    crate::framebuffer::print(b" pipe="); crate::framebuffer::print_u64(pipe_id as u64);
-                    crate::framebuffer::print(b" wrefs="); crate::framebuffer::print_u64(prev);
-                    crate::framebuffer::print(b"\n");
                     PIPE_WRITE_CLOSED[pipe_id].store(1, Ordering::Release);
                     if PIPE_READ_CLOSED[pipe_id].load(Ordering::Acquire) != 0 {
                         pipe_free(pipe_id);

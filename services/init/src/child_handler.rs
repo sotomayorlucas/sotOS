@@ -719,6 +719,25 @@ pub(crate) extern "C" fn child_handler() -> ! {
                                 // Heap (starts empty, grows via brk)
                                 vl.insert(my_brk_base, my_brk_base, 3, 0x22, VmaLabel::Heap);
                             }
+                            // Store exe_path for /proc/self/exe
+                            {
+                                let mut path_buf = [0u8; 32];
+                                let src = if !bin_name.is_empty() && bin_name[0] == b'/' {
+                                    bin_name
+                                } else {
+                                    name
+                                };
+                                let n = src.len().min(31);
+                                path_buf[..n].copy_from_slice(&src[..n]);
+                                let w0 = u64::from_le_bytes(path_buf[0..8].try_into().unwrap());
+                                let w1 = u64::from_le_bytes(path_buf[8..16].try_into().unwrap());
+                                let w2 = u64::from_le_bytes(path_buf[16..24].try_into().unwrap());
+                                let w3 = u64::from_le_bytes(path_buf[24..32].try_into().unwrap());
+                                PROCESSES[pid - 1].exe_path[0].store(w0, Ordering::Release);
+                                PROCESSES[pid - 1].exe_path[1].store(w1, Ordering::Release);
+                                PROCESSES[pid - 1].exe_path[2].store(w2, Ordering::Release);
+                                PROCESSES[pid - 1].exe_path[3].store(w3, Ordering::Release);
+                            }
                         }
                         EXEC_LOCK.store(0, Ordering::Release);
                         ep_cap = new_ep;

@@ -61,6 +61,16 @@ pub(crate) struct ProcessState {
     pub sig_alt_sp: AtomicU64,          // ss_sp (stack base pointer)
     pub sig_alt_size: AtomicU64,        // ss_size (stack size in bytes)
     pub sig_alt_flags: AtomicU64,       // ss_flags (0=enabled, SS_ONSTACK=1, SS_DISABLE=2)
+
+    // Robust futex list (set_robust_list/get_robust_list)
+    pub robust_list_head: AtomicU64,    // pointer to robust_list_head struct
+    pub robust_list_len: AtomicU64,     // length argument from set_robust_list
+
+    // Process name (prctl PR_SET_NAME, 16 bytes max including NUL)
+    pub proc_name: [AtomicU64; 2],      // 16 bytes stored as 2×u64
+
+    // Executable path for /proc/self/exe (set at exec time)
+    pub exe_path: [AtomicU64; 4],       // up to 32 bytes (NUL-terminated)
 }
 
 impl ProcessState {
@@ -92,6 +102,10 @@ impl ProcessState {
             sig_alt_sp: AtomicU64::new(0),
             sig_alt_size: AtomicU64::new(0),
             sig_alt_flags: AtomicU64::new(2), // SS_DISABLE
+            robust_list_head: AtomicU64::new(0),
+            robust_list_len: AtomicU64::new(0),
+            proc_name: [const { AtomicU64::new(0) }; 2],
+            exe_path: [const { AtomicU64::new(0) }; 4],
         }
     }
 }
