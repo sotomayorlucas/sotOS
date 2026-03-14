@@ -280,14 +280,7 @@ pub(crate) fn sys_read(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     }
                 }
             }
-            // Log TCP read results for P5 (git-remote-https TLS debugging)
-            if ctx.pid == 5 && (total > 0 || saw_eof) {
-                print(b"TCP-RD P5 ");
-                if saw_eof { print(b"EOF "); }
-                print(b"t="); print_u64(total as u64);
-                print(b" req="); print_u64(max_read as u64);
-                print(b"\n");
-            }
+            // TCP read tracing disabled to reduce serial overhead during clone
             if total > 0 {
                 reply_val(ctx.ep_cap, total as i64);
             } else if saw_eof {
@@ -566,8 +559,8 @@ pub(crate) fn sys_write(ctx: &mut SyscallContext, msg: &IpcMsg) {
             let mut local_buf = [0u8; 4096];
             ctx.guest_read(buf_ptr, &mut local_buf[..safe_len]);
             let src = &local_buf[..safe_len];
-            // Log pipe write data for git debugging
-            if ctx.pid >= 3 {
+            // Pipe write tracing (disabled during clone to reduce serial overhead)
+            if false && ctx.pid >= 3 {
                 print(b"PIPE-W P"); print_u64(ctx.pid as u64);
                 print(b" fd="); print_u64(fd as u64);
                 print(b" len="); print_u64(len as u64);
@@ -1621,12 +1614,7 @@ pub(crate) fn sys_readv(ctx: &mut SyscallContext, msg: &IpcMsg) {
             }
             if off == 0 && !saw_eof { break; }
         }
-        if ctx.pid == 5 && (total > 0 || saw_eof) {
-            print(b"TCP-RV P5 ");
-            if saw_eof { print(b"EOF "); }
-            print(b"t="); print_u64(total as u64);
-            print(b"\n");
-        }
+        // TCP readv tracing disabled
         if total > 0 {
             reply_val(ctx.ep_cap, total as i64);
         } else if saw_eof {
@@ -1829,8 +1817,8 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let pipe_id = ctx.sock_conn_id[fd] as usize;
         let cnt = iovcnt.min(16);
         let mut total = 0usize;
-        // Log all iovec content for git debugging
-        if ctx.pid >= 3 && cnt > 0 {
+        // Pipe writev tracing disabled during clone
+        if false && ctx.pid >= 3 && cnt > 0 {
             // Compute total length
             let mut tlen = 0usize;
             for j in 0..cnt {

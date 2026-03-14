@@ -400,23 +400,10 @@ pub(crate) extern "C" fn child_handler() -> ! {
         // PIPE_RETRY_TAG it will re-increment via mark_pipe_retry().
         clear_pipe_retry(pid);
 
-        // Trace syscalls from separate-AS children (per-AS exec)
-        // Suppress high-frequency syscalls that flood serial during Wine startup
-        if (child_as_cap != 0 || pid == 3 || pid == 5)
-           && syscall_nr != 0  // read
-           && syscall_nr != 1  // write
-           && syscall_nr != 3  // close
-           && syscall_nr != 7  // poll
-           && syscall_nr != 9  // mmap (has its own MMAP log)
-           && syscall_nr != 14 // rt_sigprocmask
-           && syscall_nr != 17 // pread64
-           && syscall_nr != 20 // writev
-           && syscall_nr != 47 // recvmsg
-           && syscall_nr != 232 // epoll_wait
-           && syscall_nr != 257 // openat (has OPENAT log)
-           && syscall_nr != 262 // fstatat (has FSTATAT log)
-           && syscall_nr != 281 // epoll_pwait
-        {
+        // Trace syscalls — disabled during git clone to reduce serial overhead.
+        // 43K+ lines of AS-SYS tracing cause ~5s of serial I/O per second,
+        // which disrupts TLS session timing and causes false #GP crashes.
+        if false {
             print(b"AS-SYS P"); print_u64(pid as u64);
             print(b" #"); print_u64(syscall_nr);
             print(b" a0="); crate::framebuffer::print_hex64(msg.regs[0]);

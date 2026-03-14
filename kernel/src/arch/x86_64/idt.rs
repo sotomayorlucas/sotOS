@@ -216,6 +216,10 @@ extern "x86-interrupt" fn general_protection_handler(frame: InterruptStackFrame,
             "#GP(user) tid={} code={} rip={:#x} rsp={:#x}",
             tid, code, rip, frame.stack_pointer.as_u64()
         );
+        // Dump instruction bytes at crash RIP
+        let bytes = unsafe { core::slice::from_raw_parts(rip as *const u8, 16) };
+        kprintln!("#GP bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
         // Set SIGSEGV pending so parent sees WIFSIGNALED, then exit thread.
         if let Some(tid) = crate::sched::current_tid() {
             crate::sched::set_pending_signal(tid, 11);
