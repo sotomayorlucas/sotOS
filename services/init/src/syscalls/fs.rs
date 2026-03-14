@@ -252,10 +252,10 @@ pub(crate) fn sys_read(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     Ok(resp) => {
                         let n = resp.tag as usize; // tag = byte count
                         if n > 0 && n <= recv_len {
-                            unsafe {
-                                let src = &resp.regs[0] as *const u64 as *const u8; // data at regs[0]
-                                core::ptr::copy_nonoverlapping(src, buf_ptr as *mut u8, n);
-                            }
+                            let src = unsafe {
+                                core::slice::from_raw_parts(&resp.regs[0] as *const u64 as *const u8, n)
+                            };
+                            ctx.guest_write(buf_ptr, src);
                             got = n;
                             break;
                         }
@@ -1171,7 +1171,7 @@ pub(crate) fn sys_open(ctx: &mut SyscallContext, msg: &IpcMsg) {
         }
     } else if starts_with(name, b"/etc/") || starts_with(name, b"/proc/")
            || starts_with(name, b"/sys/") {
-        // Virtual files — same logic as SYS_OPENAT
+        // Virtual files first, then fall through to VFS for real /etc/ files
         let virt_len = open_virtual_file(name, ctx.dir_buf);
         if let Some(gen_len) = virt_len {
             *ctx.dir_len = gen_len;
@@ -1185,7 +1185,32 @@ pub(crate) fn sys_open(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 reply_val(ctx.ep_cap, -EMFILE);
             }
         } else {
-            reply_val(ctx.ep_cap, -ENOENT);
+            // Not a known virtual file — try VFS disk (e.g., /etc/ssl/cert.pem)
+            vfs_lock();
+            let vfs_found = unsafe { shared_store() }.and_then(|store| {
+                use sotos_objstore::ROOT_OID;
+                if let Ok(oid) = store.resolve_path(name, ROOT_OID) {
+                    let entry = store.stat(oid)?;
+                    Some((oid, entry.size, entry.is_dir()))
+                } else { None }
+            });
+            vfs_unlock();
+            if let Some((oid, size, is_dir)) = vfs_found {
+                let mut vslot = None;
+                for s in 0..GRP_MAX_VFS { if ctx.vfs_files[s][0] == 0 { vslot = Some(s); break; } }
+                let mut fd = None;
+                for i in 3..GRP_MAX_FDS { if ctx.child_fds[i] == 0 { fd = Some(i); break; } }
+                if let (Some(vs), Some(f)) = (vslot, fd) {
+                    ctx.child_fds[f] = if is_dir { 14 } else { 13 };
+                    ctx.vfs_files[vs] = [oid, size, 0, f as u64];
+                    ctx.fd_flags[f] = flags;
+                    reply_val(ctx.ep_cap, f as i64);
+                } else {
+                    reply_val(ctx.ep_cap, -EMFILE);
+                }
+            } else {
+                reply_val(ctx.ep_cap, -ENOENT);
+            }
         }
     } else if name == b"/" || name == b"/bin" || name == b"/lib"
            || name == b"/lib64" || name == b"/sbin" || name == b"/tmp"
@@ -1540,9 +1565,8 @@ pub(crate) fn sys_readv(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let cnt = iovcnt.min(16);
         for i in 0..cnt {
             let entry = iov_ptr + (i as u64) * 16;
-            if entry + 16 > 0x0000_8000_0000_0000 { break; }
-            let base = unsafe { *(entry as *const u64) };
-            let ilen = unsafe { *((entry + 8) as *const u64) } as usize;
+            let base = ctx.guest_read_u64(entry);
+            let ilen = ctx.guest_read_u64(entry + 8) as usize;
             if base == 0 || ilen == 0 { continue; }
             // Fill this iovec with TCP data in 64-byte chunks
             let mut off = 0usize;
@@ -1558,10 +1582,10 @@ pub(crate) fn sys_readv(ctx: &mut SyscallContext, msg: &IpcMsg) {
                         Ok(resp) => {
                             let n = resp.tag as usize;
                             if n > 0 && n <= chunk {
-                                unsafe {
-                                    let src = &resp.regs[0] as *const u64 as *const u8;
-                                    core::ptr::copy_nonoverlapping(src, (base + off as u64) as *mut u8, n);
-                                }
+                                let src = unsafe {
+                                    core::slice::from_raw_parts(&resp.regs[0] as *const u64 as *const u8, n)
+                                };
+                                ctx.guest_write(base + off as u64, src);
                                 got = n;
                                 break;
                             }
@@ -1710,8 +1734,8 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
         for i in 0..cnt {
             let entry = iov_ptr + (i as u64) * 16;
             if entry + 16 > 0x0000_8000_0000_0000 { break; }
-            let base = unsafe { *(entry as *const u64) };
-            let ilen = unsafe { *((entry + 8) as *const u64) } as usize;
+            let base = ctx.guest_read_u64(entry);
+            let ilen = ctx.guest_read_u64(entry + 8) as usize;
             if base == 0 || ilen == 0 { continue; }
             // Send in 40-byte chunks
             let mut off = 0;
@@ -1721,7 +1745,8 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     tag: NET_CMD_TCP_SEND,
                     regs: [conn_id, 0, chunk as u64, 0, 0, 0, 0, 0],
                 };
-                let data = unsafe { core::slice::from_raw_parts((base + off as u64) as *const u8, chunk) };
+                let mut data = [0u8; 40];
+                ctx.guest_read(base + off as u64, &mut data[..chunk]);
                 unsafe {
                     let dst = &mut req.regs[3] as *mut u64 as *mut u8;
                     core::ptr::copy_nonoverlapping(data.as_ptr(), dst, chunk);
@@ -2370,7 +2395,32 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 reply_val(ctx.ep_cap, -EMFILE);
             }
         } else {
-            reply_val(ctx.ep_cap, -ENOENT);
+            // Not a known virtual file — fall through to VFS for real /etc/ files
+            vfs_lock();
+            let vfs_found = unsafe { shared_store() }.and_then(|store| {
+                use sotos_objstore::ROOT_OID;
+                if let Ok(oid) = store.resolve_path(name, ROOT_OID) {
+                    let entry = store.stat(oid)?;
+                    Some((oid, entry.size, entry.is_dir()))
+                } else { None }
+            });
+            vfs_unlock();
+            if let Some((oid, size, is_dir)) = vfs_found {
+                let mut vslot = None;
+                for s in 0..GRP_MAX_VFS { if ctx.vfs_files[s][0] == 0 { vslot = Some(s); break; } }
+                let mut fslot = None;
+                for i in 3..GRP_MAX_FDS { if ctx.child_fds[i] == 0 { fslot = Some(i); break; } }
+                if let (Some(vs), Some(f)) = (vslot, fslot) {
+                    ctx.child_fds[f] = if is_dir { 14 } else { 13 };
+                    ctx.vfs_files[vs] = [oid, size, 0, f as u64];
+                    ctx.fd_flags[f] = flags;
+                    reply_val(ctx.ep_cap, f as i64);
+                } else {
+                    reply_val(ctx.ep_cap, -EMFILE);
+                }
+            } else {
+                reply_val(ctx.ep_cap, -ENOENT);
+            }
         }
     } else if starts_with(name, b"/proc/") || starts_with(name, b"/sys/") {
         let mut gen_len: usize = 0;
