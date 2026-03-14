@@ -186,6 +186,11 @@ pub(crate) fn sys_mmap(ctx: &mut SyscallContext, msg: &IpcMsg) {
     if map_noreplace && req_addr != 0 {
         let overlaps = unsafe { VMA_LISTS[ctx.memg].overlaps(req_addr, req_addr + aligned_len) };
         if overlaps {
+            if ctx.pid == 3 {
+                print(b"MMAP-FAIL P3 -EEXIST addr="); crate::framebuffer::print_hex64(req_addr);
+                print(b" len="); crate::framebuffer::print_hex64(aligned_len);
+                print(b"\n");
+            }
             reply_val(ctx.ep_cap, -EEXIST);
             return;
         }
@@ -314,6 +319,11 @@ pub(crate) fn sys_mmap(ctx: &mut SyscallContext, msg: &IpcMsg) {
         }
 
         if file_data == 0 && !is_vfs {
+            if ctx.pid == 3 {
+                print(b"MMAP-FAIL P3 -EBADF fd="); crate::framebuffer::print_u64(fd as u64);
+                print(b" kind="); crate::framebuffer::print_u64(if fdu < GRP_MAX_FDS { ctx.child_fds[fdu] as u64 } else { 99 });
+                print(b"\n");
+            }
             reply_val(ctx.ep_cap, -EBADF);
             return;
         }
@@ -363,6 +373,10 @@ pub(crate) fn sys_mmap(ctx: &mut SyscallContext, msg: &IpcMsg) {
             wine_patch_shared_user_data(ctx, base);
             reply_val(ctx.ep_cap, base as i64);
         } else {
+            if ctx.pid == 3 {
+                print(b"MMAP-FAIL P3 -ENOMEM(file) pages="); crate::framebuffer::print_u64(pages);
+                print(b"\n");
+            }
             reply_val(ctx.ep_cap, -ENOMEM);
         }
         return;
@@ -388,6 +402,13 @@ pub(crate) fn sys_mmap(ctx: &mut SyscallContext, msg: &IpcMsg) {
         wine_patch_shared_user_data(ctx, base);
         reply_val(ctx.ep_cap, base as i64);
     } else {
+        if ctx.pid == 3 {
+            let free = sys::debug_free_frames();
+            print(b"MMAP-FAIL P3 -ENOMEM(anon) pg="); crate::framebuffer::print_u64(pages);
+            print(b" base="); crate::framebuffer::print_hex64(base);
+            print(b" free="); crate::framebuffer::print_u64(free);
+            print(b"\n");
+        }
         reply_val(ctx.ep_cap, -ENOMEM);
     }
 }
