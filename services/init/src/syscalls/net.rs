@@ -794,6 +794,7 @@ pub(crate) fn sys_recvfrom(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let nonblock = fd < GRP_MAX_FDS && (ctx.fd_flags[fd] & 0x800) != 0; // O_NONBLOCK
         let max_attempts = if nonblock { 10u32 } else { 5000u32 };
         let mut got = 0usize;
+        let mut saw_eof = false;
         for _attempt in 0..max_attempts {
             let req = IpcMsg {
                 tag: NET_CMD_TCP_RECV,
@@ -802,6 +803,7 @@ pub(crate) fn sys_recvfrom(ctx: &mut SyscallContext, msg: &IpcMsg) {
             match sys::call_timeout(net_cap, &req, 200) {
                 Ok(resp) => {
                     let n = resp.tag as usize;
+                    if n == 0xFFFE { saw_eof = true; break; }
                     if n > 0 && n <= recv_len {
                         let src = unsafe {
                             core::slice::from_raw_parts(&resp.regs[0] as *const u64 as *const u8, n)
@@ -816,9 +818,8 @@ pub(crate) fn sys_recvfrom(ctx: &mut SyscallContext, msg: &IpcMsg) {
             sys::yield_now();
         }
         if got > 0 { reply_val(ep_cap, got as i64); }
-        else {
-            reply_val(ep_cap, -EAGAIN);
-        }
+        else if saw_eof { reply_val(ep_cap, 0); }
+        else { reply_val(ep_cap, -EAGAIN); }
     }
 }
 

@@ -243,6 +243,7 @@ pub(crate) fn sys_read(ctx: &mut SyscallContext, msg: &IpcMsg) {
             let max_read = len.min(32768); // cap at 32KB per read
             let mut total = 0usize;
             let mut empty_retries = 0u32;
+            let mut saw_eof = false;
             while total < max_read && empty_retries < 5000 {
                 let chunk = (max_read - total).min(64);
                 let req = IpcMsg {
@@ -252,16 +253,21 @@ pub(crate) fn sys_read(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 match sys::call_timeout(net_cap, &req, 200) {
                     Ok(resp) => {
                         let n = resp.tag as usize;
+                        if n == 0xFFFE {
+                            // EOF sentinel: remote closed connection
+                            saw_eof = true;
+                            break;
+                        }
                         if n > 0 && n <= chunk {
                             let src = unsafe {
                                 core::slice::from_raw_parts(&resp.regs[0] as *const u64 as *const u8, n)
                             };
                             ctx.guest_write(buf_ptr + total as u64, src);
                             total += n;
-                            empty_retries = 0; // reset on progress
+                            empty_retries = 0;
                             if n < chunk { break; } // short read = no more data buffered
                         } else {
-                            // No data available
+                            // n==0: no data yet (not EOF)
                             if total > 0 { break; } // return what we have
                             empty_retries += 1;
                             sys::yield_now();
@@ -274,8 +280,18 @@ pub(crate) fn sys_read(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     }
                 }
             }
+            // Log TCP read results for P5 (git-remote-https TLS debugging)
+            if ctx.pid == 5 && (total > 0 || saw_eof) {
+                print(b"TCP-RD P5 ");
+                if saw_eof { print(b"EOF "); }
+                print(b"t="); print_u64(total as u64);
+                print(b" req="); print_u64(max_read as u64);
+                print(b"\n");
+            }
             if total > 0 {
                 reply_val(ctx.ep_cap, total as i64);
+            } else if saw_eof {
+                reply_val(ctx.ep_cap, 0); // EOF: remote closed connection
             } else {
                 reply_val(ctx.ep_cap, -EAGAIN);
             }
@@ -1556,51 +1572,65 @@ pub(crate) fn sys_readv(ctx: &mut SyscallContext, msg: &IpcMsg) {
             reply_val(ctx.ep_cap, -EBADF);
         }
     } else if ctx.child_fds[fd] == 16 {
-        // TCP socket readv -> gather into iovecs via TCP_RECV
+        // TCP socket readv -> gather into iovecs via multi-chunk TCP_RECV
         let net_cap = NET_EP_CAP.load(Ordering::Acquire);
         let conn_id = ctx.sock_conn_id[fd] as u64;
         let mut total = 0usize;
+        let mut saw_eof = false;
         let cnt = iovcnt.min(16);
         for i in 0..cnt {
             let entry = iov_ptr + (i as u64) * 16;
             let base = ctx.guest_read_u64(entry);
             let ilen = ctx.guest_read_u64(entry + 8) as usize;
             if base == 0 || ilen == 0 { continue; }
-            // Fill this iovec with TCP data in 64-byte chunks
             let mut off = 0usize;
-            while off < ilen {
+            let mut empty = 0u32;
+            while off < ilen && !saw_eof {
                 let chunk = (ilen - off).min(64);
-                let mut got = 0usize;
-                for _ in 0..5000u32 {
-                    let req = sotos_common::IpcMsg {
-                        tag: NET_CMD_TCP_RECV,
-                        regs: [conn_id, chunk as u64, 0, 0, 0, 0, 0, 0],
-                    };
-                    match sys::call_timeout(net_cap, &req, 200) {
-                        Ok(resp) => {
-                            let n = resp.tag as usize;
-                            if n > 0 && n <= chunk {
-                                let src = unsafe {
-                                    core::slice::from_raw_parts(&resp.regs[0] as *const u64 as *const u8, n)
-                                };
-                                ctx.guest_write(base + off as u64, src);
-                                got = n;
-                                break;
-                            }
+                let req = sotos_common::IpcMsg {
+                    tag: NET_CMD_TCP_RECV,
+                    regs: [conn_id, chunk as u64, 0, 0, 0, 0, 0, 0],
+                };
+                match sys::call_timeout(net_cap, &req, 200) {
+                    Ok(resp) => {
+                        let n = resp.tag as usize;
+                        if n == 0xFFFE { saw_eof = true; break; }
+                        if n > 0 && n <= chunk {
+                            let src = unsafe {
+                                core::slice::from_raw_parts(&resp.regs[0] as *const u64 as *const u8, n)
+                            };
+                            ctx.guest_write(base + off as u64, src);
+                            off += n;
+                            total += n;
+                            empty = 0;
+                            if n < chunk { break; }
+                        } else {
+                            if total > 0 || off > 0 { break; }
+                            empty += 1;
+                            if empty > 5000 { break; }
+                            sys::yield_now();
                         }
-                        Err(_) => {}
                     }
-                    sys::yield_now();
+                    Err(_) => {
+                        if total > 0 || off > 0 { break; }
+                        empty += 1;
+                        if empty > 5000 { break; }
+                        sys::yield_now();
+                    }
                 }
-                if got == 0 { break; } // no more data
-                off += got;
-                total += got;
-                if got < chunk { break; } // short read, don't fill more
             }
-            if off == 0 { break; } // no data for this iovec, stop
+            if off == 0 && !saw_eof { break; }
+        }
+        if ctx.pid == 5 && (total > 0 || saw_eof) {
+            print(b"TCP-RV P5 ");
+            if saw_eof { print(b"EOF "); }
+            print(b"t="); print_u64(total as u64);
+            print(b"\n");
         }
         if total > 0 {
             reply_val(ctx.ep_cap, total as i64);
+        } else if saw_eof {
+            reply_val(ctx.ep_cap, 0);
         } else {
             reply_val(ctx.ep_cap, -EAGAIN);
         }

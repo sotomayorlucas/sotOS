@@ -1072,11 +1072,12 @@ fn process_ipc_cmd(
                     }
                 }
                 if !sock.is_active() {
-                    break;
+                    // Connection closed by remote — signal EOF (not "no data yet")
+                    return 0xFFFE; // sentinel: EOF
                 }
                 sys::yield_now();
             }
-            0
+            0 // no data after polling (not EOF, just slow)
         }
 
         CMD_TCP_CLOSE => {
