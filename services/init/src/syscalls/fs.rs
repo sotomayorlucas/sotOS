@@ -1107,19 +1107,9 @@ pub(crate) fn close_cloexec_fds(ctx: &mut SyscallContext) {
         close_fd_internal(ctx, fd);
         bits &= !(1u128 << fd);
     }
-    // Close inherited pipe fds > 2 that weren't CLOEXEC.
-    // After fork+exec, the child dup2's needed pipes to 0/1/2 and
-    // explicitly closes the originals. Any remaining pipe fds are leaks.
-    for fd in 3..GRP_MAX_FDS {
-        let k = ctx.child_fds[fd];
-        if k == 10 || k == 11 {
-            print(b"EXEC-PIPE-CLOSE P"); print_u64(ctx.pid as u64);
-            print(b" fd="); print_u64(fd as u64);
-            print(b" kind="); print_u64(k as u64);
-            print(b"\n");
-            close_fd_internal(ctx, fd);
-        }
-    }
+    // NOTE: Do NOT close non-CLOEXEC pipe fds here. Linux only closes
+    // FD_CLOEXEC fds during exec. Programs like git intentionally pass
+    // pipe fds to helper processes (git-remote-https) for IPC.
     // Clear orphaned initrd entries (fd == u64::MAX) inherited from forked parent.
     // After exec, the new binary has no use for the parent's stale initrd buffers.
     // Leaving them causes mmap to match the wrong file data.
