@@ -644,6 +644,11 @@ pub fn wake(tid: ThreadId) {
     let mut sched = SCHEDULER.lock();
     if let Some(slot) = sched.slot_of(tid) {
         if let Some(t) = sched.threads.get_mut_by_index(slot) {
+            // Always clear ipc_timed_out when woken by a sender.
+            // Race: timer tick may have already woken the thread with ipc_timed_out=true.
+            // Without this clear, the receiver sees a spurious timeout and discards
+            // the sender's message, leaving the caller blocked forever.
+            t.ipc_timed_out = false;
             if t.state == ThreadState::Blocked {
                 t.state = ThreadState::Ready;
                 t.timeslice = TIMESLICE;
