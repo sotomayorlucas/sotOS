@@ -1010,7 +1010,9 @@ pub(crate) extern "C" fn child_handler() -> ! {
                     // Write the list sentinel (rbx+0x1088) to address 0 so the loop
                     // terminates. Only apply when rbx looks like a valid glibc pointer
                     // (non-zero, in user space) to avoid corrupting Wine's NT TIB.
-                    if fork_rbx != 0 && fork_rbx < 0x0000_8000_0000_0000 {
+                    // Always write sentinel — needed for ALL glibc children including
+                    // wineserver. The sentinel terminates the atfork linked list loop.
+                    {
                         let sentinel = fork_rbx.wrapping_add(0x1088);
                         let _ = sys::vm_write(child_as_cap, 0,
                             &sentinel as *const u64 as u64, 8);
@@ -1422,7 +1424,7 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 }
 
                 // Fix glibc fork linked list spin (same as SYS_CLONE path).
-                if fork_rbx != 0 && fork_rbx < 0x0000_8000_0000_0000 {
+                {
                     let sentinel = fork_rbx.wrapping_add(0x1088);
                     let _ = sys::vm_write(child_as_cap, 0,
                         &sentinel as *const u64 as u64, 8);
