@@ -595,12 +595,13 @@ pub fn current_tid() -> Option<ThreadId> {
 
 /// Block the current thread (set to Blocked) and switch away.
 pub fn block_current() {
+    let saved_idx;
     {
         let percpu = percpu::current_percpu();
-        let idx = percpu.current_thread;
-        if idx != usize::MAX {
+        saved_idx = percpu.current_thread;
+        if saved_idx != usize::MAX {
             let mut sched = SCHEDULER.lock();
-            if let Some(t) = sched.threads.get_mut_by_index(idx as u32) {
+            if let Some(t) = sched.threads.get_mut_by_index(saved_idx as u32) {
                 t.state = ThreadState::Blocked;
             }
         }
@@ -644,10 +645,6 @@ pub fn wake(tid: ThreadId) {
     let mut sched = SCHEDULER.lock();
     if let Some(slot) = sched.slot_of(tid) {
         if let Some(t) = sched.threads.get_mut_by_index(slot) {
-            // Always clear ipc_timed_out when woken by a sender.
-            // Race: timer tick may have already woken the thread with ipc_timed_out=true.
-            // Without this clear, the receiver sees a spurious timeout and discards
-            // the sender's message, leaving the caller blocked forever.
             t.ipc_timed_out = false;
             if t.state == ThreadState::Blocked {
                 t.state = ThreadState::Ready;

@@ -384,12 +384,6 @@ pub(crate) extern "C" fn child_handler() -> ! {
 
         // Check for pending unblocked signals
         if let Some(action) = syscalls_signal::check_pending_signals(ep_cap, pid, kernel_tid, child_as_cap) {
-            if pid >= 6 {
-                print(b"SIG-INTERCEPT P"); print_u64(pid as u64);
-                print(b" nr="); print_u64(msg.tag);
-                print(b" brk="); print_u64(action.is_break() as u64);
-                print(b"\n");
-            }
             if action.is_break() { break; }
             continue;
         }

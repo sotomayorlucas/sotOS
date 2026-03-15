@@ -270,7 +270,6 @@ pub fn send(ep_handle: PoolHandle, msg: Message) -> Result<(), SysError> {
             SendAction::ReplyToCaller(caller_tid)
         } else if ep.reply_cancelled {
             // The caller timed out and was removed by cancel_caller.
-            crate::kprintln!("IPC-DISCARD ep={} (reply_cancelled)", local);
             ep.reply_cancelled = false;
             SendAction::Discard
         } else {
@@ -297,10 +296,6 @@ pub fn send(ep_handle: PoolHandle, msg: Message) -> Result<(), SysError> {
 
     match action {
         SendAction::ReplyToCaller(tid) => {
-            // Trace reply delivery for Wine child threads
-            if tid >= 20 && tid < 30 {
-                crate::kprintln!("IPC-REPLY t={} tag={}", tid, msg.tag);
-            }
             sched::write_ipc_msg(sched::ThreadId(tid), msg);
             sched::wake(sched::ThreadId(tid));
         }

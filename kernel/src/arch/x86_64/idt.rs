@@ -636,36 +636,6 @@ core::arch::global_asm!(
 extern "C" fn lapic_timer_user_handler(gprs: *mut u64, iframe: *mut u64) {
     lapic::eoi();
 
-    // RIP profiler: detect spinning user threads.
-    // Uses percpu index directly (no scheduler lock — safe in interrupt).
-    {
-        use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-        static PROF_LAST_RIP: AtomicU64 = AtomicU64::new(0);
-        static PROF_REPEAT: AtomicU32 = AtomicU32::new(0);
-        static PROF_LOGGED: AtomicU32 = AtomicU32::new(0);
-        let user_rip = unsafe { *iframe };
-        let last = PROF_LAST_RIP.load(Ordering::Relaxed);
-        if user_rip == last {
-            let r = PROF_REPEAT.fetch_add(1, Ordering::Relaxed);
-            // Log when we detect a spin (same RIP hit 100+ times)
-            if r == 100 || r == 500 || r == 2000 || r == 10000 {
-                let user_rsp = unsafe { *iframe.add(3) };
-                let thr_idx = super::percpu::current_percpu().current_thread;
-                crate::kprintln!("SPIN rip={:#x} rsp={:#x} thr={} x{}", user_rip, user_rsp, thr_idx, r);
-            }
-        } else {
-            let prev = PROF_REPEAT.swap(0, Ordering::Relaxed);
-            PROF_LAST_RIP.store(user_rip, Ordering::Relaxed);
-            // Log new RIP only a few times to avoid flooding
-            if prev > 50 {
-                let logged = PROF_LOGGED.fetch_add(1, Ordering::Relaxed);
-                if logged < 20 {
-                    crate::kprintln!("SPIN-END rip={:#x} prev_x{}", user_rip, prev);
-                }
-            }
-        }
-    }
-
     // Check if current thread has pending async signals
     let percpu = super::percpu::current_percpu();
     let idx = percpu.current_thread;
