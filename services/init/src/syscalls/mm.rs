@@ -135,6 +135,13 @@ pub(crate) fn sys_brk(ctx: &mut SyscallContext, msg: &IpcMsg) {
             pg += 0x1000;
         }
         if ok {
+            // Zero new pages — Linux ABI requires brk-expanded memory to be zeroed.
+            // Without this, recycled frames contain stale heap metadata that corrupts malloc.
+            let mut zp = (old_brk + 0xFFF) & !0xFFF;
+            while zp < new_brk {
+                ctx.guest_zero_page(zp);
+                zp += 0x1000;
+            }
             *ctx.current_brk = new_brk;
             if ctx.pid > 0 && ctx.pid <= MAX_PROCS {
                 PROCESSES[ctx.pid - 1].brk_current.store(new_brk, Ordering::Release);

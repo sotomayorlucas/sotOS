@@ -994,10 +994,10 @@ pub(crate) fn sys_recvmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 Ok(resp) => {
                     let n = resp.tag as usize;
                     if n > 0 && n <= recv_len {
-                        unsafe {
-                            let src = &resp.regs[0] as *const u64 as *const u8;
-                            core::ptr::copy_nonoverlapping(src, iov_base as *mut u8, n);
-                        }
+                        let src = unsafe {
+                            core::slice::from_raw_parts(&resp.regs[0] as *const u64 as *const u8, n)
+                        };
+                        ctx.guest_write(iov_base, src);
                         total_n = n;
                         break;
                     }
@@ -1009,23 +1009,19 @@ pub(crate) fn sys_recvmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
             if msg_name != 0 && msg_namelen >= 16 {
                 let remote_ip = ctx.sock_udp_remote_ip[fd];
                 let remote_port = ctx.sock_udp_remote_port[fd];
-                unsafe {
-                    let sa = msg_name as *mut u8;
-                    *sa.add(0) = 2; *sa.add(1) = 0;
-                    *sa.add(2) = (remote_port >> 8) as u8;
-                    *sa.add(3) = (remote_port & 0xFF) as u8;
-                    *sa.add(4) = ((remote_ip >> 24) & 0xFF) as u8;
-                    *sa.add(5) = ((remote_ip >> 16) & 0xFF) as u8;
-                    *sa.add(6) = ((remote_ip >> 8) & 0xFF) as u8;
-                    *sa.add(7) = (remote_ip & 0xFF) as u8;
-                    for i in 8..16 { *sa.add(i) = 0; }
-                }
-                unsafe { *((msghdr_ptr + 8) as *mut u32) = 16; }
+                let mut sa = [0u8; 16];
+                sa[0] = 2; // AF_INET
+                sa[2] = (remote_port >> 8) as u8;
+                sa[3] = (remote_port & 0xFF) as u8;
+                sa[4] = ((remote_ip >> 24) & 0xFF) as u8;
+                sa[5] = ((remote_ip >> 16) & 0xFF) as u8;
+                sa[6] = ((remote_ip >> 8) & 0xFF) as u8;
+                sa[7] = (remote_ip & 0xFF) as u8;
+                ctx.guest_write(msg_name, &sa);
+                ctx.guest_write(msghdr_ptr + 8, &16u32.to_le_bytes());
             }
-            unsafe {
-                *((msghdr_ptr + 40) as *mut u64) = 0;
-                *((msghdr_ptr + 48) as *mut i32) = 0;
-            }
+            ctx.guest_write(msghdr_ptr + 40, &0u64.to_le_bytes());
+            ctx.guest_write(msghdr_ptr + 48, &0i32.to_le_bytes());
             reply_val(ep_cap, total_n as i64);
         } else {
             reply_val(ep_cap, -EAGAIN);
@@ -1047,10 +1043,10 @@ pub(crate) fn sys_recvmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 Ok(resp) => {
                     let n = resp.tag as usize;
                     if n > 0 && n <= recv_len {
-                        unsafe {
-                            let src = &resp.regs[0] as *const u64 as *const u8;
-                            core::ptr::copy_nonoverlapping(src, iov_base as *mut u8, n);
-                        }
+                        let src = unsafe {
+                            core::slice::from_raw_parts(&resp.regs[0] as *const u64 as *const u8, n)
+                        };
+                        ctx.guest_write(iov_base, src);
                         got = n;
                         break;
                     }
@@ -1059,10 +1055,8 @@ pub(crate) fn sys_recvmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
             }
             sys::yield_now();
         }
-        unsafe {
-            *((msghdr_ptr + 40) as *mut u64) = 0;
-            *((msghdr_ptr + 48) as *mut i32) = 0;
-        }
+        ctx.guest_write(msghdr_ptr + 40, &0u64.to_le_bytes());
+        ctx.guest_write(msghdr_ptr + 48, &0i32.to_le_bytes());
         if got > 0 { reply_val(ep_cap, got as i64); }
         else { reply_val(ep_cap, -EAGAIN); }
     }

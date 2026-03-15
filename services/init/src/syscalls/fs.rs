@@ -330,10 +330,10 @@ pub(crate) fn sys_read(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     Ok(resp) => {
                         let n = resp.tag as usize; // tag = byte count
                         if n > 0 && n <= recv_len {
-                            unsafe {
-                                let src = &resp.regs[0] as *const u64 as *const u8; // data at regs[0]
-                                core::ptr::copy_nonoverlapping(src, buf_ptr as *mut u8, n);
-                            }
+                            let src = unsafe {
+                                core::slice::from_raw_parts(&resp.regs[0] as *const u64 as *const u8, n)
+                            };
+                            ctx.guest_write(buf_ptr, src);
                         }
                         reply_val(ctx.ep_cap, n as i64);
                     }
@@ -3081,13 +3081,7 @@ pub(crate) fn sys_getdents64(ctx: &mut SyscallContext, msg: &IpcMsg) {
             reply_val(ctx.ep_cap, 0); // EOF
         } else {
             let copy_len = remaining.min(count);
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    ctx.dir_buf[*ctx.dir_pos..].as_ptr(),
-                    dirp as *mut u8,
-                    copy_len,
-                );
-            }
+            ctx.guest_write(dirp, &ctx.dir_buf[*ctx.dir_pos..*ctx.dir_pos + copy_len]);
             *ctx.dir_pos += copy_len;
             reply_val(ctx.ep_cap, copy_len as i64);
         }
@@ -3286,19 +3280,17 @@ pub(crate) fn sys_statfs(ctx: &mut SyscallContext, msg: &IpcMsg, _syscall_nr: u6
     let buf = msg.regs[1];
     if buf != 0 {
         // struct statfs is 120 bytes on x86_64
-        unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 120); }
-        unsafe {
-            let p = buf as *mut u64;
-            *p = 0xEF53; // f_type = EXT4_SUPER_MAGIC
-            *p.add(1) = 4096; // f_bsize
-            *p.add(2) = 1024 * 1024; // f_blocks
-            *p.add(3) = 512 * 1024; // f_bfree
-            *p.add(4) = 512 * 1024; // f_bavail
-            *p.add(5) = 65536; // f_files
-            *p.add(6) = 32768; // f_ffree
-            // f_fsid = 0 (already zeroed)
-            *p.add(9) = 255; // f_namelen
-        }
+        let mut sfs = [0u8; 120];
+        sfs[0..8].copy_from_slice(&0xEF53u64.to_le_bytes()); // f_type = EXT4_SUPER_MAGIC
+        sfs[8..16].copy_from_slice(&4096u64.to_le_bytes()); // f_bsize
+        sfs[16..24].copy_from_slice(&(1024u64 * 1024).to_le_bytes()); // f_blocks
+        sfs[24..32].copy_from_slice(&(512u64 * 1024).to_le_bytes()); // f_bfree
+        sfs[32..40].copy_from_slice(&(512u64 * 1024).to_le_bytes()); // f_bavail
+        sfs[40..48].copy_from_slice(&65536u64.to_le_bytes()); // f_files
+        sfs[48..56].copy_from_slice(&32768u64.to_le_bytes()); // f_ffree
+        // f_fsid = 0 (already zeroed)
+        sfs[72..80].copy_from_slice(&255u64.to_le_bytes()); // f_namelen
+        ctx.guest_write(buf, &sfs);
     }
     reply_val(ctx.ep_cap, 0);
 }

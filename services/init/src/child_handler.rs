@@ -1595,6 +1595,12 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 syscalls_info::sys_clock_gettime(&mut ctx, &msg);
             }
 
+            // SYS_time(201)
+            SYS_TIME => {
+                let mut ctx = make_ctx!();
+                syscalls_info::sys_time(&mut ctx, &msg);
+            }
+
             // SYS_exit_group
             SYS_EXIT_GROUP => {
                 let mut ctx = make_ctx!();

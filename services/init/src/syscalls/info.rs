@@ -51,6 +51,19 @@ pub(crate) fn sys_gettimeofday(ctx: &mut SyscallContext, msg: &IpcMsg) {
     reply_val(ctx.ep_cap, 0);
 }
 
+/// SYS_TIME (201): return seconds since epoch.
+pub(crate) fn sys_time(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let tsc = rdtsc();
+    let boot_tsc = BOOT_TSC.load(Ordering::Acquire);
+    let elapsed_secs = if tsc > boot_tsc { (tsc - boot_tsc) / 2_000_000_000 } else { 0 };
+    let secs = elapsed_secs + UPTIME_OFFSET_SECS;
+    let tloc = msg.regs[0];
+    if tloc != 0 {
+        ctx.guest_write(tloc, &secs.to_le_bytes());
+    }
+    reply_val(ctx.ep_cap, secs as i64);
+}
+
 /// SYS_NANOSLEEP (35): stub returning 0.
 pub(crate) fn sys_nanosleep(ctx: &mut SyscallContext, _msg: &IpcMsg) {
     reply_val(ctx.ep_cap, 0);
@@ -78,7 +91,8 @@ pub(crate) fn sys_times(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let buf = msg.regs[0];
     if buf != 0 {
         // struct tms = 4 * i64 = 32 bytes (clock_t = i64 on x86_64)
-        unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 32); }
+        let zeros = [0u8; 32];
+        ctx.guest_write(buf, &zeros);
     }
     // Return clock ticks since boot
     let tsc = rdtsc();
@@ -88,13 +102,13 @@ pub(crate) fn sys_times(ctx: &mut SyscallContext, msg: &IpcMsg) {
 /// SYS_GETITIMER (36) / SYS_SETITIMER (38): timer stubs.
 pub(crate) fn sys_getitimer(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let buf = msg.regs[1];
-    if buf != 0 { unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 32); } }
+    if buf != 0 { let zeros = [0u8; 32]; ctx.guest_write(buf, &zeros); }
     reply_val(ctx.ep_cap, 0);
 }
 
 pub(crate) fn sys_setitimer(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let old = msg.regs[2];
-    if old != 0 { unsafe { core::ptr::write_bytes(old as *mut u8, 0, 32); } }
+    if old != 0 { let zeros = [0u8; 32]; ctx.guest_write(old, &zeros); }
     reply_val(ctx.ep_cap, 0);
 }
 
@@ -102,37 +116,24 @@ pub(crate) fn sys_setitimer(ctx: &mut SyscallContext, msg: &IpcMsg) {
 
 /// SYS_SYSINFO (99): return system info struct.
 pub(crate) fn sys_sysinfo(ctx: &mut SyscallContext, msg: &IpcMsg) {
-    let buf = msg.regs[0] as *mut u8;
-    if !buf.is_null() {
+    let buf_addr = msg.regs[0];
+    if buf_addr != 0 {
         // struct sysinfo is 112 bytes on x86_64
-        unsafe { core::ptr::write_bytes(buf, 0, 112); }
+        let mut si = [0u8; 112];
         let tsc = rdtsc();
         let boot_tsc = BOOT_TSC.load(Ordering::Acquire);
         let secs = if tsc > boot_tsc { (tsc - boot_tsc) / 2_000_000_000 } else { 0 };
-        unsafe {
-            // offset 0: uptime (i64)
-            *(buf as *mut u64) = secs + UPTIME_OFFSET_SECS;
-            // offset 32: totalram (u64) — report 1 GiB
-            *((buf.add(32)) as *mut u64) = 1024 * 1024 * 1024;
-            // offset 40: freeram (u64) — report 512 MiB
-            *((buf.add(40)) as *mut u64) = 512 * 1024 * 1024;
-            // offset 48: sharedram
-            *((buf.add(48)) as *mut u64) = 0;
-            // offset 56: bufferram
-            *((buf.add(56)) as *mut u64) = 0;
-            // offset 64: totalswap
-            *((buf.add(64)) as *mut u64) = 0;
-            // offset 72: freeswap
-            *((buf.add(72)) as *mut u64) = 0;
-            // offset 80: procs (u16)
-            *((buf.add(80)) as *mut u16) = 1;
-            // offset 88: totalhigh
-            *((buf.add(88)) as *mut u64) = 0;
-            // offset 96: freehigh
-            *((buf.add(96)) as *mut u64) = 0;
-            // offset 104: mem_unit (u32) — 1 byte
-            *((buf.add(104)) as *mut u32) = 1;
-        }
+        // offset 0: uptime (i64)
+        si[0..8].copy_from_slice(&(secs + UPTIME_OFFSET_SECS).to_le_bytes());
+        // offset 32: totalram (u64) — report 1 GiB
+        si[32..40].copy_from_slice(&(1024u64 * 1024 * 1024).to_le_bytes());
+        // offset 40: freeram (u64) — report 512 MiB
+        si[40..48].copy_from_slice(&(512u64 * 1024 * 1024).to_le_bytes());
+        // offset 80: procs (u16)
+        si[80..82].copy_from_slice(&1u16.to_le_bytes());
+        // offset 104: mem_unit (u32) — 1 byte
+        si[104..108].copy_from_slice(&1u32.to_le_bytes());
+        ctx.guest_write(buf_addr, &si);
     }
     reply_val(ctx.ep_cap, 0);
 }
@@ -141,7 +142,8 @@ pub(crate) fn sys_sysinfo(ctx: &mut SyscallContext, msg: &IpcMsg) {
 pub(crate) fn sys_getrusage(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let buf = msg.regs[1];
     if buf != 0 {
-        unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 144); }
+        let zeros = [0u8; 144];
+        ctx.guest_write(buf, &zeros);
     }
     reply_val(ctx.ep_cap, 0);
 }
@@ -153,10 +155,11 @@ pub(crate) fn sys_prlimit64(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let new_limit = msg.regs[2];
     let old_limit = msg.regs[3];
     if old_limit != 0 && old_limit < 0x0000_8000_0000_0000 {
-        let buf = unsafe { core::slice::from_raw_parts_mut(old_limit as *mut u8, 16) };
         let big: u64 = 0x7FFF_FFFF_FFFF_FFFF;
-        buf[0..8].copy_from_slice(&big.to_le_bytes()); // rlim_cur
-        buf[8..16].copy_from_slice(&big.to_le_bytes()); // rlim_max
+        let mut rl = [0u8; 16];
+        rl[0..8].copy_from_slice(&big.to_le_bytes()); // rlim_cur
+        rl[8..16].copy_from_slice(&big.to_le_bytes()); // rlim_max
+        ctx.guest_write(old_limit, &rl);
     }
     let _ = new_limit;
     reply_val(ctx.ep_cap, 0);
@@ -166,10 +169,11 @@ pub(crate) fn sys_prlimit64(ctx: &mut SyscallContext, msg: &IpcMsg) {
 pub(crate) fn sys_getrlimit(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let rlim_ptr = msg.regs[1];
     if rlim_ptr != 0 {
-        unsafe {
-            *(rlim_ptr as *mut u64) = 0x7FFF_FFFF_FFFF_FFFF; // rlim_cur
-            *((rlim_ptr + 8) as *mut u64) = 0x7FFF_FFFF_FFFF_FFFF; // rlim_max
-        }
+        let big: u64 = 0x7FFF_FFFF_FFFF_FFFF;
+        let mut rl = [0u8; 16];
+        rl[0..8].copy_from_slice(&big.to_le_bytes());
+        rl[8..16].copy_from_slice(&big.to_le_bytes());
+        ctx.guest_write(rlim_ptr, &rl);
     }
     reply_val(ctx.ep_cap, 0);
 }
@@ -184,13 +188,13 @@ pub(crate) fn sys_sched_yield(ctx: &mut SyscallContext, _msg: &IpcMsg) {
 
 /// SYS_SCHED_GETAFFINITY (204): return CPU mask.
 pub(crate) fn sys_sched_getaffinity(ctx: &mut SyscallContext, msg: &IpcMsg) {
-    let mask_ptr = msg.regs[2] as *mut u8;
+    let mask_ptr = msg.regs[2];
     let len = msg.regs[1] as usize;
-    if !mask_ptr.is_null() && len > 0 {
-        unsafe {
-            core::ptr::write_bytes(mask_ptr, 0, len.min(128));
-            *mask_ptr = 1; // CPU 0
-        }
+    if mask_ptr != 0 && len > 0 {
+        let safe_len = len.min(128);
+        let mut mask = [0u8; 128];
+        mask[0] = 1; // CPU 0
+        ctx.guest_write(mask_ptr, &mask[..safe_len]);
     }
     reply_val(ctx.ep_cap, len.min(128) as i64);
 }
@@ -198,17 +202,19 @@ pub(crate) fn sys_sched_getaffinity(ctx: &mut SyscallContext, msg: &IpcMsg) {
 /// SYS_SCHED_GETPARAM (143): return sched priority.
 pub(crate) fn sys_sched_getparam(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let buf = msg.regs[1];
-    if buf != 0 { unsafe { *(buf as *mut i32) = 0; } } // sched_priority = 0
+    if buf != 0 { ctx.guest_write(buf, &0i32.to_le_bytes()); } // sched_priority = 0
     reply_val(ctx.ep_cap, 0);
 }
 
 /// SYS_GETRANDOM (318): fill buffer with random bytes.
 pub(crate) fn sys_getrandom(ctx: &mut SyscallContext, msg: &IpcMsg) {
-    let buf_ptr = msg.regs[0] as *mut u8;
+    let buf_ptr = msg.regs[0];
     let buflen = msg.regs[1] as usize;
-    let dst = unsafe { core::slice::from_raw_parts_mut(buf_ptr, buflen) };
-    crate::child_handler::fill_random(dst);
-    reply_val(ctx.ep_cap, buflen as i64);
+    let safe_len = buflen.min(4096);
+    let mut local = [0u8; 4096];
+    crate::child_handler::fill_random(&mut local[..safe_len]);
+    ctx.guest_write(buf_ptr, &local[..safe_len]);
+    reply_val(ctx.ep_cap, safe_len as i64);
 }
 
 // ─── Process control ────────────────────────────────────────────
@@ -221,7 +227,7 @@ pub(crate) fn sys_prctl(ctx: &mut SyscallContext, msg: &IpcMsg) {
             let buf = msg.regs[1];
             if buf != 0 && ctx.pid > 0 && ctx.pid <= MAX_PROCS {
                 let mut raw = [0u8; 16];
-                unsafe { core::ptr::copy_nonoverlapping(buf as *const u8, raw.as_mut_ptr(), 16); }
+                ctx.guest_read(buf, &mut raw);
                 // NUL-terminate at 15
                 raw[15] = 0;
                 let w0 = u64::from_le_bytes(raw[0..8].try_into().unwrap());
@@ -236,16 +242,14 @@ pub(crate) fn sys_prctl(ctx: &mut SyscallContext, msg: &IpcMsg) {
             if buf != 0 && ctx.pid > 0 && ctx.pid <= MAX_PROCS {
                 let w0 = PROCESSES[ctx.pid - 1].proc_name[0].load(Ordering::Acquire);
                 let w1 = PROCESSES[ctx.pid - 1].proc_name[1].load(Ordering::Acquire);
+                let mut name = [0u8; 16];
                 if w0 == 0 && w1 == 0 {
-                    // No name set — return "program"
-                    let name = b"program\0\0\0\0\0\0\0\0\0";
-                    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), buf as *mut u8, 16); }
+                    name[..7].copy_from_slice(b"program");
                 } else {
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(&w0 as *const u64 as *const u8, buf as *mut u8, 8);
-                        core::ptr::copy_nonoverlapping(&w1 as *const u64 as *const u8, (buf + 8) as *mut u8, 8);
-                    }
+                    name[0..8].copy_from_slice(&w0.to_le_bytes());
+                    name[8..16].copy_from_slice(&w1.to_le_bytes());
                 }
+                ctx.guest_write(buf, &name);
             }
             reply_val(ctx.ep_cap, 0);
         }
@@ -289,7 +293,8 @@ pub(crate) fn sys_getresuid(ctx: &mut SyscallContext, msg: &IpcMsg) {
 pub(crate) fn sys_capget(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let data = msg.regs[1];
     if data != 0 {
-        unsafe { core::ptr::write_bytes(data as *mut u8, 0, 24); }
+        let zeros = [0u8; 24];
+        ctx.guest_write(data, &zeros);
     }
     reply_val(ctx.ep_cap, 0);
 }
@@ -337,13 +342,16 @@ pub(crate) fn sys_timerfd_settime(ctx: &mut SyscallContext, msg: &IpcMsg) {
     if fd < GRP_MAX_FDS && ctx.child_fds[fd] == 23 {
         if let Some(slot) = ctx.timerfd_slot_fd.iter().position(|&x| x == fd) {
             if old_value_ptr != 0 {
-                unsafe { core::ptr::write_bytes(old_value_ptr as *mut u8, 0, 32); }
+                let zeros = [0u8; 32];
+                ctx.guest_write(old_value_ptr, &zeros);
             }
             if new_value_ptr != 0 {
-                let int_sec = unsafe { *(new_value_ptr as *const u64) };
-                let int_ns = unsafe { *((new_value_ptr + 8) as *const u64) };
-                let val_sec = unsafe { *((new_value_ptr + 16) as *const u64) };
-                let val_ns = unsafe { *((new_value_ptr + 24) as *const u64) };
+                let mut tv = [0u8; 32];
+                ctx.guest_read(new_value_ptr, &mut tv);
+                let int_sec = u64::from_le_bytes(tv[0..8].try_into().unwrap());
+                let int_ns = u64::from_le_bytes(tv[8..16].try_into().unwrap());
+                let val_sec = u64::from_le_bytes(tv[16..24].try_into().unwrap());
+                let val_ns = u64::from_le_bytes(tv[24..32].try_into().unwrap());
                 let interval_ns = int_sec * 1_000_000_000 + int_ns;
                 let value_ns = val_sec * 1_000_000_000 + val_ns;
                 ctx.timerfd_interval_ns[slot] = interval_ns;
@@ -365,23 +373,20 @@ pub(crate) fn sys_timerfd_gettime(ctx: &mut SyscallContext, msg: &IpcMsg) {
     if fd < GRP_MAX_FDS && ctx.child_fds[fd] == 23 {
         if let Some(slot) = ctx.timerfd_slot_fd.iter().position(|&x| x == fd) {
             if buf != 0 {
-                unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 32); }
+                let mut its = [0u8; 32];
                 let now = rdtsc();
                 let exp = ctx.timerfd_expiry_tsc[slot];
                 if exp > now {
                     let remaining_ns = (exp - now) / 2;
-                    unsafe {
-                        *((buf + 16) as *mut u64) = remaining_ns / 1_000_000_000;
-                        *((buf + 24) as *mut u64) = remaining_ns % 1_000_000_000;
-                    }
+                    its[16..24].copy_from_slice(&(remaining_ns / 1_000_000_000).to_le_bytes());
+                    its[24..32].copy_from_slice(&(remaining_ns % 1_000_000_000).to_le_bytes());
                 }
                 let int_ns = ctx.timerfd_interval_ns[slot];
                 if int_ns != 0 {
-                    unsafe {
-                        *(buf as *mut u64) = int_ns / 1_000_000_000;
-                        *((buf + 8) as *mut u64) = int_ns % 1_000_000_000;
-                    }
+                    its[0..8].copy_from_slice(&(int_ns / 1_000_000_000).to_le_bytes());
+                    its[8..16].copy_from_slice(&(int_ns % 1_000_000_000).to_le_bytes());
                 }
+                ctx.guest_write(buf, &its);
             }
             reply_val(ctx.ep_cap, 0);
         } else { reply_val(ctx.ep_cap, -EBADF); }
