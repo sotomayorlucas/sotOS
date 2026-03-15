@@ -216,10 +216,58 @@ extern "x86-interrupt" fn general_protection_handler(frame: InterruptStackFrame,
             "#GP(user) tid={} code={} rip={:#x} rsp={:#x}",
             tid, code, rip, frame.stack_pointer.as_u64()
         );
-        // Dump instruction bytes at crash RIP
+        // Dump instruction bytes at and BEFORE crash RIP
         let bytes = unsafe { core::slice::from_raw_parts(rip as *const u8, 16) };
-        kprintln!("#GP bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+        kprintln!("#GP bytes@rip: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
+        // 16 bytes before the crash — shows the function that fell through into HLT
+        if rip > 16 {
+            let pre = unsafe { core::slice::from_raw_parts((rip - 16) as *const u8, 16) };
+            kprintln!("#GP pre-16: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                pre[0], pre[1], pre[2], pre[3], pre[4], pre[5], pre[6], pre[7],
+                pre[8], pre[9], pre[10], pre[11], pre[12], pre[13], pre[14], pre[15]);
+        }
+        // Also dump more stack words to understand control flow
+        let user_rsp = frame.stack_pointer.as_u64();
+        if user_rsp > 0x1000 && user_rsp < 0x0000_8000_0000_0000 {
+            let stk = unsafe { core::slice::from_raw_parts(user_rsp as *const u64, 8) };
+            kprintln!("#GP stack: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+                stk[0], stk[1], stk[2], stk[3], stk[4], stk[5], stk[6], stk[7]);
+        }
+        // Dump caller address from stack
+        let rsp_val = frame.stack_pointer.as_u64();
+        if rsp_val > 0x1000 && rsp_val < 0x0000_8000_0000_0000 {
+            let ret_addr = unsafe { *(rsp_val as *const u64) };
+            let rbp_val = unsafe { *((rsp_val + 8) as *const u64) };
+            kprintln!("#GP caller: [rsp]={:#x} [rsp+8]={:#x}", ret_addr, rbp_val);
+            // Walk RBP chain for backtrace (up to 6 frames)
+            let mut bp = rbp_val;
+            for i in 0..6u32 {
+                if bp < 0x1000 || bp >= 0x0000_8000_0000_0000 { break; }
+                let saved_bp = unsafe { *(bp as *const u64) };
+                let saved_ip = unsafe { *((bp + 8) as *const u64) };
+                kprintln!("#GP bt[{}]: rip={:#x} rbp={:#x}", i, saved_ip, saved_bp);
+                bp = saved_bp;
+            }
+        }
+        // Dump key GPRs that might hold the corrupted function pointer
+        // Note: interrupt frame only has RIP, CS, RFLAGS, RSP, SS.
+        // General registers are NOT in the interrupt stack frame for #GP.
+        // But we can read them from the current CPU state since we haven't
+        // clobbered them yet (swapgs only touches GS).
+        let rax: u64; let rbx: u64; let rcx: u64; let rdx: u64;
+        let rdi: u64; let rsi: u64; let rbp: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {0}, rax", "mov {1}, rbx", "mov {2}, rcx", "mov {3}, rdx",
+                "mov {4}, rdi", "mov {5}, rsi", "mov {6}, rbp",
+                out(reg) rax, out(reg) rbx, out(reg) rcx, out(reg) rdx,
+                out(reg) rdi, out(reg) rsi, out(reg) rbp,
+                options(nomem, nostack)
+            );
+        }
+        kprintln!("#GP regs: rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}", rax, rbx, rcx, rdx);
+        kprintln!("#GP regs: rdi={:#x} rsi={:#x} rbp={:#x}", rdi, rsi, rbp);
         // Set SIGSEGV pending so parent sees WIFSIGNALED, then exit thread.
         if let Some(tid) = crate::sched::current_tid() {
             crate::sched::set_pending_signal(tid, 11);
