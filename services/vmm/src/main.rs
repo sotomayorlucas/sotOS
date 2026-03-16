@@ -87,8 +87,8 @@ pub extern "C" fn _start() -> ! {
                     };
 
                     fault_count += 1;
-                    // Log first 200 faults, then every 1000th
-                    if fault_count <= 200 || fault_count % 1000 == 0 {
+                    // Log only every 10000th fault (quiet mode)
+                    if fault_count % 10000 == 0 {
                         print(b"VF t=");
                         print_hex16(fault.tid as u64);
                         print(b" a=");

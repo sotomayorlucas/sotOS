@@ -97,6 +97,38 @@ unsafe fn copy_guest_path_saved(guest_ptr: u64, out: &mut [u8], fork_rsp: u64, p
     i
 }
 
+/// Format /proc/uptime as "SECS.00 SECS.00\n"
+fn fmt_uptime(secs: u64, buf: &mut [u8; 32]) -> usize {
+    let mut i = 0usize;
+    // Write seconds as decimal
+    if secs == 0 { buf[i] = b'0'; i += 1; }
+    else {
+        let mut tmp = [0u8; 20];
+        let mut n = 0;
+        let mut v = secs;
+        while v > 0 { tmp[n] = b'0' + (v % 10) as u8; n += 1; v /= 10; }
+        for j in (0..n).rev() { buf[i] = tmp[j]; i += 1; }
+    }
+    buf[i] = b'.'; i += 1;
+    buf[i] = b'0'; i += 1;
+    buf[i] = b'0'; i += 1;
+    buf[i] = b' '; i += 1;
+    // Idle time = same
+    if secs == 0 { buf[i] = b'0'; i += 1; }
+    else {
+        let mut tmp = [0u8; 20];
+        let mut n = 0;
+        let mut v = secs;
+        while v > 0 { tmp[n] = b'0' + (v % 10) as u8; n += 1; v /= 10; }
+        for j in (0..n).rev() { buf[i] = tmp[j]; i += 1; }
+    }
+    buf[i] = b'.'; i += 1;
+    buf[i] = b'0'; i += 1;
+    buf[i] = b'0'; i += 1;
+    buf[i] = b'\n'; i += 1;
+    i
+}
+
 /// Open a virtual file (/etc/*, /proc/*, /sys/*). Returns Some(content_len) or None.
 pub(crate) fn open_virtual_file(name: &[u8], dir_buf: &mut [u8]) -> Option<usize> {
     if starts_with(name, b"/etc/") {
@@ -128,6 +160,11 @@ pub(crate) fn open_virtual_file(name: &[u8], dir_buf: &mut [u8]) -> Option<usize
             gen_len = n;
         } else if name == b"/etc/group" {
             let c = b"root:x:0:\nnogroup:x:65534:\n";
+            let n = c.len().min(dir_buf.len());
+            dir_buf[..n].copy_from_slice(&c[..n]);
+            gen_len = n;
+        } else if name == b"/etc/os-release" {
+            let c = b"PRETTY_NAME=\"sotOS (Exokernel)\"\nNAME=\"sotOS\"\nID=sotos\nVERSION=\"1.0\"\nVERSION_ID=\"1.0\"\nHOME_URL=\"https://github.com/nicksotomern/sotOS\"\n";
             let n = c.len().min(dir_buf.len());
             dir_buf[..n].copy_from_slice(&c[..n]);
             gen_len = n;
@@ -167,6 +204,37 @@ pub(crate) fn open_virtual_file(name: &[u8], dir_buf: &mut [u8]) -> Option<usize
             let c = b"0\n";
             dir_buf[..c.len()].copy_from_slice(c);
             gen_len = c.len();
+        } else if name == b"/proc/uptime" {
+            let tsc = rdtsc();
+            let secs = tsc / 2_000_000_000; // ~2GHz assumed
+            let mut buf = [0u8; 32];
+            let n = fmt_uptime(secs, &mut buf);
+            dir_buf[..n].copy_from_slice(&buf[..n]);
+            gen_len = n;
+        } else if name == b"/proc/loadavg" {
+            let c = b"0.00 0.00 0.00 1/1 1\n";
+            dir_buf[..c.len()].copy_from_slice(c);
+            gen_len = c.len();
+        } else if name == b"/proc/sys/kernel/hostname" {
+            let c = b"sotOS\n";
+            dir_buf[..c.len()].copy_from_slice(c);
+            gen_len = c.len();
+        } else if name == b"/proc/sys/kernel/osrelease" {
+            let c = b"5.15.0-sotOS\n";
+            dir_buf[..c.len()].copy_from_slice(c);
+            gen_len = c.len();
+        } else if starts_with(name, b"/sys/devices/virtual/dmi/id/") {
+            // DMI/SMBIOS: board_name, board_vendor, product_name, etc.
+            let c = b"QEMU Virtual Machine\n";
+            dir_buf[..c.len()].copy_from_slice(c);
+            gen_len = c.len();
+        } else if starts_with(name, b"/sys/class/") || starts_with(name, b"/sys/bus/")
+               || starts_with(name, b"/sys/devices/") {
+            // Generic /sys stub: return empty
+            gen_len = 0;
+        } else if starts_with(name, b"/proc/self/") || starts_with(name, b"/proc/1/") {
+            // Unhandled /proc/self/* paths: return empty (non-fatal for fastfetch)
+            gen_len = 0;
         } else {
             return None;
         }

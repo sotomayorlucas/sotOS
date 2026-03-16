@@ -579,9 +579,11 @@ pub(crate) fn sys_write(ctx: &mut SyscallContext, msg: &IpcMsg) {
         11 => {
             // Pipe write (blocking): write ALL bytes to shared pipe buffer.
             let pipe_id = ctx.sock_conn_id[fd] as usize;
-            // Trace pipe writes from wineserver (pid 5) for IPC debugging
-            if ctx.pid == 5 && len > 60 {
-                print(b"PW5 fd="); print_u64(fd as u64);
+            // Trace pipe writes for Wine IPC debugging (pid >= 3, disabled for clean output)
+            if false && ctx.pid >= 3 && len > 60 {
+                print(b"PW P"); print_u64(ctx.pid as u64);
+                print(b" fd="); print_u64(fd as u64);
+                print(b" pipe="); print_u64(pipe_id as u64);
                 print(b" len="); print_u64(len as u64);
                 print(b"\n");
             }
@@ -601,6 +603,13 @@ pub(crate) fn sys_write(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     }
                 }
                 total_written += off;
+            }
+            if false && ctx.pid >= 3 && total_written != len {
+                print(b"PW-PARTIAL P"); print_u64(ctx.pid as u64);
+                print(b" fd="); print_u64(fd as u64);
+                print(b" wrote="); print_u64(total_written as u64);
+                print(b"/"); print_u64(len as u64);
+                print(b"\n");
             }
             if total_written > 0 {
                 reply_val(ctx.ep_cap, total_written as i64);
@@ -666,11 +675,6 @@ pub(crate) fn sys_write(ctx: &mut SyscallContext, msg: &IpcMsg) {
         }
         27 | 28 => {
             // AF_UNIX connected socket write (blocking).
-            // kind=27 (client): write to pipe_a (client→server)
-            // kind=28 (server): write to pipe_b (server→client)
-            // Must block until ALL bytes are written (blocking socket semantics).
-            // Wine's wineserver IPC sends large messages; partial writes cause
-            // "wine client error" and abort the connection.
             let conn = ctx.sock_conn_id[fd] as usize;
             if conn < crate::fd::MAX_UNIX_CONNS {
                 let pipe_id = if ctx.child_fds[fd] == 27 {
@@ -678,6 +682,7 @@ pub(crate) fn sys_write(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 } else {
                     unsafe { crate::fd::UNIX_CONN_PIPE_B[conn] as usize }
                 };
+                // UXW tracing disabled for clean output
                 // Write ALL bytes (blocking socket semantics). Retry indefinitely
                 // until the reader drains the pipe. Wine's wineserver IPC requires
                 // full writes — partial writes cause fatal "wine client error".
@@ -982,16 +987,7 @@ pub(crate) fn sys_pread64(ctx: &mut SyscallContext, msg: &IpcMsg) {
 /// Returns true if the fd was valid and closed.
 pub(crate) fn close_fd_internal(ctx: &mut SyscallContext, fd: usize) -> bool {
     if fd >= GRP_MAX_FDS || ctx.child_fds[fd] == 0 { return false; }
-    if ctx.pid >= 3 {
-        let k = ctx.child_fds[fd];
-        if k == 10 || k == 11 {
-            print(b"FD-CLOSE P"); print_u64(ctx.pid as u64);
-            print(b" fd="); print_u64(fd as u64);
-            print(b" k="); print_u64(k as u64);
-            print(b" pipe="); print_u64(ctx.sock_conn_id[fd] as u64);
-            print(b"\n");
-        }
-    }
+    // FD-CLOSE tracing disabled for clean output
     if ctx.child_fds[fd] == 12 {
         for s in 0..GRP_MAX_INITRD {
             if ctx.initrd_files[s][3] == fd as u64 {
@@ -1049,17 +1045,9 @@ pub(crate) fn close_fd_internal(ctx: &mut SyscallContext, fd: usize) -> bool {
         if pipe_id < MAX_PIPES {
             let prev = PIPE_WRITE_REFS[pipe_id].fetch_sub(1, Ordering::AcqRel);
             if ctx.pid >= 3 {
-                print(b"CLOSE-PW P"); print_u64(ctx.pid as u64);
-                print(b" fd="); print_u64(fd as u64);
-                print(b" pipe="); print_u64(pipe_id as u64);
-                print(b" wrefs="); print_u64(prev); // prev = before decrement
-                print(b"->"); print_u64(if prev > 0 { prev - 1 } else { 0 });
-                print(b"\n");
+                // CLOSE-PW tracing disabled for clean output
             }
             if prev <= 1 {
-                print(b"PWC-SET close P"); print_u64(ctx.pid as u64);
-                print(b" pipe="); print_u64(pipe_id as u64);
-                print(b"\n");
                 PIPE_WRITE_CLOSED[pipe_id].store(1, Ordering::Release);
                 if PIPE_READ_CLOSED[pipe_id].load(Ordering::Acquire) != 0 {
                     pipe_free(pipe_id);
@@ -1120,18 +1108,21 @@ pub(crate) fn close_fd_internal(ctx: &mut SyscallContext, fd: usize) -> bool {
     ctx.child_fds[fd] = 0;
     // Clear cloexec bit
     if fd < 128 { *ctx.fd_cloexec &= !(1u128 << fd); }
+    // Auto-remove from epoll (Linux semantics: close() removes fd from all epoll instances)
+    for i in 0..MAX_EPOLL_ENTRIES {
+        if ctx.epoll_reg_fd[i] == fd as i32 {
+            ctx.epoll_reg_fd[i] = -1;
+            ctx.epoll_reg_events[i] = 0;
+            ctx.epoll_reg_data[i] = 0;
+        }
+    }
     true
 }
 
 /// SYS_CLOSE (3): close fd, cleaning up associated resources.
 pub(crate) fn sys_close(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let fd = msg.regs[0] as usize;
-    if ctx.pid >= 5 && fd < GRP_MAX_FDS {
-        print(b"CLOSE P"); print_u64(ctx.pid as u64);
-        print(b" fd="); print_u64(fd as u64);
-        print(b" kind="); print_u64(ctx.child_fds[fd] as u64);
-        print(b"\n");
-    }
+    // CLOSE tracing disabled for clean output
     close_fd_internal(ctx, fd);
     reply_val(ctx.ep_cap, 0);
 }
@@ -1878,7 +1869,7 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let pipe_id = ctx.sock_conn_id[fd] as usize;
         let cnt = iovcnt.min(16);
         let mut total = 0usize;
-        // Pipe writev tracing disabled during clone
+        // Pipe writev tracing for Wine IPC debugging (disabled for clean output)
         if false && ctx.pid >= 3 && cnt > 0 {
             // Compute total length
             let mut tlen = 0usize;
@@ -1935,6 +1926,7 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
             total += written;
             if written < safe_ilen { break; }
         }
+        // PIPEV-PARTIAL tracing disabled for clean output
         reply_val(ctx.ep_cap, total as i64);
     } else if fd < GRP_MAX_FDS && (ctx.child_fds[fd] == 27 || ctx.child_fds[fd] == 28) {
         // AF_UNIX socket writev: gather iovecs and write to pipe (blocking)
@@ -2191,6 +2183,14 @@ pub(crate) fn sys_dup2(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let op = ctx.sock_conn_id[oldfd] as usize;
         if ok == 11 && op < MAX_PIPES { PIPE_WRITE_REFS[op].fetch_add(1, Ordering::AcqRel); }
         else if ok == 10 && op < MAX_PIPES { PIPE_READ_REFS[op].fetch_add(1, Ordering::AcqRel); }
+        // Auto-remove newfd from epoll (dup2 implicitly closes newfd)
+        for i in 0..MAX_EPOLL_ENTRIES {
+            if ctx.epoll_reg_fd[i] == newfd as i32 {
+                ctx.epoll_reg_fd[i] = -1;
+                ctx.epoll_reg_events[i] = 0;
+                ctx.epoll_reg_data[i] = 0;
+            }
+        }
         // Clean up old vfs_files slot for newfd before overwriting
         if ctx.child_fds[newfd] == 13 || ctx.child_fds[newfd] == 14 {
             for s in 0..GRP_MAX_VFS {

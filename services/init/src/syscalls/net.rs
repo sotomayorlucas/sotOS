@@ -1304,10 +1304,11 @@ pub(crate) fn sys_epoll_wait(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let max_events = (msg.regs[2] as usize).min(32);
     let timeout = msg.regs[3] as i32;
 
-    // Debug: first epoll_wait call per-process, dump registered fds
-    static mut EPOLL_DBG_DONE: [bool; 16] = [false; 16];
-    if ctx.pid < 16 && !unsafe { EPOLL_DBG_DONE[ctx.pid] } {
-        unsafe { EPOLL_DBG_DONE[ctx.pid] = true; }
+    // Debug: first 3 epoll_wait calls per-process, dump registered fds
+    static mut EPOLL_DBG_COUNT: [u32; 16] = [0; 16];
+    let show_dbg = ctx.pid < 16 && unsafe { EPOLL_DBG_COUNT[ctx.pid] } < 3;
+    if show_dbg {
+        unsafe { EPOLL_DBG_COUNT[ctx.pid] += 1; }
         print(b"EPOLL-WAIT-DBG P"); print_u64(ctx.pid as u64);
         print(b" timeout="); print_u64(timeout as u64);
         print(b" regs:");
@@ -1388,6 +1389,11 @@ pub(crate) fn sys_epoll_wait(ctx: &mut SyscallContext, msg: &IpcMsg) {
         }
     }
     if ready_count > 0 || timeout == 0 {
+        if show_dbg {
+            print(b"EPOLL-RET P"); print_u64(ctx.pid as u64);
+            print(b" ready="); print_u64(ready_count as u64);
+            print(b" (immediate)\n");
+        }
         reply_val(ep_cap, ready_count as i64);
     } else {
         let deadline = rdtsc() + (timeout as u64).min(30000) * 2_000_000;
