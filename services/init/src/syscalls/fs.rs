@@ -1903,30 +1903,80 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
             }
             print(b"]\n");
         }
+        // Compute expected total for partial-write detection
+        let mut expected_total = 0usize;
+        for j in 0..cnt {
+            let e = iov_ptr + (j as u64) * 16;
+            if e + 16 > 0x0000_8000_0000_0000 { break; }
+            let il = ctx.guest_read_u64(e + 8) as usize;
+            expected_total += il;
+        }
         for i in 0..cnt {
             let entry = iov_ptr + (i as u64) * 16;
             if entry + 16 > 0x0000_8000_0000_0000 { break; }
             let base = ctx.guest_read_u64(entry);
             let ilen = ctx.guest_read_u64(entry + 8) as usize;
-            if base == 0 || ilen == 0 { continue; }
-            let safe_ilen = ilen.min(4096);
-            let mut local_buf = [0u8; 4096];
-            ctx.guest_read(base, &mut local_buf[..safe_ilen]);
-            let src = &local_buf[..safe_ilen];
-            let mut written = 0usize;
-            while written < safe_ilen {
-                let n = pipe_write(pipe_id, &src[written..]);
-                if n > 0 {
-                    written += n;
-                } else {
-                    sys::yield_now(); // reader may be slow, keep trying
-                    sys::yield_now();
+            if ilen == 0 { continue; }
+            // If base reads as 0 but len > 0, retry once (vm_read may have
+            // raced with a CoW fault being processed by the VMM).
+            let base = if base == 0 && ilen > 0 {
+                sys::yield_now();
+                let retry = ctx.guest_read_u64(entry);
+                if retry == 0 {
+                    // Genuine NULL iovec — skip (EFAULT in Linux)
+                    print(b"WRITEV-NULL-IOV P"); print_u64(ctx.pid as u64);
+                    print(b" iov="); print_u64(i as u64);
+                    print(b" len="); print_u64(ilen as u64);
+                    print(b" as_cap="); print_u64(ctx.child_as_cap);
+                    print(b"\n");
+                    continue;
                 }
+                retry
+            } else if base == 0 {
+                continue;
+            } else {
+                base
+            };
+            // Write full iovec in 4096-byte chunks (blocking).
+            // Previous code truncated to 4096 — Wine requests can be larger.
+            let mut iov_written = 0usize;
+            while iov_written < ilen {
+                let chunk = (ilen - iov_written).min(4096);
+                let mut local_buf = [0u8; 4096];
+                ctx.guest_read(base + iov_written as u64, &mut local_buf[..chunk]);
+                let mut off = 0usize;
+                while off < chunk {
+                    let n = pipe_write(pipe_id, &local_buf[off..chunk]);
+                    if n > 0 { off += n; }
+                    else {
+                        sys::yield_now();
+                        sys::yield_now();
+                    }
+                }
+                iov_written += off;
+                if off < chunk { break; }
             }
-            total += written;
-            if written < safe_ilen { break; }
+            total += iov_written;
+            if iov_written < ilen { break; }
         }
-        // PIPEV-PARTIAL tracing disabled for clean output
+        // Diagnostic: detect partial writes (Wine IPC failure root cause)
+        if total != expected_total && expected_total > 0 && ctx.pid >= 3 {
+            print(b"PIPEV-PARTIAL P"); print_u64(ctx.pid as u64);
+            print(b" fd="); print_u64(fd as u64);
+            print(b" wrote="); print_u64(total as u64);
+            print(b"/"); print_u64(expected_total as u64);
+            print(b" as="); print_u64(ctx.child_as_cap);
+            print(b" cnt="); print_u64(cnt as u64);
+            // Dump iovec details
+            for j in 0..cnt.min(4) {
+                let e = iov_ptr + (j as u64) * 16;
+                if e + 16 > 0x0000_8000_0000_0000 { break; }
+                let b = ctx.guest_read_u64(e);
+                let l = ctx.guest_read_u64(e + 8);
+                print(b" ["); print_u64(b); print(b","); print_u64(l); print(b"]");
+            }
+            print(b"\n");
+        }
         reply_val(ctx.ep_cap, total as i64);
     } else if fd < GRP_MAX_FDS && (ctx.child_fds[fd] == 27 || ctx.child_fds[fd] == 28) {
         // AF_UNIX socket writev: gather iovecs and write to pipe (blocking)

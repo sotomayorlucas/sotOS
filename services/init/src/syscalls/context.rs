@@ -75,16 +75,27 @@ impl SyscallContext<'_> {
                 core::ptr::copy_nonoverlapping(remote_ptr as *const u8, buf.as_mut_ptr(), buf.len());
             }
         } else {
-            // Read in chunks of up to 4096 bytes
+            // Read in chunks of up to 4096 bytes.
+            // If vm_read fails (e.g. CoW page not yet faulted in by VMM),
+            // yield to let the VMM handle pending faults and retry once.
             let mut done = 0;
             while done < buf.len() {
                 let chunk = (buf.len() - done).min(4096);
-                let _ = sotos_common::sys::vm_read(
+                let r = sotos_common::sys::vm_read(
                     self.child_as_cap,
                     remote_ptr + done as u64,
                     buf[done..].as_mut_ptr() as u64,
                     chunk as u64,
                 );
+                if r.is_err() {
+                    sotos_common::sys::yield_now();
+                    let _ = sotos_common::sys::vm_read(
+                        self.child_as_cap,
+                        remote_ptr + done as u64,
+                        buf[done..].as_mut_ptr() as u64,
+                        chunk as u64,
+                    );
+                }
                 done += chunk;
             }
         }
