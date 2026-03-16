@@ -220,24 +220,13 @@ extern "x86-interrupt" fn general_protection_handler(frame: InterruptStackFrame,
                     frame.instruction_pointer.as_u64(), frame.stack_pointer.as_u64(), n);
             }
         }
-        // Deliver SIGSEGV. Set pending signal and let the next syscall or
-        // timer tick deliver it. Skip the faulting instruction to avoid an
-        // infinite #GP loop (advance RIP past the faulting instruction).
+        // Set SIGSEGV pending and exit the thread. Wine will see
+        // WIFSIGNALED(SIGSEGV) on waitpid() and handle it.
+        // We can't return to the faulting instruction (infinite #GP loop)
+        // and we can't use the VMM fault queue (#GP is not a page fault).
         if let Some(tid) = crate::sched::current_tid() {
             crate::sched::set_pending_signal(tid, 11);
-            crate::sched::set_fault_info_current(
-                frame.instruction_pointer.as_u64(), 0,
-            );
         }
-        // Push the thread to the VMM fault queue so it gets suspended
-        // and the signal is delivered when it's next scheduled.
-        if let Some(tid) = crate::sched::current_tid() {
-            if crate::fault::push_fault(tid.0, frame.instruction_pointer.as_u64(), 0, 0) {
-                crate::sched::fault_current();
-                // fault_current doesn't return — thread is suspended
-            }
-        }
-        // Fallback: exit the thread if fault queue is full
         crate::sched::exit_current();
         return;
     }

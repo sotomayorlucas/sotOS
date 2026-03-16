@@ -1010,12 +1010,22 @@ pub(crate) extern "C" fn child_handler() -> ! {
                     // Write the list sentinel (rbx+0x1088) to address 0 so the loop
                     // terminates. Only apply when rbx looks like a valid glibc pointer
                     // (non-zero, in user space) to avoid corrupting Wine's NT TIB.
-                    // Always write sentinel — needed for ALL glibc children including
-                    // wineserver. The sentinel terminates the atfork linked list loop.
+                    // Fix glibc fork atfork list: make the list head an empty
+                    // self-referencing circular list. The head is at rbx+0x1088.
+                    // Write head_addr to both [head] and [head+8] (next and prev
+                    // pointers) so glibc sees an empty list and skips traversal.
+                    // Also write sentinel to address 0 (demand-paged NULL page
+                    // fallback in case a stale node still points to NULL).
                     {
-                        let sentinel = fork_rbx.wrapping_add(0x1088);
+                        let head_addr = fork_rbx.wrapping_add(0x1088);
+                        // Make list head point to itself (empty circular list)
+                        let _ = sys::vm_write(child_as_cap, head_addr,
+                            &head_addr as *const u64 as u64, 8);
+                        let _ = sys::vm_write(child_as_cap, head_addr + 8,
+                            &head_addr as *const u64 as u64, 8);
+                        // Also patch NULL page as fallback
                         let _ = sys::vm_write(child_as_cap, 0,
-                            &sentinel as *const u64 as u64, 8);
+                            &head_addr as *const u64 as u64, 8);
                     }
 
                     // Eagerly copy TLS page and patch TID fields.
@@ -1423,11 +1433,15 @@ pub(crate) extern "C" fn child_handler() -> ! {
                     } else { print(b"FK-PTE-A ABSENT\n"); }
                 }
 
-                // Fix glibc fork linked list spin (same as SYS_CLONE path).
+                // Fix glibc fork atfork list (same as SYS_CLONE path).
                 {
-                    let sentinel = fork_rbx.wrapping_add(0x1088);
+                    let head_addr = fork_rbx.wrapping_add(0x1088);
+                    let _ = sys::vm_write(child_as_cap, head_addr,
+                        &head_addr as *const u64 as u64, 8);
+                    let _ = sys::vm_write(child_as_cap, head_addr + 8,
+                        &head_addr as *const u64 as u64, 8);
                     let _ = sys::vm_write(child_as_cap, 0,
-                        &sentinel as *const u64 as u64, 8);
+                        &head_addr as *const u64 as u64, 8);
                 }
 
                 // Eagerly copy stack pages for the child.
