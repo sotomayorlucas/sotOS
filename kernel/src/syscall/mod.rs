@@ -1809,16 +1809,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
                         paging::set_wx_relaxed(child_cr3, true);
                     }
                     // Auto-enable RIP profiler on the 5th+ AS clone (Wine P7+)
-                    {
-                        use core::sync::atomic::{AtomicU32, Ordering};
-                        static CLONE_COUNT: AtomicU32 = AtomicU32::new(0);
-                        let n = CLONE_COUNT.fetch_add(1, Ordering::Relaxed);
-                        crate::kprintln!("AS-CLONE #{} cr3={:#x}", n, child_cr3);
-                        if n >= 2 {
-                            crate::arch::x86_64::idt::DEBUG_PROFILE_CR3
-                                .store(child_cr3, Ordering::Release);
-                        }
-                    }
+                    // Auto-profiler disabled (spin loop already diagnosed)
 
                     match cap::insert(CapObject::AddrSpace { cr3: child_cr3 }, Rights::ALL, None) {
                         Some(cap_id) => {
