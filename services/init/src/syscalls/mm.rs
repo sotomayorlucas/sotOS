@@ -254,6 +254,13 @@ pub(crate) fn sys_mmap(ctx: &mut SyscallContext, msg: &IpcMsg) {
             print(b"NTDLL-BASE P"); crate::framebuffer::print_u64(ctx.pid as u64);
             print(b" base="); crate::framebuffer::print_hex64(base);
             print(b"\n");
+            // Re-trigger SharedUserData patch now that we know the ntdll base.
+            // The 0x7ffe0000 mmap may have happened BEFORE ntdll base was known,
+            // causing the patch to bail with "NO-BASE". Now we can compute the
+            // correct dispatcher address.
+            if !unsafe { WINE_KUSD_DONE[ctx.pid] } {
+                wine_patch_shared_user_data(ctx, 0x7ffe0000);
+            }
         }
     }
 
