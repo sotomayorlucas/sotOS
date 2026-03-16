@@ -446,14 +446,7 @@ pub(crate) fn sys_write(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let fd = msg.regs[0] as usize;
     let buf_ptr = msg.regs[1];
     let len = msg.regs[2] as usize;
-    // Trace non-stdout writes for Wine partial write debugging
-    if ctx.pid >= 2 && fd < GRP_MAX_FDS && ctx.child_fds[fd] != 2 && ctx.child_fds[fd] != 0 && len > 60 {
-        print(b"W P"); print_u64(ctx.pid as u64);
-        print(b" fd="); print_u64(fd as u64);
-        print(b" k="); print_u64(ctx.child_fds[fd] as u64);
-        print(b" len="); print_u64(len as u64);
-        print(b"\n");
-    }
+    // Write tracing disabled for performance
     if fd >= GRP_MAX_FDS || ctx.child_fds[fd] == 0 {
         reply_val(ctx.ep_cap, -EBADF);
         return;
@@ -586,8 +579,8 @@ pub(crate) fn sys_write(ctx: &mut SyscallContext, msg: &IpcMsg) {
         11 => {
             // Pipe write (blocking): write ALL bytes to shared pipe buffer.
             let pipe_id = ctx.sock_conn_id[fd] as usize;
-            // Trace pipe writes for Wine IPC debugging
-            if ctx.pid >= 2 && len > 60 {
+            // Pipe write tracing disabled for performance
+            if false && ctx.pid >= 2 && len > 60 {
                 print(b"PW P"); print_u64(ctx.pid as u64);
                 print(b" fd="); print_u64(fd as u64);
                 print(b" pipe="); print_u64(pipe_id as u64);
@@ -1762,16 +1755,7 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let fd = msg.regs[0] as usize;
     let iov_ptr = msg.regs[1];
     let iovcnt = msg.regs[2] as usize;
-    // Log ALL writev calls from P2 (Wine partial write debugging)
-    if ctx.pid == 2 && fd < GRP_MAX_FDS {
-        let k = ctx.child_fds[fd];
-        if k != 2 && k != 0 {
-            print(b"WV P2 fd="); print_u64(fd as u64);
-            print(b" k="); print_u64(k as u64);
-            print(b" cnt="); print_u64(iovcnt as u64);
-            print(b"\n");
-        }
-    }
+    // Writev tracing disabled for performance
     if fd < GRP_MAX_FDS && ctx.child_fds[fd] == 2 {
         let mut total: usize = 0;
         let cnt = iovcnt.min(16);
@@ -2539,8 +2523,8 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let flags = msg.regs[2] as u32;
     let mut path = [0u8; 128];
     let path_len = ctx.guest_copy_path(path_ptr, &mut path);
-    // Debug: trace openat paths from P3+ (suppress P5+ to reduce serial noise during Wine)
-    if ctx.pid >= 3 && ctx.pid < 5 {
+    // Debug: trace openat paths for P6 only (Wine hello.exe debugging)
+    if ctx.pid == 6 {
         print(b"OPENAT P"); print_u64(ctx.pid as u64);
         print(b" fl=0x"); crate::framebuffer::print_hex64(flags as u64);
         print(b" ["); for &b in &path[..path_len] { sys::debug_print(b); } print(b"]\n");

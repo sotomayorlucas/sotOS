@@ -167,7 +167,7 @@ pub(crate) fn sys_mmap(ctx: &mut SyscallContext, msg: &IpcMsg) {
     // Suppress MMAP logging for NOREPLACE+PROT_NONE probes (Wine VA reservation
     // binary search generates thousands of these, flooding serial).
     let is_noreplace_probe = prot == 0 && (flags & MAP_FIXED_NOREPLACE_FLAG) != 0;
-    if !is_noreplace_probe && ctx.child_as_cap != 0 && ctx.pid >= 3 {
+    if !is_noreplace_probe && ctx.pid == 6 {
         print(b"MMAP P"); crate::framebuffer::print_u64(ctx.pid as u64);
         print(b" addr="); crate::framebuffer::print_hex64(req_addr);
         print(b" fd="); crate::framebuffer::print_u64(fd as u64);
