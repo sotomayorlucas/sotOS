@@ -1010,22 +1010,20 @@ pub(crate) extern "C" fn child_handler() -> ! {
                     // Write the list sentinel (rbx+0x1088) to address 0 so the loop
                     // terminates. Only apply when rbx looks like a valid glibc pointer
                     // (non-zero, in user space) to avoid corrupting Wine's NT TIB.
-                    // Fix glibc fork atfork list: make the list head an empty
-                    // self-referencing circular list. The head is at rbx+0x1088.
-                    // Write head_addr to both [head] and [head+8] (next and prev
-                    // pointers) so glibc sees an empty list and skips traversal.
-                    // Also write sentinel to address 0 (demand-paged NULL page
-                    // fallback in case a stale node still points to NULL).
-                    {
+                    // Fix glibc fork atfork list: write sentinel to address 0 AND
+                    // make the list head self-referencing (empty circular list).
+                    if fork_rbx != 0 {
                         let head_addr = fork_rbx.wrapping_add(0x1088);
-                        // Make list head point to itself (empty circular list)
-                        let _ = sys::vm_write(child_as_cap, head_addr,
-                            &head_addr as *const u64 as u64, 8);
-                        let _ = sys::vm_write(child_as_cap, head_addr + 8,
-                            &head_addr as *const u64 as u64, 8);
-                        // Also patch NULL page as fallback
+                        // Patch NULL page so *(NULL) returns sentinel (stops infinite loop)
                         let _ = sys::vm_write(child_as_cap, 0,
                             &head_addr as *const u64 as u64, 8);
+                        // Make list head point to itself (empty list → skip traversal)
+                        if head_addr > 0x10000 && head_addr < 0x0000_8000_0000_0000 {
+                            let _ = sys::vm_write(child_as_cap, head_addr,
+                                &head_addr as *const u64 as u64, 8);
+                            let _ = sys::vm_write(child_as_cap, head_addr + 8,
+                                &head_addr as *const u64 as u64, 8);
+                        }
                     }
 
                     // Eagerly copy TLS page and patch TID fields.
@@ -1434,14 +1432,16 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 }
 
                 // Fix glibc fork atfork list (same as SYS_CLONE path).
-                {
+                if fork_rbx != 0 {
                     let head_addr = fork_rbx.wrapping_add(0x1088);
-                    let _ = sys::vm_write(child_as_cap, head_addr,
-                        &head_addr as *const u64 as u64, 8);
-                    let _ = sys::vm_write(child_as_cap, head_addr + 8,
-                        &head_addr as *const u64 as u64, 8);
                     let _ = sys::vm_write(child_as_cap, 0,
                         &head_addr as *const u64 as u64, 8);
+                    if head_addr > 0x10000 && head_addr < 0x0000_8000_0000_0000 {
+                        let _ = sys::vm_write(child_as_cap, head_addr,
+                            &head_addr as *const u64 as u64, 8);
+                        let _ = sys::vm_write(child_as_cap, head_addr + 8,
+                            &head_addr as *const u64 as u64, 8);
+                    }
                 }
 
                 // Eagerly copy stack pages for the child.
