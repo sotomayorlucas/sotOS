@@ -446,7 +446,14 @@ pub(crate) fn sys_write(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let fd = msg.regs[0] as usize;
     let buf_ptr = msg.regs[1];
     let len = msg.regs[2] as usize;
-    // (debug logging removed — serial is too slow for per-syscall prints)
+    // Trace non-stdout writes for Wine partial write debugging
+    if ctx.pid >= 2 && fd < GRP_MAX_FDS && ctx.child_fds[fd] != 2 && ctx.child_fds[fd] != 0 && len > 60 {
+        print(b"W P"); print_u64(ctx.pid as u64);
+        print(b" fd="); print_u64(fd as u64);
+        print(b" k="); print_u64(ctx.child_fds[fd] as u64);
+        print(b" len="); print_u64(len as u64);
+        print(b"\n");
+    }
     if fd >= GRP_MAX_FDS || ctx.child_fds[fd] == 0 {
         reply_val(ctx.ep_cap, -EBADF);
         return;
@@ -579,8 +586,8 @@ pub(crate) fn sys_write(ctx: &mut SyscallContext, msg: &IpcMsg) {
         11 => {
             // Pipe write (blocking): write ALL bytes to shared pipe buffer.
             let pipe_id = ctx.sock_conn_id[fd] as usize;
-            // Trace pipe writes for Wine IPC debugging (pid >= 3, disabled for clean output)
-            if false && ctx.pid >= 3 && len > 60 {
+            // Trace pipe writes for Wine IPC debugging
+            if ctx.pid >= 2 && len > 60 {
                 print(b"PW P"); print_u64(ctx.pid as u64);
                 print(b" fd="); print_u64(fd as u64);
                 print(b" pipe="); print_u64(pipe_id as u64);
@@ -604,7 +611,7 @@ pub(crate) fn sys_write(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 }
                 total_written += off;
             }
-            if false && ctx.pid >= 3 && total_written != len {
+            if ctx.pid >= 2 && total_written != len {
                 print(b"PW-PARTIAL P"); print_u64(ctx.pid as u64);
                 print(b" fd="); print_u64(fd as u64);
                 print(b" wrote="); print_u64(total_written as u64);
@@ -1755,7 +1762,16 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let fd = msg.regs[0] as usize;
     let iov_ptr = msg.regs[1];
     let iovcnt = msg.regs[2] as usize;
-    // (debug logging removed — serial too slow for per-syscall prints)
+    // Log ALL writev calls from P2 (Wine partial write debugging)
+    if ctx.pid == 2 && fd < GRP_MAX_FDS {
+        let k = ctx.child_fds[fd];
+        if k != 2 && k != 0 {
+            print(b"WV P2 fd="); print_u64(fd as u64);
+            print(b" k="); print_u64(k as u64);
+            print(b" cnt="); print_u64(iovcnt as u64);
+            print(b"\n");
+        }
+    }
     if fd < GRP_MAX_FDS && ctx.child_fds[fd] == 2 {
         let mut total: usize = 0;
         let cnt = iovcnt.min(16);
@@ -1869,8 +1885,8 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let pipe_id = ctx.sock_conn_id[fd] as usize;
         let cnt = iovcnt.min(16);
         let mut total = 0usize;
-        // Pipe writev tracing for Wine IPC debugging (disabled for clean output)
-        if false && ctx.pid >= 3 && cnt > 0 {
+        // Pipe writev tracing for Wine IPC debugging
+        if ctx.pid >= 2 && cnt > 0 {
             // Compute total length
             let mut tlen = 0usize;
             for j in 0..cnt {
@@ -1910,6 +1926,19 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
             if e + 16 > 0x0000_8000_0000_0000 { break; }
             let il = ctx.guest_read_u64(e + 8) as usize;
             expected_total += il;
+        }
+        // Dump iovec details for P2 pipe writev (Wine partial write debugging)
+        if ctx.pid == 2 {
+            for j in 0..cnt.min(4) {
+                let e = iov_ptr + (j as u64) * 16;
+                if e + 16 > 0x0000_8000_0000_0000 { break; }
+                let b = ctx.guest_read_u64(e);
+                let l = ctx.guest_read_u64(e + 8);
+                print(b"IOV P2 ["); print_u64(j as u64);
+                print(b"] b="); crate::framebuffer::print_hex64(b);
+                print(b" l="); print_u64(l);
+                print(b"\n");
+            }
         }
         for i in 0..cnt {
             let entry = iov_ptr + (i as u64) * 16;
@@ -1960,7 +1989,7 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
             if iov_written < ilen { break; }
         }
         // Diagnostic: detect partial writes (Wine IPC failure root cause)
-        if total != expected_total && expected_total > 0 && ctx.pid >= 3 {
+        if total != expected_total && expected_total > 0 && ctx.pid >= 2 {
             print(b"PIPEV-PARTIAL P"); print_u64(ctx.pid as u64);
             print(b" fd="); print_u64(fd as u64);
             print(b" wrote="); print_u64(total as u64);
@@ -1975,6 +2004,11 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 let l = ctx.guest_read_u64(e + 8);
                 print(b" ["); print_u64(b); print(b","); print_u64(l); print(b"]");
             }
+            print(b"\n");
+        }
+        if ctx.pid == 2 {
+            print(b"WRITEV-RET P2 total="); print_u64(total as u64);
+            print(b" exp="); print_u64(expected_total as u64);
             print(b"\n");
         }
         reply_val(ctx.ep_cap, total as i64);
