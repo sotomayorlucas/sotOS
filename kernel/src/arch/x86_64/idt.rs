@@ -220,14 +220,25 @@ extern "x86-interrupt" fn general_protection_handler(frame: InterruptStackFrame,
                     frame.instruction_pointer.as_u64(), frame.stack_pointer.as_u64(), n);
             }
         }
-        // Deliver SIGSEGV — Wine's ntdll vectored exception handler will catch it.
+        // Deliver SIGSEGV. Set pending signal and let the next syscall or
+        // timer tick deliver it. Skip the faulting instruction to avoid an
+        // infinite #GP loop (advance RIP past the faulting instruction).
         if let Some(tid) = crate::sched::current_tid() {
             crate::sched::set_pending_signal(tid, 11);
             crate::sched::set_fault_info_current(
                 frame.instruction_pointer.as_u64(), 0,
             );
         }
-        unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
+        // Push the thread to the VMM fault queue so it gets suspended
+        // and the signal is delivered when it's next scheduled.
+        if let Some(tid) = crate::sched::current_tid() {
+            if crate::fault::push_fault(tid.0, frame.instruction_pointer.as_u64(), 0, 0) {
+                crate::sched::fault_current();
+                // fault_current doesn't return — thread is suspended
+            }
+        }
+        // Fallback: exit the thread if fault queue is full
+        crate::sched::exit_current();
         return;
     }
     panic!("EXCEPTION: general protection fault (code {})\n{:#?}", code, frame);
