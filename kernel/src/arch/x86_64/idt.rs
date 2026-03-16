@@ -244,8 +244,8 @@ extern "x86-interrupt" fn general_protection_handler(frame: InterruptStackFrame,
             let mut bp = rbp_val;
             for i in 0..6u32 {
                 if bp < 0x1000 || bp >= 0x0000_8000_0000_0000 { break; }
-                let saved_bp = unsafe { *(bp as *const u64) };
-                let saved_ip = unsafe { *((bp + 8) as *const u64) };
+                let saved_bp = unsafe { core::ptr::read_unaligned(bp as *const u64) };
+                let saved_ip = unsafe { core::ptr::read_unaligned((bp + 8) as *const u64) };
                 kprintln!("#GP bt[{}]: rip={:#x} rbp={:#x}", i, saved_ip, saved_bp);
                 bp = saved_bp;
             }
