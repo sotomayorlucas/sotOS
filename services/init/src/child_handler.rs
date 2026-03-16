@@ -316,13 +316,12 @@ pub(crate) extern "C" fn child_handler() -> ! {
     let _sigg = PROCESSES[pid - 1].sig_group.load(Ordering::Acquire) as usize;
 
     // Per-child brk/mmap state. Each memory group gets its own region.
-    const CHILD_REGION_SIZE: u64 = 0x4000000; // 64 MiB per child (brk + mmap)
-    const CHILD_BRK_BASE: u64 = 0x7000000;
-    const CHILD_MMAP_OFFSET: u64 = 0x1000000; // mmap starts 16 MiB into the region
+    const CHILD_REGION_SIZE: u64 = 0x10000000; // 256 MiB per child (brk + mmap)
+    const CHILD_BRK_BASE: u64 = 0x200000000; // 8 GiB — above Wine PE region (ntdll.dll=0x68M, kernel32=0x7BM)
+    const CHILD_MMAP_OFFSET: u64 = 0x4000000; // mmap starts 64 MiB into the region
     // Initrd file buffers: separate region well above brk/mmap
-    // 64 children × 64 MiB = 4 GiB → ends at 0x107000000.
-    // Virtual addresses: pages are demand-allocated from physical RAM.
-    const INITRD_BUF_REGION: u64 = 0x110000000;
+    // 16 children × 256 MiB = 4 GiB → ends at 0x300000000.
+    const INITRD_BUF_REGION: u64 = 0x400000000; // 16 GiB
     const INITRD_BUF_PER_GROUP: u64 = 8 * 0x300000; // 24 MiB
 
     // Initialize memory group state: check if parent set inherited brk/mmap
