@@ -74,8 +74,8 @@ pub(crate) static LAST_EXEC_ELF_HI: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LAST_EXEC_HAS_INTERP: AtomicU64 = AtomicU64::new(0);
 /// Temp buffer for execve ELF loading (separate from SPAWN/DL buffers).
 pub(crate) const EXEC_BUF_BASE: u64 = 0x5400000;
-pub(crate) const EXEC_BUF_PAGES: u64 = 1280; // 5 MiB (links is ~4.9 MiB)
-pub(crate) const EXEC_TEMP_MAP: u64 = 0x5900000; // past EXEC_BUF_BASE + 1280*4K
+pub(crate) const EXEC_BUF_PAGES: u64 = 1408; // 5.5 MiB (apk is ~5.4 MiB)
+pub(crate) const EXEC_TEMP_MAP: u64 = 0x5A00000; // past EXEC_BUF_BASE + 1408*4K
 /// Temp buffer for loading the interpreter ELF (for dynamic binaries).
 pub(crate) const INTERP_BUF_BASE: u64 = 0xA000000; // Far from other regions
 pub(crate) const INTERP_BUF_PAGES: u64 = 220; // ~900 KiB, enough for ld-musl (~845 KiB)
