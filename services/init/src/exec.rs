@@ -2,7 +2,7 @@ use sotos_common::sys;
 use sotos_common::elf::{ElfInfo, LoadSegment, InterpInfo, MAX_LOAD_SEGMENTS};
 use core::sync::atomic::{AtomicU64, Ordering};
 use crate::framebuffer::{print, print_hex64};
-use crate::process::NEXT_CHILD_STACK;
+use crate::process::{NEXT_CHILD_STACK, MAX_PROCS, PROCESSES};
 use crate::vdso;
 use crate::{vfs_lock, vfs_unlock, shared_store};
 use ufmt::uwrite;
@@ -182,6 +182,124 @@ pub(crate) fn format_proc_self_stat(buf: &mut [u8], pid: usize) -> usize {
     let mut w = BufWriter::new(buf);
     let _ = uwrite!(w, "{} (program) R 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", pid);
     w.pos()
+}
+
+/// Format /proc/stat: CPU time statistics for htop.
+pub(crate) fn format_proc_stat(buf: &mut [u8], user: u64, system: u64, idle: u64) -> usize {
+    let mut w = BufWriter::new(buf);
+    let _ = uwrite!(w, "cpu  {} 0 {} {} 0 0 0 0 0 0\n", user, system, idle);
+    let _ = uwrite!(w, "cpu0 {} 0 {} {} 0 0 0 0 0 0\n", user, system, idle);
+    let _ = uwrite!(w, "intr 0\n");
+    let _ = uwrite!(w, "ctxt 0\n");
+    let _ = uwrite!(w, "btime 1773360000\n");
+    let _ = uwrite!(w, "processes 1\n");
+    let _ = uwrite!(w, "procs_running 1\n");
+    let _ = uwrite!(w, "procs_blocked 0\n");
+    w.pos()
+}
+
+/// Format /proc/[pid]/stat for htop.
+pub(crate) fn format_proc_pid_stat(buf: &mut [u8], pid: usize) -> usize {
+    let mut w = BufWriter::new(buf);
+    let name = get_proc_name(pid);
+    let ppid = if pid > 0 && pid <= MAX_PROCS {
+        PROCESSES[pid - 1].parent.load(Ordering::Acquire)
+    } else { 0 };
+    let state_val = if pid > 0 && pid <= MAX_PROCS {
+        PROCESSES[pid - 1].state.load(Ordering::Acquire)
+    } else { 0 };
+    let sc = if state_val == 1 { 'R' } else { 'S' };
+    // Format: pid (comm) state ppid pgrp session tty_nr tpgid flags
+    //         minflt cminflt majflt cmajflt utime stime cutime cstime
+    //         priority nice num_threads itrealvalue starttime vsize rss ...
+    let _ = uwrite!(w, "{} ({}) {} {} {} {} 0 -1 0 0 0 0 0 0 0 0 20 0 1 0 0 4096000 256 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        pid, name, sc, ppid, pid, pid);
+    w.pos()
+}
+
+/// Format /proc/[pid]/cmdline for htop.
+pub(crate) fn format_proc_pid_cmdline(buf: &mut [u8], pid: usize) -> usize {
+    if pid == 0 || pid > MAX_PROCS { return 0; }
+    let name = get_proc_name(pid);
+    let len = name.len().min(buf.len().saturating_sub(1));
+    buf[..len].copy_from_slice(&name.as_bytes()[..len]);
+    if len < buf.len() { buf[len] = 0; }
+    len + 1
+}
+
+/// Format /proc/[pid]/comm for htop.
+pub(crate) fn format_proc_pid_comm(buf: &mut [u8], pid: usize) -> usize {
+    let name = get_proc_name(pid);
+    let mut w = BufWriter::new(buf);
+    let _ = uwrite!(w, "{}\n", name);
+    w.pos()
+}
+
+/// Get process name from exe_path or a default.
+fn get_proc_name(pid: usize) -> &'static str {
+    if pid == 0 || pid > MAX_PROCS { return "unknown"; }
+    let p = &PROCESSES[pid - 1];
+    let state = p.state.load(Ordering::Acquire);
+    if state == 0 { return "dead"; }
+    // Try exe_path
+    let raw0 = p.exe_path[0].load(Ordering::Acquire);
+    if raw0 != 0 {
+        // Decode first 8 bytes
+        let bytes = raw0.to_le_bytes();
+        // Find basename after last '/'
+        let mut last_slash = 0;
+        for i in 0..8 {
+            if bytes[i] == 0 { break; }
+            if bytes[i] == b'/' { last_slash = i + 1; }
+        }
+        if last_slash < 8 && bytes[last_slash] != 0 {
+            // Return a static name based on first few chars
+            match &bytes[last_slash..] {
+                b if b.starts_with(b"init") => return "init",
+                b if b.starts_with(b"shell") => return "shell",
+                b if b.starts_with(b"vmm") => return "vmm",
+                b if b.starts_with(b"kbd") => return "kbd",
+                b if b.starts_with(b"net") => return "net",
+                b if b.starts_with(b"nvme") => return "nvme",
+                b if b.starts_with(b"xhci") => return "xhci",
+                b if b.starts_with(b"htop") => return "htop",
+                b if b.starts_with(b"apk") => return "apk",
+                b if b.starts_with(b"bash") => return "bash",
+                _ => {}
+            }
+        }
+    }
+    match pid {
+        1 => "init",
+        2 => "vmm",
+        3 => "shell",
+        4 => "kbd",
+        5 => "net",
+        6 => "nvme",
+        7 => "xhci",
+        _ => "process",
+    }
+}
+
+/// Format a u64 as decimal into buf. Returns number of bytes written.
+pub(crate) fn format_u64_simple(val: u64, buf: &mut [u8]) -> usize {
+    if val == 0 {
+        if !buf.is_empty() { buf[0] = b'0'; }
+        return 1;
+    }
+    let mut tmp = [0u8; 20];
+    let mut len = 0;
+    let mut v = val;
+    while v > 0 {
+        tmp[len] = b'0' + (v % 10) as u8;
+        v /= 10;
+        len += 1;
+    }
+    let out_len = len.min(buf.len());
+    for i in 0..out_len {
+        buf[i] = tmp[len - 1 - i];
+    }
+    out_len
 }
 
 /// Format a PID listing row: "pid  S      ppid\n"
@@ -469,6 +587,18 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
     if let Err(e) = map_elf_segments(EXEC_BUF_BASE, &elf_info, &segments, seg_count, main_base, target_as) {
         unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
         return Err(e);
+    }
+
+    // Static-PIE (ET_DYN without PT_INTERP): apply RELA + RELR relocations
+    // to the buffer, then re-map segments so relocated data reaches the target AS.
+    if elf_info.elf_type == 3 && interp_info.is_none() && main_base != 0 {
+        let elf_data_mut = unsafe { core::slice::from_raw_parts_mut(EXEC_BUF_BASE as *mut u8, file_size) };
+        apply_static_pie_relocs_to_buf(elf_data_mut, &elf_info, &segments, seg_count, main_base);
+        // Re-map with relocated data
+        if let Err(e) = map_elf_segments(EXEC_BUF_BASE, &elf_info, &segments, seg_count, main_base, target_as) {
+            unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
+            return Err(e);
+        }
     }
 
     let mut exec_entry = main_base + elf_info.entry;
@@ -987,6 +1117,160 @@ fn apply_interp_relocs_to_buf(
             }
         }
         rp += 24;
+    }
+}
+
+/// Apply RELA + RELR relocations for a static-PIE binary (ET_DYN without PT_INTERP).
+/// Modifies the ELF data buffer in place so that map_elf_segments copies relocated data.
+fn apply_static_pie_relocs_to_buf(
+    elf_data: &mut [u8],
+    elf_info: &sotos_common::elf::ElfInfo,
+    segments: &[sotos_common::elf::LoadSegment; sotos_common::elf::MAX_LOAD_SEGMENTS],
+    seg_count: usize,
+    base: u64,
+) {
+    // Find PT_DYNAMIC segment
+    let mut dyn_offset = 0usize;
+    let mut dyn_size = 0usize;
+    let mut found = false;
+    for i in 0..elf_info.phnum {
+        let ph = elf_info.phoff + i * elf_info.phentsize;
+        if ph + elf_info.phentsize > elf_data.len() { break; }
+        let p_type = u32::from_le_bytes([
+            elf_data[ph], elf_data[ph+1], elf_data[ph+2], elf_data[ph+3],
+        ]);
+        if p_type == 2 { // PT_DYNAMIC
+            dyn_offset = u64::from_le_bytes([
+                elf_data[ph+8], elf_data[ph+9], elf_data[ph+10], elf_data[ph+11],
+                elf_data[ph+12], elf_data[ph+13], elf_data[ph+14], elf_data[ph+15],
+            ]) as usize;
+            dyn_size = u64::from_le_bytes([
+                elf_data[ph+32], elf_data[ph+33], elf_data[ph+34], elf_data[ph+35],
+                elf_data[ph+36], elf_data[ph+37], elf_data[ph+38], elf_data[ph+39],
+            ]) as usize;
+            found = true;
+            break;
+        }
+    }
+    if !found { return; }
+
+    let mut rela_off: u64 = 0;
+    let mut rela_sz: u64 = 0;
+    let mut relr_off: u64 = 0;
+    let mut relr_sz: u64 = 0;
+    let mut pos = dyn_offset;
+    let end = (dyn_offset + dyn_size).min(elf_data.len());
+    while pos + 16 <= end {
+        let tag = u64::from_le_bytes([
+            elf_data[pos], elf_data[pos+1], elf_data[pos+2], elf_data[pos+3],
+            elf_data[pos+4], elf_data[pos+5], elf_data[pos+6], elf_data[pos+7],
+        ]);
+        let val = u64::from_le_bytes([
+            elf_data[pos+8], elf_data[pos+9], elf_data[pos+10], elf_data[pos+11],
+            elf_data[pos+12], elf_data[pos+13], elf_data[pos+14], elf_data[pos+15],
+        ]);
+        match tag {
+            0 => break,
+            7 => rela_off = val,   // DT_RELA
+            8 => rela_sz = val,    // DT_RELASZ
+            0x24 => relr_off = val, // DT_RELR
+            0x23 => relr_sz = val,  // DT_RELRSZ
+            _ => {}
+        }
+        pos += 16;
+    }
+
+    // Apply RELA RELATIVE relocations
+    if rela_off != 0 && rela_sz != 0 {
+        let rela_file_off = rela_off as usize;
+        let mut rp = rela_file_off;
+        let rela_end = (rela_file_off + rela_sz as usize).min(elf_data.len());
+        while rp + 24 <= rela_end {
+            let r_offset = u64::from_le_bytes([
+                elf_data[rp], elf_data[rp+1], elf_data[rp+2], elf_data[rp+3],
+                elf_data[rp+4], elf_data[rp+5], elf_data[rp+6], elf_data[rp+7],
+            ]);
+            let r_info = u64::from_le_bytes([
+                elf_data[rp+8], elf_data[rp+9], elf_data[rp+10], elf_data[rp+11],
+                elf_data[rp+12], elf_data[rp+13], elf_data[rp+14], elf_data[rp+15],
+            ]);
+            let r_addend = u64::from_le_bytes([
+                elf_data[rp+16], elf_data[rp+17], elf_data[rp+18], elf_data[rp+19],
+                elf_data[rp+20], elf_data[rp+21], elf_data[rp+22], elf_data[rp+23],
+            ]);
+            let r_type = (r_info & 0xFFFFFFFF) as u32;
+            if let Some(file_off) = vaddr_to_file_offset(r_offset, segments, seg_count) {
+                if file_off + 8 <= elf_data.len() {
+                    match r_type {
+                        8 => { // R_X86_64_RELATIVE
+                            let val = (base + r_addend).to_le_bytes();
+                            elf_data[file_off..file_off+8].copy_from_slice(&val);
+                        }
+                        6 => { // R_X86_64_GLOB_DAT
+                            let val = if r_addend != 0 {
+                                (base + r_addend).to_le_bytes()
+                            } else {
+                                0u64.to_le_bytes()
+                            };
+                            elf_data[file_off..file_off+8].copy_from_slice(&val);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            rp += 24;
+        }
+    }
+
+    // Apply RELR relocations (compact relative relocation format).
+    // Each entry is 8 bytes. If bit 0 is clear, it's an absolute vaddr to patch.
+    // If bit 0 is set, bits 1..63 form a bitmap of 63 subsequent qword locations.
+    if relr_off != 0 && relr_sz != 0 {
+        let relr_file_off = relr_off as usize;
+        let relr_end = (relr_file_off + relr_sz as usize).min(elf_data.len());
+        let mut where_vaddr: u64 = 0;
+        let mut rp = relr_file_off;
+        while rp + 8 <= relr_end {
+            let entry = u64::from_le_bytes([
+                elf_data[rp], elf_data[rp+1], elf_data[rp+2], elf_data[rp+3],
+                elf_data[rp+4], elf_data[rp+5], elf_data[rp+6], elf_data[rp+7],
+            ]);
+            if entry & 1 == 0 {
+                // Absolute entry: patch at this vaddr
+                where_vaddr = entry;
+                if let Some(file_off) = vaddr_to_file_offset(where_vaddr, segments, seg_count) {
+                    if file_off + 8 <= elf_data.len() {
+                        let old = u64::from_le_bytes([
+                            elf_data[file_off], elf_data[file_off+1], elf_data[file_off+2], elf_data[file_off+3],
+                            elf_data[file_off+4], elf_data[file_off+5], elf_data[file_off+6], elf_data[file_off+7],
+                        ]);
+                        let val = old.wrapping_add(base).to_le_bytes();
+                        elf_data[file_off..file_off+8].copy_from_slice(&val);
+                    }
+                }
+                where_vaddr += 8;
+            } else {
+                // Bitmap entry: bits 1..63 indicate which of the next 63 qwords to patch
+                let bitmap = entry >> 1;
+                for bit in 0..63u64 {
+                    if bitmap & (1u64 << bit) != 0 {
+                        let patch_vaddr = where_vaddr + bit * 8;
+                        if let Some(file_off) = vaddr_to_file_offset(patch_vaddr, segments, seg_count) {
+                            if file_off + 8 <= elf_data.len() {
+                                let old = u64::from_le_bytes([
+                                    elf_data[file_off], elf_data[file_off+1], elf_data[file_off+2], elf_data[file_off+3],
+                                    elf_data[file_off+4], elf_data[file_off+5], elf_data[file_off+6], elf_data[file_off+7],
+                                ]);
+                                let val = old.wrapping_add(base).to_le_bytes();
+                                elf_data[file_off..file_off+8].copy_from_slice(&val);
+                            }
+                        }
+                    }
+                }
+                where_vaddr += 63 * 8;
+            }
+            rp += 8;
+        }
     }
 }
 

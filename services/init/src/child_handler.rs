@@ -214,6 +214,56 @@ pub(crate) fn open_virtual_file(name: &[u8], dir_buf: &mut [u8]) -> Option<usize
             gen_len = n;
         } else if name == b"/proc/self/exe" {
             gen_len = 0;
+        } else if name == b"/proc/self/stat" {
+            gen_len = crate::exec::format_proc_self_stat(dir_buf, 1);
+        } else if name == b"/proc/stat" {
+            let tsc = rdtsc();
+            let jiffies = tsc / 20_000_000;
+            let user = jiffies / 20;
+            let system = jiffies / 50;
+            let idle = jiffies.saturating_sub(user + system);
+            gen_len = crate::exec::format_proc_stat(dir_buf, user, system, idle);
+        } else if starts_with(name, b"/proc/") && !starts_with(name, b"/proc/self/")
+               && !starts_with(name, b"/proc/sys/") {
+            // /proc/[pid]/* paths
+            let rest = &name[6..];
+            let mut digit_end = 0;
+            while digit_end < rest.len() && rest[digit_end] >= b'0' && rest[digit_end] <= b'9' {
+                digit_end += 1;
+            }
+            if digit_end > 0 {
+                let mut n: u64 = 0;
+                for i in 0..digit_end { n = n * 10 + (rest[i] - b'0') as u64; }
+                if n >= 1 && n <= MAX_PROCS as u64
+                    && PROCESSES[n as usize - 1].state.load(Ordering::Acquire) != 0 {
+                    let after = &rest[digit_end..];
+                    if after == b"/stat" {
+                        gen_len = crate::exec::format_proc_pid_stat(dir_buf, n as usize);
+                    } else if after == b"/cmdline" {
+                        gen_len = crate::exec::format_proc_pid_cmdline(dir_buf, n as usize);
+                    } else if after == b"/statm" {
+                        let info = b"1024 256 128 64 0 128 0\n";
+                        let l = info.len().min(dir_buf.len());
+                        dir_buf[..l].copy_from_slice(&info[..l]);
+                        gen_len = l;
+                    } else if after == b"/io" {
+                        let info = b"rchar: 0\nwchar: 0\nsyscr: 0\nsyscw: 0\nread_bytes: 0\nwrite_bytes: 0\ncancelled_write_bytes: 0\n";
+                        let l = info.len().min(dir_buf.len());
+                        dir_buf[..l].copy_from_slice(&info[..l]);
+                        gen_len = l;
+                    } else if after == b"/comm" {
+                        gen_len = crate::exec::format_proc_pid_comm(dir_buf, n as usize);
+                    } else if after == b"/status" || after.is_empty() {
+                        gen_len = crate::process::format_proc_status(dir_buf, n as usize);
+                    } else {
+                        gen_len = 0;
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
         } else if name == b"/sys/devices/system/cpu/online" {
             let c = b"0\n";
             dir_buf[..c.len()].copy_from_slice(c);

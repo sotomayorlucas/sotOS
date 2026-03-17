@@ -8,7 +8,10 @@ use sotos_common::linux_abi::*;
 use sotos_common::IpcMsg;
 use core::sync::atomic::Ordering;
 use crate::exec::{reply_val, rdtsc, copy_guest_path, starts_with,
-                  format_uptime_into, format_proc_self_stat};
+                  format_uptime_into, format_proc_self_stat,
+                  format_proc_stat, format_proc_pid_stat,
+                  format_proc_pid_cmdline, format_proc_pid_comm,
+                  format_u64_simple};
 use crate::process::*;
 use crate::fd::*;
 use crate::child_handler::{open_virtual_file, fill_random, mark_pipe_retry_on};
@@ -2662,6 +2665,78 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 reply_val(ctx.ep_cap, -ENOENT);
             }
         }
+    } else if name == b"/proc" || name == b"/proc/" {
+        // /proc as a directory for getdents64 (htop uses opendir("/proc"))
+        use sotos_common::linux_abi::{DT_DIR};
+        *ctx.dir_len = 0;
+        *ctx.dir_pos = 0;
+        // Populate dir_buf with dirent64 entries for each active PID
+        let mut off = 0usize;
+        // Add "." and ".."
+        for dot_name in [b"." as &[u8], b".."] {
+            let reclen = ((19 + dot_name.len() + 1 + 7) / 8) * 8;
+            if off + reclen <= ctx.dir_buf.len() {
+                let d = &mut ctx.dir_buf[off..off + reclen];
+                for b in d.iter_mut() { *b = 0; }
+                d[0..8].copy_from_slice(&1u64.to_le_bytes()); // d_ino
+                d[8..16].copy_from_slice(&((off + reclen) as u64).to_le_bytes()); // d_off
+                d[16..18].copy_from_slice(&(reclen as u16).to_le_bytes()); // d_reclen
+                d[18] = DT_DIR; // d_type
+                d[19..19 + dot_name.len()].copy_from_slice(dot_name);
+                off += reclen;
+            }
+        }
+        // Add PID directories
+        for i in 0..MAX_PROCS {
+            let st = PROCESSES[i].state.load(Ordering::Acquire);
+            if st == 0 { continue; }
+            let pid_val = (i + 1) as u64;
+            let mut pid_str = [0u8; 8];
+            let pid_len = format_u64_simple(pid_val, &mut pid_str);
+            let reclen = ((19 + pid_len + 1 + 7) / 8) * 8;
+            if off + reclen > ctx.dir_buf.len() { break; }
+            let d = &mut ctx.dir_buf[off..off + reclen];
+            for b in d.iter_mut() { *b = 0; }
+            d[0..8].copy_from_slice(&pid_val.to_le_bytes());
+            d[8..16].copy_from_slice(&((off + reclen) as u64).to_le_bytes());
+            d[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
+            d[18] = DT_DIR;
+            d[19..19 + pid_len].copy_from_slice(&pid_str[..pid_len]);
+            off += reclen;
+        }
+        // Add pseudo-files: stat, meminfo, cpuinfo, uptime, loadavg, version
+        for vname in [b"stat" as &[u8], b"meminfo", b"cpuinfo", b"uptime", b"loadavg", b"version", b"self"] {
+            let dt = if vname == b"self" { DT_DIR } else { sotos_common::linux_abi::DT_REG };
+            let reclen = ((19 + vname.len() + 1 + 7) / 8) * 8;
+            if off + reclen > ctx.dir_buf.len() { break; }
+            let d = &mut ctx.dir_buf[off..off + reclen];
+            for b in d.iter_mut() { *b = 0; }
+            d[0..8].copy_from_slice(&0x1000u64.to_le_bytes());
+            d[8..16].copy_from_slice(&((off + reclen) as u64).to_le_bytes());
+            d[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
+            d[18] = dt;
+            d[19..19 + vname.len()].copy_from_slice(vname);
+            off += reclen;
+        }
+        *ctx.dir_len = off;
+        // Allocate FD as kind=14 (directory) with virtual OID
+        let mut fd = None;
+        for i in 3..GRP_MAX_FDS { if ctx.child_fds[i] == 0 { fd = Some(i); break; } }
+        if let Some(f) = fd {
+            ctx.child_fds[f] = 14;
+            // Store in vfs_files with magic OID so getdents64 uses our pre-populated dir_buf
+            let mut vslot = None;
+            for s in 0..GRP_MAX_VFS { if ctx.vfs_files[s][0] == 0 { vslot = Some(s); break; } }
+            if let Some(vs) = vslot {
+                ctx.vfs_files[vs] = [0xFFFF_FF01, 0, 0xDEAD, f as u64];
+                reply_val(ctx.ep_cap, f as i64);
+            } else {
+                ctx.child_fds[f] = 0;
+                reply_val(ctx.ep_cap, -EMFILE);
+            }
+        } else {
+            reply_val(ctx.ep_cap, -EMFILE);
+        }
     } else if starts_with(name, b"/proc/") || starts_with(name, b"/sys/") {
         let mut gen_len: usize = 0;
         let mut handled = true;
@@ -2696,6 +2771,15 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
             let n = info.len().min(ctx.dir_buf.len());
             ctx.dir_buf[..n].copy_from_slice(&info[..n]);
             gen_len = n;
+        } else if name == b"/proc/stat" {
+            // CPU time statistics for htop
+            let tsc = rdtsc();
+            let boot_tsc = BOOT_TSC.load(Ordering::Acquire);
+            let jiffies = if tsc > boot_tsc { (tsc - boot_tsc) / 20_000_000 } else { 0 }; // ~100 Hz jiffies
+            let user = jiffies / 20;
+            let system = jiffies / 50;
+            let idle = jiffies.saturating_sub(user + system);
+            gen_len = format_proc_stat(ctx.dir_buf, user, system, idle);
         } else if name == b"/proc/self/auxv" || name == b"/proc/self/environ" {
             // Empty content
         } else if starts_with(name, b"/proc/syslog/") {
@@ -2727,6 +2811,27 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 let after = &rest[consumed..];
                 if after == b"/status" || after.is_empty() {
                     gen_len = format_proc_status(ctx.dir_buf, n as usize);
+                } else if after == b"/stat" {
+                    gen_len = format_proc_pid_stat(ctx.dir_buf, n as usize);
+                } else if after == b"/cmdline" {
+                    gen_len = format_proc_pid_cmdline(ctx.dir_buf, n as usize);
+                } else if after == b"/statm" {
+                    let info = b"1024 256 128 64 0 128 0\n";
+                    let len = info.len().min(ctx.dir_buf.len());
+                    ctx.dir_buf[..len].copy_from_slice(&info[..len]);
+                    gen_len = len;
+                } else if after == b"/io" {
+                    let info = b"rchar: 0\nwchar: 0\nsyscr: 0\nsyscw: 0\nread_bytes: 0\nwrite_bytes: 0\ncancelled_write_bytes: 0\n";
+                    let len = info.len().min(ctx.dir_buf.len());
+                    ctx.dir_buf[..len].copy_from_slice(&info[..len]);
+                    gen_len = len;
+                } else if after == b"/comm" {
+                    gen_len = format_proc_pid_comm(ctx.dir_buf, n as usize);
+                } else if after == b"/maps" || after == b"/smaps" {
+                    gen_len = 0; // empty
+                } else if after == b"/environ" || after == b"/auxv" || after == b"/limits"
+                       || after == b"/cgroup" || after == b"/oom_score" {
+                    gen_len = 0; // empty stub
                 } else {
                     handled = false;
                 }
