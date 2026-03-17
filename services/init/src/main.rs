@@ -186,6 +186,8 @@ pub extern "C" fn _start() -> ! {
     // --- Initialize framebuffer text console ---
     if boot_info.fb_addr != 0 {
         unsafe { fb_init(boot_info); }
+        // Draw Tokyo Night desktop GUI (positions terminal in window)
+        unsafe { framebuffer::fb_init_gui(); }
     }
 
     print(b"INIT: boot complete, ");

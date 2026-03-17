@@ -328,6 +328,28 @@ pub(crate) unsafe fn fb_init(boot_info: &sotos_common::BootInfo) {
     }
 }
 
+/// Initialize GUI desktop (Tokyo Night theme) on top of framebuffer.
+/// Positions the text console within the terminal window client area.
+pub(crate) unsafe fn fb_init_gui() {
+    if !FB_ACTIVE || FB_WIDTH < 640 || FB_HEIGHT < 480 { return; }
+    // Create a FramebufferDisplay over the raw framebuffer
+    let mut display = sotos_gui::FramebufferDisplay::new(
+        FB_PTR as *mut u32,
+        FB_WIDTH,
+        FB_HEIGHT,
+        FB_PITCH / 4, // stride in pixels, not bytes
+    );
+    // Draw the modern Tokyo Night desktop
+    let layout = sotos_gui::draw_modern_desktop(&mut display, b"LUCAS Terminal");
+    // Position text console within the terminal window's client area
+    TEXT_X = layout.text_x;
+    TEXT_Y = layout.text_y;
+    CON_COLS = layout.text_cols;
+    CON_ROWS = layout.text_rows;
+    CON_CUR_COL = 0;
+    CON_CUR_ROW = 0;
+}
+
 /// Draw an 8x16 glyph at pixel position.
 unsafe fn fb_draw_glyph_at(px: u32, py: u32, ch: u8, fg: u32, bg: u32) {
     let glyph = &VGA_FONT[(ch as usize) * 16..(ch as usize) * 16 + 16];
