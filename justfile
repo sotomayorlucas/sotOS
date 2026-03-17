@@ -265,6 +265,14 @@ run-all: image create-test-disk
     @grep -E "NET:.*MAC|DHCP.*IP=|PONG|async.*completed|FAT32-TEST:.*SUCCESS|LUCAS:.*starting" target/test-output.log || true
     @echo "=== PASS: sotOS booted successfully without panics ==="
 
+# Run comprehensive test suite (boots QEMU, tests all features via serial)
+test *ARGS: image
+    python scripts/test_system.py {{ARGS}}
+
+# Run tests with verbose output
+test-verbose: image
+    python scripts/test_system.py --verbose
+
 # Flash sotOS image to a disk/USB drive (usage: just flash DISK=/dev/sdX)
 flash DISK: image
     @echo "WARNING: This will OVERWRITE all data on {{DISK}}"

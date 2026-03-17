@@ -252,6 +252,13 @@ fn emit_stub(p: &mut [u8], off: usize) {
 /// Forge the vDSO ELF into `page` (must be a zeroed 4096-byte buffer).
 /// `boot_tsc` is the TSC value captured at boot time.
 pub fn forge(page: &mut [u8], boot_tsc: u64) {
+    // All addresses in .dynamic and .dynsym are ABSOLUTE (VDSO_BASE-based).
+    // musl's dynamic linker computes base = eh + p_offset - p_vaddr
+    //   = VDSO_BASE + 0 - VDSO_BASE = 0
+    // Then laddr(p, val) = 0 + val = val, so .dynamic values must be
+    // the actual runtime addresses (VDSO_BASE + page_offset).
+    let vb = VDSO_BASE as u64;
+
     // ---- ELF Header (64 bytes at offset 0) ----
     wbs(page, 0, &[0x7F, b'E', b'L', b'F']); // e_ident magic
     page[4] = 2; // ELFCLASS64
@@ -262,8 +269,8 @@ pub fn forge(page: &mut [u8], boot_tsc: u64) {
     w16(page, 16, 3); // e_type = ET_DYN
     w16(page, 18, 0x3E); // e_machine = EM_X86_64
     w32(page, 20, 1); // e_version = EV_CURRENT
-    w64(page, 24, TEXT_OFF as u64); // e_entry (0-based vaddr)
-    w64(page, 32, PHDR_OFF as u64); // e_phoff
+    w64(page, 24, vb + TEXT_OFF as u64); // e_entry (absolute vaddr)
+    w64(page, 32, PHDR_OFF as u64); // e_phoff (file offset, not vaddr)
     w64(page, 40, 0); // e_shoff (no section headers)
     w32(page, 48, 0); // e_flags
     w16(page, 52, 64); // e_ehsize
@@ -277,9 +284,9 @@ pub fn forge(page: &mut [u8], boot_tsc: u64) {
     let ph0 = PHDR_OFF;
     w32(page, ph0, 1); // p_type = PT_LOAD
     w32(page, ph0 + 4, 5); // p_flags = PF_R | PF_X
-    w64(page, ph0 + 8, 0); // p_offset
-    w64(page, ph0 + 16, 0); // p_vaddr (0-based)
-    w64(page, ph0 + 24, 0); // p_paddr
+    w64(page, ph0 + 8, 0); // p_offset (file offset)
+    w64(page, ph0 + 16, vb); // p_vaddr = VDSO_BASE (absolute)
+    w64(page, ph0 + 24, vb); // p_paddr
     w64(page, ph0 + 32, 0x1000); // p_filesz
     w64(page, ph0 + 40, 0x1000); // p_memsz
     w64(page, ph0 + 48, 0x1000); // p_align
@@ -289,14 +296,15 @@ pub fn forge(page: &mut [u8], boot_tsc: u64) {
     let dyn_size: u64 = 9 * 16; // 9 entries × 16 bytes
     w32(page, ph1, 2); // p_type = PT_DYNAMIC
     w32(page, ph1 + 4, 4); // p_flags = PF_R
-    w64(page, ph1 + 8, DYNAMIC_OFF as u64); // p_offset
-    w64(page, ph1 + 16, DYNAMIC_OFF as u64); // p_vaddr
-    w64(page, ph1 + 24, DYNAMIC_OFF as u64); // p_paddr
+    w64(page, ph1 + 8, DYNAMIC_OFF as u64); // p_offset (file offset)
+    w64(page, ph1 + 16, vb + DYNAMIC_OFF as u64); // p_vaddr (absolute)
+    w64(page, ph1 + 24, vb + DYNAMIC_OFF as u64); // p_paddr
     w64(page, ph1 + 32, dyn_size); // p_filesz
     w64(page, ph1 + 40, dyn_size); // p_memsz
     w64(page, ph1 + 48, 8); // p_align
 
     // ---- .dynamic section (at DYNAMIC_OFF) ----
+    // All address values are ABSOLUTE (VDSO_BASE + page_offset).
     let mut d = DYNAMIC_OFF;
     let dyn_entry = |p: &mut [u8], d: &mut usize, tag: u64, val: u64| {
         w64(p, *d, tag);
@@ -304,18 +312,18 @@ pub fn forge(page: &mut [u8], boot_tsc: u64) {
         *d += 16;
     };
 
-    dyn_entry(page, &mut d, 4, HASH_OFF as u64); // DT_HASH
-    dyn_entry(page, &mut d, 5, DYNSTR_OFF as u64); // DT_STRTAB
-    dyn_entry(page, &mut d, 6, DYNSYM_OFF as u64); // DT_SYMTAB
-    dyn_entry(page, &mut d, 10, DYNSTR_SIZE as u64); // DT_STRSZ
-    dyn_entry(page, &mut d, 11, 24); // DT_SYMENT
-    dyn_entry(page, &mut d, 0x6FFF_FFF0, VERSYM_OFF as u64); // DT_VERSYM
-    dyn_entry(page, &mut d, 0x6FFF_FFFC, VERDEF_OFF as u64); // DT_VERDEF
-    dyn_entry(page, &mut d, 0x6FFF_FFFD, 2); // DT_VERDEFNUM
+    dyn_entry(page, &mut d, 4, vb + HASH_OFF as u64); // DT_HASH
+    dyn_entry(page, &mut d, 5, vb + DYNSTR_OFF as u64); // DT_STRTAB
+    dyn_entry(page, &mut d, 6, vb + DYNSYM_OFF as u64); // DT_SYMTAB
+    dyn_entry(page, &mut d, 10, DYNSTR_SIZE as u64); // DT_STRSZ (size, not addr)
+    dyn_entry(page, &mut d, 11, 24); // DT_SYMENT (size, not addr)
+    dyn_entry(page, &mut d, 0x6FFF_FFF0, vb + VERSYM_OFF as u64); // DT_VERSYM
+    dyn_entry(page, &mut d, 0x6FFF_FFFC, vb + VERDEF_OFF as u64); // DT_VERDEF
+    dyn_entry(page, &mut d, 0x6FFF_FFFD, 2); // DT_VERDEFNUM (count, not addr)
     dyn_entry(page, &mut d, 0, 0); // DT_NULL
 
     // ---- .dynsym (at DYNSYM_OFF, 5 entries × 24 bytes) ----
-    // Entry layout: st_name(4) st_info(1) st_other(1) st_shndx(2) st_value(8) st_size(8)
+    // Symbol st_value is ABSOLUTE (VDSO_BASE + code_offset).
     // [0] STN_UNDEF — all zeros (already zeroed)
     let sym = |p: &mut [u8], idx: usize, name: u32, value: u64, size: u64| {
         let base = DYNSYM_OFF + idx * 24;
@@ -327,10 +335,10 @@ pub fn forge(page: &mut [u8], boot_tsc: u64) {
         w64(p, base + 16, size);
     };
 
-    sym(page, 1, STR_CGT as u32, (TEXT_OFF + CODE_CGT) as u64, 0x4A);
-    sym(page, 2, STR_GTOD as u32, (TEXT_OFF + CODE_GTOD) as u64, 6);
-    sym(page, 3, STR_TIME as u32, (TEXT_OFF + CODE_TIME) as u64, 6);
-    sym(page, 4, STR_GETCPU as u32, (TEXT_OFF + CODE_GETCPU) as u64, 6);
+    sym(page, 1, STR_CGT as u32, vb + (TEXT_OFF + CODE_CGT) as u64, 0x4A);
+    sym(page, 2, STR_GTOD as u32, vb + (TEXT_OFF + CODE_GTOD) as u64, 6);
+    sym(page, 3, STR_TIME as u32, vb + (TEXT_OFF + CODE_TIME) as u64, 6);
+    sym(page, 4, STR_GETCPU as u32, vb + (TEXT_OFF + CODE_GETCPU) as u64, 6);
 
     // ---- .dynstr (at DYNSTR_OFF) ----
     page[DYNSTR_OFF] = 0; // null string at offset 0

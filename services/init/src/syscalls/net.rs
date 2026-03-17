@@ -13,7 +13,8 @@ use crate::fd::*;
 use crate::NET_EP_CAP;
 use crate::child_handler::mark_pipe_retry_on;
 use crate::net::{NET_CMD_TCP_CONNECT, NET_CMD_TCP_SEND, NET_CMD_TCP_RECV,
-                 NET_CMD_UDP_BIND, NET_CMD_UDP_SENDTO, NET_CMD_UDP_RECV};
+                 NET_CMD_UDP_BIND, NET_CMD_UDP_SENDTO, NET_CMD_UDP_RECV,
+                 NET_CMD_UDP_HAS_DATA};
 use crate::framebuffer::{print, print_u64, print_hex64, kb_has_char};
 use super::context::{SyscallContext, MAX_EPOLL_ENTRIES};
 
@@ -714,20 +715,45 @@ pub(crate) fn sys_recvfrom(ctx: &mut SyscallContext, msg: &IpcMsg) {
     } else if ctx.child_fds[fd] != 16 && ctx.child_fds[fd] != 17 {
         reply_val(ep_cap, -EBADF);
     } else if ctx.child_fds[fd] == 17 {
-        // UDP recvfrom — multi-chunk: DNS responses can be >64 bytes
+        // UDP recvfrom — two-phase: lightweight HAS_DATA polling, then fetch.
+        // Phase 1 uses CMD_UDP_HAS_DATA (non-blocking IPC) to avoid tying up
+        // the net service in a long polling loop. Phase 2 fetches multi-chunk
+        // data only when the datagram is confirmed available.
         let net_cap = NET_EP_CAP.load(Ordering::Acquire);
         if net_cap == 0 { reply_val(ep_cap, -EADDRNOTAVAIL); return; }
         let src_port = ctx.sock_udp_local_port[fd];
         let max_recv = len.min(512); // DNS responses up to 512 bytes
         let mut got = 0usize;
-        // Each CMD_UDP_RECV polls net service for ~50ms (two-level yield).
-        // 3 retries = ~150ms, enough for SLIRP DNS round-trip (~15ms).
-        for _attempt in 0..3u32 {
+
+        // Phase 1: poll with CMD_UDP_HAS_DATA — lightweight, ~1ms per check.
+        // 150 checks × ~2ms yield gap ≈ 300ms total, enough for SLIRP DNS
+        // round-trip (~15-80ms) even for uncached domains.
+        let mut data_ready = false;
+        for _poll in 0..150u32 {
+            let has_req = IpcMsg {
+                tag: NET_CMD_UDP_HAS_DATA,
+                regs: [src_port as u64, 0, 0, 0, 0, 0, 0, 0],
+            };
+            if let Ok(resp) = sys::call_timeout(net_cap, &has_req, 200) {
+                if resp.tag != 0 {
+                    data_ready = true;
+                    break;
+                }
+            }
+            // Yield to let QEMU's event loop + net service process packets
+            for _ in 0..20u32 { sys::yield_now(); }
+        }
+
+        // Phase 2: fetch data with CMD_UDP_RECV (only if data is ready).
+        // If data_ready is false, still try once — data may have arrived
+        // between the last HAS_DATA check and now.
+        let fetch_attempts = if data_ready { 2u32 } else { 1 };
+        for _attempt in 0..fetch_attempts {
             let req = IpcMsg {
                 tag: NET_CMD_UDP_RECV,
                 regs: [src_port as u64, max_recv as u64, 0, 0, 0, 0, 0, 0],
             };
-            match sys::call_timeout(net_cap, &req, 5000) {
+            match sys::call_timeout(net_cap, &req, 2000) {
                 Ok(resp) => {
                     let chunk = resp.tag as usize; // bytes in this chunk (0-64)
                     if chunk > 0 {
@@ -738,9 +764,6 @@ pub(crate) fn sys_recvfrom(ctx: &mut SyscallContext, msg: &IpcMsg) {
                         ctx.guest_write(buf_ptr, src);
                         got = chunk;
                         // Fetch remaining chunks if datagram > 64 bytes
-                        // resp.regs[0] was overwritten with data, but the net service
-                        // stored total in IPC_UDP_RECV_TOTAL. We can compute: if
-                        // chunk == 64 and we need more, keep fetching with offset.
                         let mut offset = chunk;
                         while offset < max_recv && chunk == 64 {
                             let cont_req = IpcMsg {
@@ -1037,31 +1060,75 @@ pub(crate) fn sys_recvmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
     };
 
     if ctx.child_fds[fd] == 17 {
-        // UDP recvmsg
+        // UDP recvmsg — two-phase: lightweight HAS_DATA polling, then fetch.
         let net_cap = NET_EP_CAP.load(Ordering::Acquire);
         if net_cap == 0 { reply_val(ep_cap, -EADDRNOTAVAIL); return; }
         let src_port = ctx.sock_udp_local_port[fd];
-        let recv_len = iov_len.min(64);
+        let recv_len = iov_len.min(512); // support full DNS responses
         let mut total_n = 0usize;
-        for _attempt in 0..50u32 {
+
+        // Phase 1: poll with CMD_UDP_HAS_DATA (lightweight, non-blocking).
+        // 150 checks × ~2ms yield gap ≈ 300ms total.
+        let mut data_ready = false;
+        for _poll in 0..150u32 {
+            let has_req = IpcMsg {
+                tag: NET_CMD_UDP_HAS_DATA,
+                regs: [src_port as u64, 0, 0, 0, 0, 0, 0, 0],
+            };
+            if let Ok(resp) = sys::call_timeout(net_cap, &has_req, 200) {
+                if resp.tag != 0 {
+                    data_ready = true;
+                    break;
+                }
+            }
+            for _ in 0..20u32 { sys::yield_now(); }
+        }
+
+        // Phase 2: fetch data (multi-chunk for DNS responses > 64 bytes).
+        let fetch_attempts = if data_ready { 2u32 } else { 1 };
+        for _attempt in 0..fetch_attempts {
             let req = IpcMsg {
                 tag: NET_CMD_UDP_RECV,
                 regs: [src_port as u64, recv_len as u64, 0, 0, 0, 0, 0, 0],
             };
-            match sys::call_timeout(net_cap, &req, 5000) {
+            match sys::call_timeout(net_cap, &req, 2000) {
                 Ok(resp) => {
                     let n = resp.tag as usize;
-                    if n > 0 && n <= recv_len {
+                    if n > 0 {
+                        let first_chunk = n.min(64);
                         let src = unsafe {
-                            core::slice::from_raw_parts(&resp.regs[0] as *const u64 as *const u8, n)
+                            core::slice::from_raw_parts(&resp.regs[0] as *const u64 as *const u8, first_chunk)
                         };
                         ctx.guest_write(iov_base, src);
-                        total_n = n;
+                        total_n = first_chunk;
+                        // Fetch remaining chunks if datagram > 64 bytes
+                        let mut offset = first_chunk;
+                        while offset < recv_len && first_chunk == 64 {
+                            let cont_req = IpcMsg {
+                                tag: NET_CMD_UDP_RECV,
+                                regs: [src_port as u64, recv_len as u64, offset as u64, 0, 0, 0, 0, 0],
+                            };
+                            match sys::call_timeout(net_cap, &cont_req, 500) {
+                                Ok(cont_resp) => {
+                                    let cont_n = cont_resp.tag as usize;
+                                    if cont_n == 0 { break; }
+                                    let cont_src = unsafe {
+                                        core::slice::from_raw_parts(&cont_resp.regs[0] as *const u64 as *const u8, cont_n)
+                                    };
+                                    ctx.guest_write(iov_base + offset as u64, cont_src);
+                                    total_n += cont_n;
+                                    offset += cont_n;
+                                    if cont_n < 64 { break; }
+                                }
+                                Err(_) => break,
+                            }
+                        }
                         break;
                     }
                 }
                 Err(_) => {}
             }
+            sys::yield_now();
         }
         if total_n > 0 {
             if msg_name != 0 && msg_namelen >= 16 {

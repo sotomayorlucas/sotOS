@@ -214,13 +214,17 @@ pub(crate) fn sys_waitid(ctx: &mut SyscallContext, _msg: &IpcMsg) {
 fn exit_cleanup(ctx: &mut SyscallContext, status: u64) {
     let pid = ctx.pid;
     if pid == 0 || pid > MAX_PROCS { return; }
-    // Process death alarm (P3-P6 covers Wine processes)
-    if pid >= 3 && pid <= 6 {
+    // Process death alarm — dump for all processes
+    if pid >= 1 {
         crate::framebuffer::print(b"\n!!! PROC-DEATH P");
         crate::framebuffer::print_u64(pid as u64);
         crate::framebuffer::print(b" exit_code=");
         crate::framebuffer::print_u64(status);
         crate::framebuffer::print(b"\n");
+        // Dump last syscalls when process dies from signal (crash)
+        if status >= 128 {
+            crate::syscall_log::syscall_log_dump(30);
+        }
     }
     // Override exit code for processes that received deadlock-induced EOF.
     // The deadlock detector closed their pipe write-ends, causing EOF which
@@ -344,6 +348,13 @@ fn exit_cleanup(ctx: &mut SyscallContext, status: u64) {
     for s in 0..GRP_MAX_VFS { ctx.vfs_files[s] = [0; 4]; }
     PROCESSES[pid - 1].exit_code.store(status, Ordering::Release);
     PROCESSES[pid - 1].state.store(2, Ordering::Release);
+    // Reparent orphaned children to pid 1 (init)
+    for i in 0..MAX_PROCS {
+        if PROCESSES[i].parent.load(Ordering::Acquire) == pid as u64
+           && PROCESSES[i].state.load(Ordering::Acquire) != 0 {
+            PROCESSES[i].parent.store(1, Ordering::Release);
+        }
+    }
     // Deliver SIGCHLD to parent
     let ppid = PROCESSES[pid - 1].parent.load(Ordering::Acquire) as usize;
     if ppid > 0 && ppid <= MAX_PROCS {

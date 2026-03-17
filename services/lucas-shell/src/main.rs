@@ -610,6 +610,23 @@ fn find_byte(s: &[u8], b: u8) -> Option<usize> {
     None
 }
 
+/// Find a pipe operator `|` outside of single/double quotes.
+fn find_pipe_unquoted(s: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < s.len() {
+        match s[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"'  if !in_single => in_double = !in_double,
+            b'|'  if !in_single && !in_double => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Glob pattern match: supports leading `*suffix`, trailing `prefix*`, and exact match.
 #[allow(dead_code)]
 fn pattern_match(pattern: &[u8], text: &[u8]) -> bool {
@@ -833,8 +850,8 @@ fn shell_loop() {
             }
         }
 
-        // Check for pipe operator.
-        if let Some(pipe_pos) = find_byte(line, b'|') {
+        // Check for pipe operator (respects quotes).
+        if let Some(pipe_pos) = find_pipe_unquoted(line) {
             let left = trim(&line[..pipe_pos]);
             let right = trim(&line[pipe_pos + 1..]);
             if !left.is_empty() && !right.is_empty() {
@@ -2386,22 +2403,8 @@ fn cmd_top() {
 /// Execute a pipe: capture output of left command, feed as input to right command.
 /// Simple implementation: left command's output goes to a temp file, right reads it.
 fn execute_pipe(left: &[u8], right: &[u8]) {
-    // For builtins, we capture output by redirecting stdout.
-    // Simple approach: use a temp file ".pipe_tmp".
-    let mut tmp_buf = [0u8; 16];
-    let tmp_path = null_terminate(b".pipe_tmp", &mut tmp_buf);
-
-    // Write left command's output to temp file.
-    let tmp_fd = linux_open(tmp_path, 0x41); // O_WRONLY | O_CREAT
-    if tmp_fd < 0 {
-        print(b"pipe: cannot create temp\n");
-        return;
-    }
-
-    // Redirect: capture left command's output into a buffer via capture_command(),
-    // then feed it to the right command. Supports cat, ls, echo, env, ps, uname,
-    // head, tail, grep, and stat as pipe sources.
-    linux_close(tmp_fd as u64);
+    // Capture left command's output into a buffer, then feed it to the right command.
+    // Supports cat, ls, echo, env, ps, uname, head, tail, grep, stat as pipe sources.
 
     // Simplified pipe: if right is "grep PATTERN", capture left output and filter.
     if starts_with(right, b"grep ") {
@@ -2485,8 +2488,6 @@ fn execute_pipe(left: &[u8], right: &[u8]) {
             dispatch_command(right);
         }
     }
-    // Cleanup temp file.
-    linux_unlink(tmp_path);
 }
 
 /// Capture a command's output into a buffer for piping.

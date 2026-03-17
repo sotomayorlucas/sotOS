@@ -548,7 +548,11 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
         interp_base = if elf_info.elf_type == 3 {
             main_base + 0x800000
         } else {
-            NEXT_INTERP_BASE.fetch_add(INTERP_SLOT_SIZE, Ordering::SeqCst)
+            let b = NEXT_INTERP_BASE.fetch_add(INTERP_SLOT_SIZE, Ordering::SeqCst);
+            if b >= 0x70000000 {
+                NEXT_INTERP_BASE.store(INTERP_LOAD_BASE, Ordering::SeqCst);
+            }
+            b
         };
         // Unmap previous interpreter pages at this location (only for init's AS)
         if target_as == 0 {
@@ -680,9 +684,12 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
         }
     }
 
-    // Auxv pairs: PHDR+PHENT+PHNUM+PAGESZ+RANDOM+ENTRY+SYSINFO_EHDR
-    //             +UID+EUID+GID+EGID+CLKTCK+NULL = 13 (static), +AT_BASE = 14 (dynamic)
-    let auxv_pairs: u64 = if is_dynamic { 14 } else { 13 };
+    // Auxv pairs: PHDR+PHENT+PHNUM+PAGESZ+RANDOM+ENTRY
+    //             +UID+EUID+GID+EGID+CLKTCK+NULL = 12
+    //             +AT_SYSINFO_EHDR (only target_as==0) +AT_BASE (only dynamic)
+    let mut auxv_pairs: u64 = 12;
+    if target_as == 0 { auxv_pairs += 1; } // AT_SYSINFO_EHDR
+    if is_dynamic { auxv_pairs += 1; }      // AT_BASE
     let entries: u64 = 1 + argc as u64 + 1 + env_count as u64 + 1 + auxv_pairs * 2;
     let rsp = (str_area - entries as u64 * 8) & !0xF;
 
@@ -707,9 +714,12 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
         // AT_ENTRY(9) — main binary's entry point (NOT interpreter)
         *sp.add(i) = 9; i += 1; *sp.add(i) = main_base + elf_info.entry; i += 1;
         // AT_SYSINFO_EHDR(33) — vDSO base address
-        // Only set for init's own AS where the original vDSO is mapped.
-        // For separate AS, the vDSO page is a modified copy (with trampoline)
-        // that may confuse musl's ELF parser.
+        // Only set for init's own AS. For separate AS, musl's dynamic linker
+        // processes the vDSO as a shared object during startup, and our forged
+        // ELF (lacking proper GOT/PLT/relocation entries) causes the linker
+        // to compute wrong addresses and crash. TODO: add full dynamic linker
+        // compatibility to the vDSO ELF (proper section headers, DT_SONAME,
+        // empty relocation tables) to enable this for all processes.
         if target_as == 0 {
             *sp.add(i) = 33; i += 1; *sp.add(i) = vdso::VDSO_BASE; i += 1;
         }
@@ -744,7 +754,14 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
         }
     }
 
-    // Pre-TLS for glibc: write the AT_RANDOM canary at PRE_TLS+0x28.
+    // Pre-TLS: minimal musl __pthread struct + AT_RANDOM canary.
+    // musl's __pthread layout (x86_64):
+    //   0x00: self pointer (tp->self == tp validation)
+    //   0x08: dtv pointer (dynamic thread vector, 0 = no TLS segments)
+    //   0x10: prev (linked list, self-referential for single thread)
+    //   0x18: next (linked list, self-referential for single thread)
+    //   0x28: canary (stack protector, matches AT_RANDOM)
+    // glibc also reads canary from fs:0x28 (tcbhead_t.stack_guard).
     const PRE_TLS_ADDR: u64 = 0xB70000; // below vDSO (0xB80000)
     if target_as != 0 {
         // For separate AS: alloc frame, write via temp map, map into target
@@ -752,6 +769,12 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
             if sys::map(EXEC_TEMP_MAP, f, MAP_WRITABLE).is_ok() {
                 unsafe {
                     core::ptr::write_bytes(EXEC_TEMP_MAP as *mut u8, 0, 4096);
+                    // __pthread.self = PRE_TLS_ADDR (musl validates self == tp)
+                    core::ptr::write((EXEC_TEMP_MAP) as *mut u64, PRE_TLS_ADDR);
+                    // __pthread.prev = __pthread.next = self (single thread)
+                    core::ptr::write((EXEC_TEMP_MAP + 0x10) as *mut u64, PRE_TLS_ADDR);
+                    core::ptr::write((EXEC_TEMP_MAP + 0x18) as *mut u64, PRE_TLS_ADDR);
+                    // canary at offset 0x28
                     core::ptr::write((EXEC_TEMP_MAP + 0x28) as *mut u64, saved_canary);
                 }
                 let _ = sys::unmap(EXEC_TEMP_MAP);
@@ -765,6 +788,9 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
             if sys::map(PRE_TLS_ADDR, f, MAP_WRITABLE).is_ok() {
                 unsafe {
                     core::ptr::write_bytes(PRE_TLS_ADDR as *mut u8, 0, 4096);
+                    core::ptr::write((PRE_TLS_ADDR) as *mut u64, PRE_TLS_ADDR);
+                    core::ptr::write((PRE_TLS_ADDR + 0x10) as *mut u64, PRE_TLS_ADDR);
+                    core::ptr::write((PRE_TLS_ADDR + 0x18) as *mut u64, PRE_TLS_ADDR);
                     core::ptr::write((PRE_TLS_ADDR + 0x28) as *mut u64, saved_canary);
                 }
             }

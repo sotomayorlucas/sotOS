@@ -1143,7 +1143,11 @@ pub(crate) extern "C" fn child_handler() -> ! {
                         frame_data[32..40].copy_from_slice(&fork_r14.to_le_bytes());
                         frame_data[40..48].copy_from_slice(&fork_r15.to_le_bytes());
                         frame_data[48..56].copy_from_slice(&fork_rip.to_le_bytes());
-                        let _ = sys::vm_write(child_as_cap, frame_rsp, frame_data.as_ptr() as u64, 56);
+                        if sys::vm_write(child_as_cap, frame_rsp, frame_data.as_ptr() as u64, 56).is_err() {
+                            print(b"FORK-FATAL: vm_write failed\n");
+                            reply_val(ep_cap, -ENOMEM);
+                            continue;
+                        }
                     }
 
                     // Eagerly copy TLS page and patch TID fields.

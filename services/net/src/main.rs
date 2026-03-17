@@ -1289,15 +1289,12 @@ fn process_ipc_cmd(
                 }
             }
 
-            // Poll for new data with enough delay for QEMU/SLIRP to process
-            // the DNS response (~15ms wall clock). Each yield causes a vCPU
-            // exit (~10µs in TCG). We do 50 yields between each iface.poll()
-            // check (~500µs gap), and repeat 100 times → ~50ms total. This
-            // gives SLIRP plenty of time to resolve and inject the response.
-            for _poll_round in 0..100u32 {
-                // Yield multiple times to give QEMU's event loop time to
-                // deliver the virtio RX packet from SLIRP
-                for _ in 0..50u32 {
+            // Quick poll: the child handler does the long wait via
+            // CMD_UDP_HAS_DATA, so CMD_UDP_RECV only needs a short check.
+            // 15 rounds × 10 yields ≈ ~1.5ms — enough to catch data that
+            // just arrived between the HAS_DATA check and this call.
+            for _poll_round in 0..15u32 {
+                for _ in 0..10u32 {
                     sys::yield_now();
                 }
                 device.net.ack_irq();
@@ -1338,10 +1335,12 @@ fn process_ipc_cmd(
 
         CMD_UDP_HAS_DATA => {
             // Non-destructive check: does the UDP socket on this port have data?
-            // yield+ack_irq gives QEMU's event loop time to deliver SLIRP's
-            // DNS response to the virtio RX queue before we poll.
+            // Multiple yields + ack_irq give QEMU's event loop time to deliver
+            // SLIRP's response to the virtio RX queue before we poll.
             let port = arg0 as u16;
-            sys::yield_now();
+            for _ in 0..5u32 {
+                sys::yield_now();
+            }
             device.net.ack_irq();
             iface.poll(now(), device, sockets);
             if let Some(slot) = find_udp_slot(port) {
