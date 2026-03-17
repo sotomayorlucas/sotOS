@@ -499,7 +499,7 @@ pub(crate) extern "C" fn child_handler() -> ! {
         // PIPE_RETRY_TAG it will re-increment via mark_pipe_retry().
         clear_pipe_retry(pid);
 
-        // Trace syscalls for Wine/package manager child processes (P6+)
+        // Trace syscalls for separate-AS child processes (P6+)
         if pid >= 6 {
             print(b"AS-SYS P"); print_u64(pid as u64);
             print(b" #"); print_u64(syscall_nr);

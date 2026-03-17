@@ -74,7 +74,7 @@ pub(crate) static LAST_EXEC_ELF_HI: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LAST_EXEC_HAS_INTERP: AtomicU64 = AtomicU64::new(0);
 /// Temp buffer for execve ELF loading (separate from SPAWN/DL buffers).
 pub(crate) const EXEC_BUF_BASE: u64 = 0x5400000;
-pub(crate) const EXEC_BUF_PAGES: u64 = 1280; // 5 MiB (links is ~4.9 MiB)
+pub(crate) const EXEC_BUF_PAGES: u64 = 1536; // 6 MiB (apk is ~5.2 MiB)
 pub(crate) const EXEC_TEMP_MAP: u64 = 0x5900000; // past EXEC_BUF_BASE + 1280*4K
 /// Temp buffer for loading the interpreter ELF (for dynamic binaries).
 pub(crate) const INTERP_BUF_BASE: u64 = 0xA000000; // Far from other regions
@@ -466,6 +466,14 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
         }
     }
 
+    // For statically-linked PIE (ET_DYN without PT_INTERP): apply RELR
+    // relocations to the buffer BEFORE mapping. The binary has no interpreter
+    // to self-relocate — the loader must do it (like Linux kernel does).
+    if elf_info.elf_type == 3 && interp_info.is_none() && main_base != 0 {
+        let buf = unsafe { core::slice::from_raw_parts_mut(EXEC_BUF_BASE as *mut u8, file_size) };
+        apply_relr_to_buf(buf, &elf_info, &segments, seg_count, main_base);
+    }
+
     if let Err(e) = map_elf_segments(EXEC_BUF_BASE, &elf_info, &segments, seg_count, main_base, target_as) {
         unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
         return Err(e);
@@ -563,7 +571,12 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
 
         // Pre-apply relocations to the buffer so map_elf_segments copies
         // already-relocated data into whichever AS we're targeting.
-        {
+        // For separate AS (target_as != 0), skip pre-application — the
+        // interpreter's bootstrap handles its own relocations (RELA + RELR).
+        // Pre-applying RELA RELATIVE here is harmless (idempotent), but
+        // pre-applying GLOB_DAT/JUMP_SLOT can interfere with the bootstrap
+        // if the interpreter expects to resolve these itself.
+        if target_as == 0 {
             let interp_data_mut = unsafe { core::slice::from_raw_parts_mut(INTERP_BUF_BASE as *mut u8, interp_size) };
             apply_interp_relocs_to_buf(interp_data_mut, &interp_elf, &interp_segs, interp_seg_count, interp_base);
         }
@@ -583,9 +596,9 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
         // patch file-resident data, not zero-filled BSS beyond filesz).
         if target_as == 0 {
             apply_interp_relocs(interp_data, &interp_elf, interp_base);
-        } else {
-            apply_interp_relocs_remote(interp_data, &interp_elf, interp_base, target_as);
         }
+        // For separate AS: no post-mapping relocs needed — the interpreter's
+        // bootstrap self-relocates via RELA RELATIVE + RELR.
 
         unmap_temp_buf(INTERP_BUF_BASE, INTERP_BUF_PAGES);
     }
@@ -960,6 +973,10 @@ fn apply_interp_relocs_to_buf(
 
     let mut rela_off: u64 = 0;
     let mut rela_sz: u64 = 0;
+    let mut jmprel_off: u64 = 0;
+    let mut jmprel_sz: u64 = 0;
+    let mut symtab_off: u64 = 0;
+    let mut syment_sz: u64 = 24;
     let mut pos = dyn_offset;
     let end = (dyn_offset + dyn_size).min(elf_data.len());
     while pos + 16 <= end {
@@ -973,18 +990,26 @@ fn apply_interp_relocs_to_buf(
         ]);
         match tag {
             0 => break,
-            7 => rela_off = val,
-            8 => rela_sz = val,
+            2 => jmprel_sz = val,  // DT_PLTRELSZ
+            6 => symtab_off = val, // DT_SYMTAB
+            7 => rela_off = val,   // DT_RELA
+            8 => rela_sz = val,    // DT_RELASZ
+            11 => syment_sz = val, // DT_SYMENT
+            23 => jmprel_off = val, // DT_JMPREL
             _ => {}
         }
         pos += 16;
     }
 
-    if rela_off == 0 || rela_sz == 0 { return; }
+    if rela_off == 0 && jmprel_off == 0 { return; }
 
-    let rela_file_off = rela_off as usize;
+    // Process both RELA and JMPREL tables
+    let tables: [(u64, u64); 2] = [(rela_off, rela_sz), (jmprel_off, jmprel_sz)];
+    for (tbl_off, tbl_sz) in tables {
+    if tbl_off == 0 || tbl_sz == 0 { continue; }
+    let rela_file_off = tbl_off as usize;
     let mut rp = rela_file_off;
-    let rela_end = (rela_file_off + rela_sz as usize).min(elf_data.len());
+    let rela_end = (rela_file_off + tbl_sz as usize).min(elf_data.len());
     while rp + 24 <= rela_end {
         let r_offset = u64::from_le_bytes([
             elf_data[rp], elf_data[rp+1], elf_data[rp+2], elf_data[rp+3],
@@ -1007,12 +1032,26 @@ fn apply_interp_relocs_to_buf(
                         let val = (base + r_addend).to_le_bytes();
                         elf_data[file_off..file_off+8].copy_from_slice(&val);
                     }
-                    6 => { // R_X86_64_GLOB_DAT
-                        let val = if r_addend != 0 {
-                            (base + r_addend).to_le_bytes()
-                        } else {
-                            0u64.to_le_bytes()
-                        };
+                    6 | 7 => { // R_X86_64_GLOB_DAT / JUMP_SLOT — resolve via .dynsym
+                        let sym_idx = (r_info >> 32) as usize;
+                        let mut sym_val: u64 = 0;
+                        if r_addend != 0 {
+                            sym_val = base + r_addend;
+                        } else if symtab_off != 0 && sym_idx != 0 {
+                            let sym_off = symtab_off as usize + sym_idx * syment_sz as usize;
+                            if sym_off + 16 <= elf_data.len() {
+                                let st_value = u64::from_le_bytes([
+                                    elf_data[sym_off+8], elf_data[sym_off+9],
+                                    elf_data[sym_off+10], elf_data[sym_off+11],
+                                    elf_data[sym_off+12], elf_data[sym_off+13],
+                                    elf_data[sym_off+14], elf_data[sym_off+15],
+                                ]);
+                                if st_value != 0 {
+                                    sym_val = base + st_value;
+                                }
+                            }
+                        }
+                        let val = sym_val.to_le_bytes();
                         elf_data[file_off..file_off+8].copy_from_slice(&val);
                     }
                     _ => {}
@@ -1021,6 +1060,7 @@ fn apply_interp_relocs_to_buf(
         }
         rp += 24;
     }
+    } // end for tables
 }
 
 /// Pre-apply interpreter relocations (RELR + RELA) so the dynamic linker's
@@ -1138,10 +1178,134 @@ fn apply_interp_relocs(elf_data: &[u8], elf_info: &sotos_common::elf::ElfInfo, b
     // ld-linux's bootstrap handles RELR itself.
 }
 
-/// Apply interpreter RELA relocations to a REMOTE address space via vm_write.
-/// Unlike apply_interp_relocs_to_buf (which works on raw file bytes and misses
-/// BSS-resident GOT entries), this writes to already-mapped pages where BSS
-/// has been zero-filled by map_elf_segments.
+/// Apply RELR (compact relative) relocations to a raw ELF buffer.
+/// RELR format: each `*ptr += base`. Used for statically-linked PIE binaries
+/// that have no interpreter to self-relocate.
+fn apply_relr_to_buf(
+    elf_data: &mut [u8],
+    elf_info: &sotos_common::elf::ElfInfo,
+    segments: &[sotos_common::elf::LoadSegment; sotos_common::elf::MAX_LOAD_SEGMENTS],
+    seg_count: usize,
+    base: u64,
+) -> usize {
+    let mut applied: usize = 0;
+    // Find PT_DYNAMIC
+    let mut dyn_offset = 0usize;
+    let mut dyn_size = 0usize;
+    let mut found = false;
+    for i in 0..elf_info.phnum {
+        let ph = elf_info.phoff + i * elf_info.phentsize;
+        if ph + elf_info.phentsize > elf_data.len() { break; }
+        let p_type = u32::from_le_bytes([
+            elf_data[ph], elf_data[ph+1], elf_data[ph+2], elf_data[ph+3],
+        ]);
+        if p_type == 2 {
+            dyn_offset = u64::from_le_bytes([
+                elf_data[ph+8], elf_data[ph+9], elf_data[ph+10], elf_data[ph+11],
+                elf_data[ph+12], elf_data[ph+13], elf_data[ph+14], elf_data[ph+15],
+            ]) as usize;
+            dyn_size = u64::from_le_bytes([
+                elf_data[ph+32], elf_data[ph+33], elf_data[ph+34], elf_data[ph+35],
+                elf_data[ph+36], elf_data[ph+37], elf_data[ph+38], elf_data[ph+39],
+            ]) as usize;
+            found = true;
+            break;
+        }
+    }
+    if !found { return 0; }
+
+    // Also apply RELA RELATIVE while we're at it
+    let mut rela_off: u64 = 0;
+    let mut rela_sz: u64 = 0;
+    let mut relr_off: u64 = 0;
+    let mut relr_sz: u64 = 0;
+    let mut pos = dyn_offset;
+    let end = (dyn_offset + dyn_size).min(elf_data.len());
+    while pos + 16 <= end {
+        let tag = u64::from_le_bytes([
+            elf_data[pos], elf_data[pos+1], elf_data[pos+2], elf_data[pos+3],
+            elf_data[pos+4], elf_data[pos+5], elf_data[pos+6], elf_data[pos+7],
+        ]);
+        let val = u64::from_le_bytes([
+            elf_data[pos+8], elf_data[pos+9], elf_data[pos+10], elf_data[pos+11],
+            elf_data[pos+12], elf_data[pos+13], elf_data[pos+14], elf_data[pos+15],
+        ]);
+        match tag {
+            0 => break,
+            7 => rela_off = val,
+            8 => rela_sz = val,
+            0x24 => relr_off = val,
+            0x23 => relr_sz = val,
+            _ => {}
+        }
+        pos += 16;
+    }
+
+    // RELA RELATIVE
+    if rela_off != 0 && rela_sz != 0 {
+        let mut rp = rela_off as usize;
+        let rela_end = (rp + rela_sz as usize).min(elf_data.len());
+        while rp + 24 <= rela_end {
+            let r_offset = u64::from_le_bytes(elf_data[rp..rp+8].try_into().unwrap());
+            let r_info = u64::from_le_bytes(elf_data[rp+8..rp+16].try_into().unwrap());
+            let r_addend = u64::from_le_bytes(elf_data[rp+16..rp+24].try_into().unwrap());
+            if (r_info & 0xFFFFFFFF) == 8 { // R_X86_64_RELATIVE
+                if let Some(foff) = vaddr_to_file_offset(r_offset, segments, seg_count) {
+                    if foff + 8 <= elf_data.len() {
+                        let val = (base + r_addend).to_le_bytes();
+                        elf_data[foff..foff+8].copy_from_slice(&val);
+                    }
+                }
+            }
+            rp += 24;
+        }
+    }
+
+    // RELR: compact relative relocations
+    if relr_off == 0 || relr_sz == 0 { return applied; }
+    let mut rp = relr_off as usize;
+    let relr_end = (rp + relr_sz as usize).min(elf_data.len());
+    let mut where_addr: u64 = 0;
+    while rp + 8 <= relr_end {
+        let entry = u64::from_le_bytes(elf_data[rp..rp+8].try_into().unwrap());
+        if entry & 1 == 0 {
+            // Absolute address entry
+            if let Some(foff) = vaddr_to_file_offset(entry, segments, seg_count) {
+                if foff + 8 <= elf_data.len() {
+                    let old = u64::from_le_bytes(elf_data[foff..foff+8].try_into().unwrap());
+                    let val = (old + base).to_le_bytes();
+                    elf_data[foff..foff+8].copy_from_slice(&val);
+                    applied += 1;
+                }
+            }
+            where_addr = entry + 8;
+        } else {
+            // Bitmap entry: each bit represents an 8-byte slot
+            let bitmap = entry >> 1;
+            let base_addr = where_addr;
+            for bit in 0..63u64 {
+                if bitmap & (1 << bit) != 0 {
+                    let addr = base_addr + bit * 8;
+                    if let Some(foff) = vaddr_to_file_offset(addr, segments, seg_count) {
+                        if foff + 8 <= elf_data.len() {
+                            let old = u64::from_le_bytes(elf_data[foff..foff+8].try_into().unwrap());
+                            let val = (old + base).to_le_bytes();
+                            elf_data[foff..foff+8].copy_from_slice(&val);
+                            applied += 1;
+                        }
+                    }
+                }
+            }
+            where_addr = base_addr + 63 * 8;
+        }
+        rp += 8;
+    }
+    applied
+}
+
+/// Apply interpreter RELA + JMPREL relocations to a REMOTE address space via vm_write.
+/// Handles GLOB_DAT/JUMP_SLOT with .dynsym symbol lookup, and R_X86_64_RELATIVE.
+/// Processes both DT_RELA and DT_JMPREL (PLT) relocation tables.
 fn apply_interp_relocs_remote(
     elf_data: &[u8],
     elf_info: &sotos_common::elf::ElfInfo,
@@ -1175,6 +1339,8 @@ fn apply_interp_relocs_remote(
 
     let mut rela_off: u64 = 0;
     let mut rela_sz: u64 = 0;
+    let mut jmprel_off: u64 = 0;
+    let mut jmprel_sz: u64 = 0;
     let mut symtab_off: u64 = 0;
     let mut syment_sz: u64 = 24; // default Elf64_Sym size
     let mut pos = dyn_offset;
@@ -1190,20 +1356,29 @@ fn apply_interp_relocs_remote(
         ]);
         match tag {
             0 => break,
+            2 => jmprel_sz = val,  // DT_PLTRELSZ
             6 => symtab_off = val, // DT_SYMTAB
             7 => rela_off = val,   // DT_RELA
             8 => rela_sz = val,    // DT_RELASZ
             11 => syment_sz = val, // DT_SYMENT
+            23 => jmprel_off = val, // DT_JMPREL
             _ => {}
         }
         pos += 16;
     }
 
-    if rela_off == 0 || rela_sz == 0 { return; }
+    if rela_off == 0 && jmprel_off == 0 { return; }
 
-    let rela_file_off = rela_off as usize;
-    let mut rp = rela_file_off;
-    let rela_end = (rela_file_off + rela_sz as usize).min(elf_data.len());
+    // Process both RELA and JMPREL tables with the same logic
+    let tables: [(u64, u64); 2] = [
+        (rela_off, rela_sz),
+        (jmprel_off, jmprel_sz),
+    ];
+    for (tbl_off, tbl_sz) in tables {
+        if tbl_off == 0 || tbl_sz == 0 { continue; }
+        let rela_file_off = tbl_off as usize;
+        let mut rp = rela_file_off;
+        let rela_end = (rela_file_off + tbl_sz as usize).min(elf_data.len());
     while rp + 24 <= rela_end {
         let r_offset = u64::from_le_bytes([
             elf_data[rp], elf_data[rp+1], elf_data[rp+2], elf_data[rp+3],
@@ -1255,4 +1430,5 @@ fn apply_interp_relocs_remote(
         }
         rp += 24;
     }
+    } // end for tables
 }
