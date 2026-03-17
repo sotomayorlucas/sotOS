@@ -1310,7 +1310,7 @@ pub(crate) fn sys_open(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 *ctx.dir_len += reclen;
             }
             // Add PID entries for active processes
-            for i in 0..16usize {
+            for i in 0..crate::process::MAX_PROCS {
                 if crate::process::PROCESSES[i].state.load(core::sync::atomic::Ordering::Acquire) == 1 {
                     let pid = i + 1;
                     let mut nbuf = [0u8; 8];

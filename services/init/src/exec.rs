@@ -177,10 +177,42 @@ pub(crate) fn format_uptime_into(buf: &mut [u8], secs: u64) -> usize {
     w.pos()
 }
 
-/// Format minimal "/proc/self/stat": "pid (program) R 0 1 1 ...\n"
+/// Format "/proc/N/stat" with real process data from PROCESSES array.
 pub(crate) fn format_proc_self_stat(buf: &mut [u8], pid: usize) -> usize {
+    use crate::process::PROCESSES;
+    use core::sync::atomic::Ordering;
     let mut w = BufWriter::new(buf);
-    let _ = uwrite!(w, "{} (program) R 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", pid);
+    if pid == 0 || pid > crate::process::MAX_PROCS {
+        let _ = uwrite!(w, "{} (sotOS) S 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", pid);
+        return w.pos();
+    }
+    let p = &PROCESSES[pid - 1];
+    let st = p.state.load(Ordering::Acquire);
+    let state_ch = match st { 1 => 'R', 2 => 'Z', _ => 'S' };
+    let ppid = p.parent.load(Ordering::Acquire);
+    let tgid = p.tgid.load(Ordering::Acquire);
+    // Virtual memory size estimate
+    let brk_sz = p.brk_current.load(Ordering::Acquire).saturating_sub(p.brk_base.load(Ordering::Acquire));
+    let mmap_sz = p.mmap_next.load(Ordering::Acquire).saturating_sub(p.mmap_base.load(Ordering::Acquire));
+    let elf_sz = p.elf_hi.load(Ordering::Acquire).saturating_sub(p.elf_lo.load(Ordering::Acquire));
+    let vsize = brk_sz + mmap_sz + elf_sz + 0x4000; // +16K for stack
+    let rss = vsize / 4096;
+    // Count threads in this thread group
+    let mut nthreads: u64 = 0;
+    for i in 0..crate::process::MAX_PROCS {
+        if PROCESSES[i].state.load(Ordering::Acquire) == 1
+           && PROCESSES[i].tgid.load(Ordering::Acquire) == tgid {
+            nthreads += 1;
+        }
+    }
+    if nthreads == 0 { nthreads = 1; }
+    // Fields: pid (comm) state ppid pgrp session tty_nr tpgid flags
+    //   minflt cminflt majflt cmajflt utime stime cutime cstime
+    //   priority nice num_threads itrealvalue starttime vsize rss ...
+    let _ = uwrite!(w, "{} (sotOS) {} {} {} {} 0 -1 0 0 0 0 0 {} {} 0 0 20 0 {} 0 0 {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        pid, state_ch, ppid, tgid, tgid,
+        100u64, 50u64, // utime, stime (synthetic)
+        nthreads, vsize, rss);
     w.pos()
 }
 

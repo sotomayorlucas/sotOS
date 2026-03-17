@@ -194,6 +194,11 @@ pub(crate) fn open_virtual_file(name: &[u8], dir_buf: &mut [u8]) -> Option<usize
             gen_len = c.len();
         } else if starts_with(name, b"/etc/apk/keys/") {
             gen_len = 0; // empty key stubs
+        } else if name == b"/lib/apk/db/installed"
+               || name == b"/lib/apk/db/triggers"
+               || name == b"/lib/apk/db/scripts.tar"
+               || name == b"/lib/apk/db/lock" {
+            gen_len = 0; // empty apk db files (bootstrap)
         } else if name == b"/etc/gai.conf" || name == b"/etc/host.conf"
                || name == b"/etc/services" || name == b"/etc/protocols"
                || name == b"/etc/shells" || name == b"/etc/inputrc"
@@ -350,19 +355,66 @@ pub(crate) fn open_virtual_file(name: &[u8], dir_buf: &mut [u8]) -> Option<usize
                     let n = crate::exec::format_proc_self_stat(dir_buf, pid_val as usize);
                     gen_len = n;
                 } else if subpath == b"statm" {
-                    let c = b"1024 512 256 128 0 256 0\n";
-                    let n = c.len().min(dir_buf.len());
-                    dir_buf[..n].copy_from_slice(&c[..n]);
-                    gen_len = n;
+                    // Real memory stats: size resident shared text lib data dt
+                    let p = &PROCESSES[pid_val as usize - 1];
+                    let brk_sz = p.brk_current.load(core::sync::atomic::Ordering::Acquire)
+                        .saturating_sub(p.brk_base.load(core::sync::atomic::Ordering::Acquire));
+                    let mmap_sz = p.mmap_next.load(core::sync::atomic::Ordering::Acquire)
+                        .saturating_sub(p.mmap_base.load(core::sync::atomic::Ordering::Acquire));
+                    let elf_sz = p.elf_hi.load(core::sync::atomic::Ordering::Acquire)
+                        .saturating_sub(p.elf_lo.load(core::sync::atomic::Ordering::Acquire));
+                    let pages = (brk_sz + mmap_sz + elf_sz + 0x4000) / 4096;
+                    let rss = pages;
+                    let mut w = [0u8; 64];
+                    let mut pos = 0;
+                    pos += fmt_u64(pages, &mut w[pos..]); w[pos] = b' '; pos += 1;
+                    pos += fmt_u64(rss, &mut w[pos..]); w[pos] = b' '; pos += 1;
+                    pos += fmt_u64(0, &mut w[pos..]); w[pos] = b' '; pos += 1; // shared
+                    pos += fmt_u64(elf_sz / 4096, &mut w[pos..]); w[pos] = b' '; pos += 1; // text
+                    pos += fmt_u64(0, &mut w[pos..]); w[pos] = b' '; pos += 1; // lib
+                    pos += fmt_u64((brk_sz + mmap_sz) / 4096, &mut w[pos..]); w[pos] = b' '; pos += 1; // data
+                    pos += fmt_u64(0, &mut w[pos..]); w[pos] = b'\n'; pos += 1; // dt
+                    dir_buf[..pos].copy_from_slice(&w[..pos]);
+                    gen_len = pos;
                 } else if subpath == b"cmdline" {
                     let c = b"[sotOS]\0";
                     dir_buf[..c.len()].copy_from_slice(c);
                     gen_len = c.len();
                 } else if subpath == b"status" {
-                    let c = b"Name:\tsotOS\nState:\tS (sleeping)\nPid:\t1\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nVmRSS:\t2048 kB\n";
-                    let n = c.len().min(dir_buf.len());
-                    dir_buf[..n].copy_from_slice(&c[..n]);
-                    gen_len = n;
+                    let p = &PROCESSES[pid_val as usize - 1];
+                    let st = p.state.load(core::sync::atomic::Ordering::Acquire);
+                    let ppid = p.parent.load(core::sync::atomic::Ordering::Acquire);
+                    let state_str = match st { 1 => b"R (running)" as &[u8], 2 => b"Z (zombie)", _ => b"S (sleeping)" };
+                    let brk_sz = p.brk_current.load(core::sync::atomic::Ordering::Acquire)
+                        .saturating_sub(p.brk_base.load(core::sync::atomic::Ordering::Acquire));
+                    let mmap_sz = p.mmap_next.load(core::sync::atomic::Ordering::Acquire)
+                        .saturating_sub(p.mmap_base.load(core::sync::atomic::Ordering::Acquire));
+                    let elf_sz = p.elf_hi.load(core::sync::atomic::Ordering::Acquire)
+                        .saturating_sub(p.elf_lo.load(core::sync::atomic::Ordering::Acquire));
+                    let vm_kb = (brk_sz + mmap_sz + elf_sz + 0x4000) / 1024;
+                    let mut w = [0u8; 256];
+                    let mut pos = 0;
+                    let hdr = b"Name:\tsotOS\nState:\t";
+                    w[pos..pos+hdr.len()].copy_from_slice(hdr); pos += hdr.len();
+                    w[pos..pos+state_str.len()].copy_from_slice(state_str); pos += state_str.len();
+                    w[pos] = b'\n'; pos += 1;
+                    let pid_hdr = b"Pid:\t";
+                    w[pos..pos+pid_hdr.len()].copy_from_slice(pid_hdr); pos += pid_hdr.len();
+                    pos += fmt_u64(pid_val, &mut w[pos..]);
+                    w[pos] = b'\n'; pos += 1;
+                    let ppid_hdr = b"PPid:\t";
+                    w[pos..pos+ppid_hdr.len()].copy_from_slice(ppid_hdr); pos += ppid_hdr.len();
+                    pos += fmt_u64(ppid, &mut w[pos..]);
+                    let rest = b"\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nVmSize:\t";
+                    w[pos..pos+rest.len()].copy_from_slice(rest); pos += rest.len();
+                    pos += fmt_u64(vm_kb, &mut w[pos..]);
+                    let kb_end = b" kB\nVmRSS:\t";
+                    w[pos..pos+kb_end.len()].copy_from_slice(kb_end); pos += kb_end.len();
+                    pos += fmt_u64(vm_kb, &mut w[pos..]);
+                    let end = b" kB\nThreads:\t1\n";
+                    w[pos..pos+end.len()].copy_from_slice(end); pos += end.len();
+                    dir_buf[..pos].copy_from_slice(&w[..pos]);
+                    gen_len = pos;
                 } else {
                     gen_len = 0; // unknown subpath
                 }

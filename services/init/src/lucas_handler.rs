@@ -85,6 +85,13 @@ fn sysroot_init(store: &mut ObjectStore) {
             if store.find_in(b"apk", lib_oid).is_none() { let _ = store.mkdir(b"apk", lib_oid); }
         }
     }
+    // Create /lib/apk/db/ for apk package database
+    if let Ok(lib_oid) = store.resolve_path(b"lib", ROOT_OID) {
+        if store.find_in(b"apk", lib_oid).is_none() { let _ = store.mkdir(b"apk", lib_oid); }
+        if let Some(apk_oid) = store.find_in(b"apk", lib_oid) {
+            if store.find_in(b"db", apk_oid).is_none() { let _ = store.mkdir(b"db", apk_oid); }
+        }
+    }
     // Create /etc/apk directory
     if store.resolve_path(b"etc", ROOT_OID).is_err() {
         let _ = store.mkdir(b"etc", ROOT_OID);

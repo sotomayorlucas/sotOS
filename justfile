@@ -151,19 +151,21 @@ debug: image
 
 # Create a 256 MiB ObjectStore v5 disk (or inject rootfs if present)
 create-test-disk:
-    python scripts/mkdisk.py --size 256
+    [ -f target/disk.img ] || python scripts/mkdisk.py --size 256
 
 # Create a rootfs-populated disk from an extracted rootfs directory
 create-rootfs-disk ROOTFS="rootfs":
     python scripts/mkdisk.py --size 256 --rootfs {{ROOTFS}}
 
-# Run with HTTPS proxy (auto-starts proxy on host, guest can download Alpine packages)
-run-https: image
+# Run with HTTPS proxy + persistent disk (auto-starts proxy, Alpine packages persist)
+run-https: image create-test-disk
     @echo "Starting HTTPS proxy on port 8080..."
     python scripts/https_proxy.py -p 8080 &
     @sleep 1
     "{{QEMU}}" \
         -drive format=raw,file={{IMAGE}} \
+        -drive if=none,format=raw,file=target/disk.img,id=disk0 \
+        -device virtio-blk-pci,drive=disk0,disable-modern=on \
         -device virtio-net-pci,netdev=n0 \
         -netdev user,id=n0 \
         -serial stdio \
