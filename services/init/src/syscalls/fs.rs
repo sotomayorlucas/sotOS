@@ -238,9 +238,6 @@ pub(crate) fn sys_read(ctx: &mut SyscallContext, msg: &IpcMsg) {
         }
         16 => {
             // TCP socket read: bulk transfer via multi-chunk IPC.
-            // Net service reads up to 4096 bytes on first call (offset=0).
-            // Subsequent calls fetch from stored buffer (offset>0) — no socket poll.
-            // This reduces IPC+poll overhead from 256 calls per 16KB to ~64.
             let net_cap = NET_EP_CAP.load(Ordering::Acquire);
             let conn_id = ctx.sock_conn_id[fd] as u64;
             let max_read = len.min(32768);
@@ -248,18 +245,24 @@ pub(crate) fn sys_read(ctx: &mut SyscallContext, msg: &IpcMsg) {
             let mut empty_retries = 0u32;
             let mut saw_eof = false;
 
-            while total < max_read && empty_retries < 5000 {
-                // First IPC: offset=0 triggers socket read (up to 4KB)
+            while total < max_read && empty_retries < 50000 {
+                // First IPC: offset=0 triggers socket read.
+                // regs[3] = max bytes to read from smoltcp (prevents over-consumption)
+                let want = (max_read - total).min(4096) as u64;
                 let req = IpcMsg {
                     tag: NET_CMD_TCP_RECV,
-                    regs: [conn_id, 64, 0, 0, 0, 0, 0, 0],
+                    regs: [conn_id, 64, 0, want, 0, 0, 0, 0],
                 };
                 match sys::call_timeout(net_cap, &req, 200) {
                     Ok(resp) => {
                         let first_n = resp.tag as usize;
-                        if first_n == 0xFFFE { saw_eof = true; break; }
+                        if first_n == 0xFFFE {
+                            saw_eof = true; break;
+                        }
                         if first_n == 0 {
-                            if total > 0 { break; }
+                            if total > 0 {
+                                break;
+                            }
                             empty_retries += 1;
                             sys::yield_now();
                             continue;
@@ -1633,9 +1636,10 @@ pub(crate) fn sys_readv(ctx: &mut SyscallContext, msg: &IpcMsg) {
             while off < ilen && !saw_eof {
                 // First IPC: offset=0 reads up to 4KB from socket
                 let chunk = (ilen - off).min(64);
+                let want = (ilen - off).min(4096) as u64; // limit smoltcp read
                 let req = sotos_common::IpcMsg {
                     tag: NET_CMD_TCP_RECV,
-                    regs: [conn_id, chunk as u64, 0, 0, 0, 0, 0, 0],
+                    regs: [conn_id, chunk as u64, 0, want, 0, 0, 0, 0],
                 };
                 match sys::call_timeout(net_cap, &req, 200) {
                     Ok(resp) => {
@@ -3812,10 +3816,135 @@ pub(crate) fn sys_copy_file_range(ctx: &mut SyscallContext, _msg: &IpcMsg) {
     reply_val(ctx.ep_cap, -ENOSYS);
 }
 
-/// SYS_SENDFILE (40): stub.
-pub(crate) fn sys_sendfile(ctx: &mut SyscallContext, _msg: &IpcMsg) {
-    // Stub: report unsupported for now
+/// SYS_SENDFILE (40): return -ENOSYS to force read/write fallback.
+/// The read/write path with the `want` parameter prevents data waste.
+pub(crate) fn sys_sendfile(ctx: &mut SyscallContext, msg: &IpcMsg) {
     reply_val(ctx.ep_cap, -ENOSYS);
+    return;
+    // Dead code below kept for reference
+    let out_fd = msg.regs[0] as usize;
+    let in_fd = msg.regs[1] as usize;
+    let _offset_ptr = msg.regs[2]; // NULL for socket sources
+    let count = msg.regs[3] as usize;
+
+    // Only support TCP socket (16) → VFS file (13)
+    if in_fd >= GRP_MAX_FDS || out_fd >= GRP_MAX_FDS
+        || ctx.child_fds[in_fd] != 16
+        || ctx.child_fds[out_fd] != 13
+    {
+        reply_val(ctx.ep_cap, -ENOSYS);
+        return;
+    }
+
+    let net_cap = NET_EP_CAP.load(Ordering::Acquire);
+    if net_cap == 0 { reply_val(ctx.ep_cap, -EIO); return; }
+    let conn_id = ctx.sock_conn_id[in_fd] as u64;
+    let max_xfer = count.min(131072); // cap at 128KB per sendfile
+    let mut total = 0usize;
+    let mut empty_retries = 0u32;
+
+    while total < max_xfer && empty_retries < 50000 {
+        // Read from TCP socket via net service, limiting to what we need
+        let want = (max_xfer - total).min(4096) as u64;
+        let req = IpcMsg {
+            tag: NET_CMD_TCP_RECV,
+            regs: [conn_id, 64, 0, want, 0, 0, 0, 0],
+        };
+        match sys::call_timeout(net_cap, &req, 200) {
+            Ok(resp) => {
+                let first_n = resp.tag as usize;
+                if first_n == 0xFFFE { break; } // EOF
+                if first_n == 0 {
+                    if total > 0 { break; }
+                    empty_retries += 1;
+                    sys::yield_now();
+                    continue;
+                }
+                empty_retries = 0;
+                // Write first 64 bytes directly to VFS
+                let actual = first_n.min(64);
+                let chunk = unsafe {
+                    core::slice::from_raw_parts(&resp.regs[0] as *const u64 as *const u8, actual)
+                };
+                // Find VFS file slot and write
+                let mut wrote = false;
+                for s in 0..GRP_MAX_VFS {
+                    if ctx.vfs_files[s][3] == out_fd as u64 && ctx.vfs_files[s][0] != 0 {
+                        let oid = ctx.vfs_files[s][0];
+                        let pos = ctx.vfs_files[s][2] as usize;
+                        vfs_lock();
+                        let result = unsafe { shared_store() }
+                            .and_then(|store| store.write_obj_range(oid, pos, chunk).ok());
+                        vfs_unlock();
+                        if result.is_some() {
+                            ctx.vfs_files[s][2] += actual as u64;
+                            if ctx.vfs_files[s][2] > ctx.vfs_files[s][1] {
+                                ctx.vfs_files[s][1] = ctx.vfs_files[s][2];
+                            }
+                            total += actual;
+                            wrote = true;
+                        }
+                        break;
+                    }
+                }
+                if !wrote { break; }
+                // Fetch remaining bytes from the 4KB buffer
+                let mut buf_off = actual;
+                while total < max_xfer && buf_off < 4096 {
+                    let cont_req = IpcMsg {
+                        tag: NET_CMD_TCP_RECV,
+                        regs: [conn_id, 64, buf_off as u64, 0, 0, 0, 0, 0],
+                    };
+                    match sys::call_timeout(net_cap, &cont_req, 100) {
+                        Ok(cr) => {
+                            let cn = cr.tag as usize;
+                            if cn == 0 || cn == 0xFFFE { break; }
+                            let acn = cn.min(64);
+                            let cdata = unsafe {
+                                core::slice::from_raw_parts(&cr.regs[0] as *const u64 as *const u8, acn)
+                            };
+                            // Write to VFS
+                            let mut ok = false;
+                            for s in 0..GRP_MAX_VFS {
+                                if ctx.vfs_files[s][3] == out_fd as u64 && ctx.vfs_files[s][0] != 0 {
+                                    let oid = ctx.vfs_files[s][0];
+                                    let pos = ctx.vfs_files[s][2] as usize;
+                                    vfs_lock();
+                                    let r = unsafe { shared_store() }
+                                        .and_then(|st| st.write_obj_range(oid, pos, cdata).ok());
+                                    vfs_unlock();
+                                    if r.is_some() {
+                                        ctx.vfs_files[s][2] += acn as u64;
+                                        if ctx.vfs_files[s][2] > ctx.vfs_files[s][1] {
+                                            ctx.vfs_files[s][1] = ctx.vfs_files[s][2];
+                                        }
+                                        total += acn;
+                                        ok = true;
+                                    }
+                                    break;
+                                }
+                            }
+                            if !ok { break; }
+                            buf_off += acn;
+                            if acn < 64 { break; }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if first_n < 64 { break; } // socket drained
+            }
+            Err(_) => {
+                if total > 0 { break; }
+                empty_retries += 1;
+                sys::yield_now();
+            }
+        }
+    }
+    if total > 0 {
+        reply_val(ctx.ep_cap, total as i64);
+    } else {
+        reply_val(ctx.ep_cap, -ENOSYS); // fall back to read/write if nothing transferred
+    }
 }
 
 /// File metadata stubs: LINK, SYMLINK, FCHMOD, FCHOWN, LCHOWN, FLOCK, FALLOCATE, UTIMES,

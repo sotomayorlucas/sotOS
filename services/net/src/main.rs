@@ -30,7 +30,7 @@ use smoltcp::wire::{
 // Bump allocator (256 KiB, never frees)
 // =============================================================================
 
-const HEAP_SIZE: usize = 256 * 1024;
+const HEAP_SIZE: usize = 512 * 1024;
 static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 static HEAP_POS: AtomicUsize = AtomicUsize::new(0);
 
@@ -99,6 +99,7 @@ const CMD_UDP_SENDTO: u64 = 9;
 const CMD_UDP_RECV: u64 = 10;
 const CMD_TCP_STATUS: u64 = 11;
 const CMD_NET_MIRROR: u64 = 12;
+const CMD_UDP_HAS_DATA: u64 = 13;
 
 // IPC atomic command queue
 static NET_MIRROR: AtomicU64 = AtomicU64::new(0);
@@ -962,7 +963,9 @@ fn process_ipc_cmd(
             let local_port = NEXT_EPHEMERAL_PORT.fetch_add(1, Ordering::Relaxed) as u16;
 
             if let Some(slot) = alloc_tcp_slot() {
-                let rx = tcp::SocketBuffer::new(alloc::vec![0u8; 16384]);
+                // 131072 = 128KB RX buffer: SLIRP doesn't respect TCP flow control
+                // and sends data in bursts. Large buffer prevents dropped segments.
+                let rx = tcp::SocketBuffer::new(alloc::vec![0u8; 131072]);
                 let tx = tcp::SocketBuffer::new(alloc::vec![0u8; 4096]);
                 let tcp_sock = tcp::Socket::new(rx, tx);
                 let handle = sockets.add(tcp_sock);
@@ -982,7 +985,8 @@ fn process_ipc_cmd(
                 }
 
                 // Wait for connection (up to ~5 seconds for real internet)
-                for i in 0..5000u32 {
+                // Wait for connection (up to ~5 seconds for real internet)
+                for _i in 0..5000u32 {
                     iface.poll(now(), device, sockets);
                     let sock = sockets.get_mut::<tcp::Socket>(handle);
                     if sock.is_active() && sock.may_send() {
@@ -1051,8 +1055,11 @@ fn process_ipc_cmd(
                 None => return 0,
             };
 
-            // Read up to 4096 bytes in one shot (not 64!) for bulk throughput
-            let max_len = 4096usize;
+            // Read from smoltcp: use caller's requested max (regs[3]) if >0, else 4096.
+            // This prevents over-consuming from the smoltcp buffer when the caller
+            // only needs a small amount (e.g., HTTP header reads).
+            let caller_want = IPC_ARG3.load(core::sync::atomic::Ordering::Acquire) as usize;
+            let max_len = if caller_want > 0 && caller_want <= 4096 { caller_want } else { 4096 };
 
             // Try immediate read
             {
@@ -1066,15 +1073,19 @@ fn process_ipc_cmd(
                     };
                     if let Ok(n) = sock.recv_slice(ipc_buf) {
                         if n > 0 {
+                            // Flush ACK/window update immediately so server sends more data
+                            drop(sock);
+                            iface.poll(now(), device, sockets);
                             IPC_TCP_RECV_TOTAL.store(n as u64, core::sync::atomic::Ordering::Release);
                             return n as u64;
                         }
                     }
                 }
             }
-            // Poll for incoming data
-            for _ in 0..1000u32 {
+            // Poll for incoming data (with ACK flush after each read)
+            for _ in 0..2000u32 {
                 iface.poll(now(), device, sockets);
+                device.net.ack_irq();
                 let sock = sockets.get_mut::<tcp::Socket>(handle);
                 if sock.can_recv() {
                     let ipc_buf = unsafe {
@@ -1085,12 +1096,15 @@ fn process_ipc_cmd(
                     };
                     if let Ok(n) = sock.recv_slice(ipc_buf) {
                         if n > 0 {
+                            drop(sock);
+                            iface.poll(now(), device, sockets); // flush ACK
                             IPC_TCP_RECV_TOTAL.store(n as u64, core::sync::atomic::Ordering::Release);
                             return n as u64;
                         }
                     }
                 }
-                if !sock.is_active() {
+                let sock2 = sockets.get_mut::<tcp::Socket>(handle);
+                if !sock2.is_active() {
                     return 0xFFFE; // EOF sentinel
                 }
                 sys::yield_now();
@@ -1267,9 +1281,10 @@ fn process_ipc_cmd(
                 }
             }
 
-            // Poll for new data (500 iters for SLIRP DNS latency)
+            // Poll for new data — SLIRP DNS typically responds within 50ms.
             for _iter in 0..500u32 {
                 sys::yield_now();
+                device.net.ack_irq();
                 iface.poll(now(), device, sockets);
                 let sock = sockets.get_mut::<udp::Socket>(handle);
                 if sock.can_recv() {
@@ -1302,6 +1317,19 @@ fn process_ipc_cmd(
                     recv_avail | (connected << 32)
                 }
                 None => 0,
+            }
+        }
+
+        CMD_UDP_HAS_DATA => {
+            // Non-destructive check: does the UDP socket on this port have data?
+            let port = arg0 as u16;
+            iface.poll(now(), device, sockets);
+            if let Some(slot) = find_udp_slot(port) {
+                let handle = unsafe { UDP_SLOTS[slot].0.unwrap() };
+                let sock = sockets.get_mut::<udp::Socket>(handle);
+                if sock.can_recv() { 1 } else { 0 }
+            } else {
+                0
             }
         }
 

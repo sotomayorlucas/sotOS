@@ -60,6 +60,20 @@ fn poll_fd_readable(ctx: &SyscallContext, fd: usize) -> bool {
                 pipe_has_data(pipe_a) || pipe_writer_closed(pipe_a)
             } else { false }
         }
+        17 => {
+            // UDP socket: check net service for pending datagram (non-destructive)
+            let net_cap = NET_EP_CAP.load(Ordering::Acquire);
+            if net_cap == 0 { return false; }
+            let src_port = ctx.sock_udp_local_port[fd];
+            let req = IpcMsg {
+                tag: crate::net::NET_CMD_UDP_HAS_DATA,
+                regs: [src_port as u64, 0, 0, 0, 0, 0, 0, 0],
+            };
+            match sys::call_timeout(net_cap, &req, 1000) {
+                Ok(resp) => resp.regs[0] != 0,
+                Err(_) => false,
+            }
+        }
         2 | 8 | 12 | 13 | 14 | 15 | 16 | 22 | 23 | 25 => true, // always "ready"
         _ => true, // default: report readable
     }
@@ -719,7 +733,7 @@ pub(crate) fn sys_recvfrom(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let src_port = ctx.sock_udp_local_port[fd];
         let max_recv = len.min(512); // DNS responses up to 512 bytes
         let mut got = 0usize;
-        // First call: offset=0, triggers net service to poll for new datagram
+        // Retry for DNS responses (poll() should have confirmed data is available).
         for _attempt in 0..50u32 {
             let req = IpcMsg {
                 tag: NET_CMD_UDP_RECV,
@@ -789,39 +803,93 @@ pub(crate) fn sys_recvfrom(ctx: &mut SyscallContext, msg: &IpcMsg) {
             reply_val(ep_cap, -EAGAIN);
         }
     } else {
-        // TCP recvfrom
+        // TCP recvfrom: bulk transfer via multi-chunk IPC (matches TCP read handler)
         let net_cap = NET_EP_CAP.load(Ordering::Acquire);
         let conn_id = ctx.sock_conn_id[fd] as u64;
-        let recv_len = len.min(64);
-        let nonblock = fd < GRP_MAX_FDS && (ctx.fd_flags[fd] & 0x800) != 0; // O_NONBLOCK
-        let max_attempts = if nonblock { 10u32 } else { 5000u32 };
-        let mut got = 0usize;
+        let max_read = len.min(32768);
+        let mut total = 0usize;
+        let mut empty_retries = 0u32;
         let mut saw_eof = false;
-        for _attempt in 0..max_attempts {
+
+        while total < max_read && empty_retries < 50000 {
+            // First IPC: offset=0 triggers socket read.
+            // regs[3] = max bytes to read from smoltcp (prevents over-consumption)
+            let want = (max_read - total).min(4096) as u64;
             let req = IpcMsg {
                 tag: NET_CMD_TCP_RECV,
-                regs: [conn_id, recv_len as u64, 0, 0, 0, 0, 0, 0],
+                regs: [conn_id, 64, 0, want, 0, 0, 0, 0],
             };
             match sys::call_timeout(net_cap, &req, 200) {
                 Ok(resp) => {
-                    let n = resp.tag as usize;
-                    if n == 0xFFFE { saw_eof = true; break; }
-                    if n > 0 && n <= recv_len {
-                        let src = unsafe {
-                            core::slice::from_raw_parts(&resp.regs[0] as *const u64 as *const u8, n)
-                        };
-                        ctx.guest_write(buf_ptr, src);
-                        got = n;
-                        break;
+                    let first_n = resp.tag as usize;
+                    if first_n == 0xFFFE {
+                        saw_eof = true; break;
                     }
+                    if first_n == 0 {
+                        if total > 0 {
+                            break;
+                        }
+                        empty_retries += 1;
+                        sys::yield_now();
+                        continue;
+                    }
+                    // Write first 64 bytes
+                    let actual_first = first_n.min(64);
+                    let src = unsafe {
+                        core::slice::from_raw_parts(&resp.regs[0] as *const u64 as *const u8, actual_first)
+                    };
+                    ctx.guest_write(buf_ptr + total as u64, src);
+                    total += actual_first;
+                    empty_retries = 0;
+
+                    // Fetch remaining bytes from buffer (offset > 0, no socket poll)
+                    let mut buf_offset = actual_first;
+                    while total < max_read && buf_offset < 4096 {
+                        let cont_req = IpcMsg {
+                            tag: NET_CMD_TCP_RECV,
+                            regs: [conn_id, 64, buf_offset as u64, 0, 0, 0, 0, 0],
+                        };
+                        match sys::call_timeout(net_cap, &cont_req, 100) {
+                            Ok(cont_resp) => {
+                                let cn = cont_resp.tag as usize;
+                                if cn == 0 || cn == 0xFFFE { break; }
+                                let actual_cn = cn.min(64);
+                                let cont_src = unsafe {
+                                    core::slice::from_raw_parts(&cont_resp.regs[0] as *const u64 as *const u8, actual_cn)
+                                };
+                                ctx.guest_write(buf_ptr + total as u64, cont_src);
+                                total += actual_cn;
+                                buf_offset += actual_cn;
+                                if actual_cn < 64 { break; } // last chunk from buffer
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    // If we got less than 64 on the first read, socket is drained
+                    if first_n < 64 { break; }
                 }
-                Err(_) => {}
+                Err(_) => {
+                    if total > 0 { break; }
+                    empty_retries += 1;
+                    sys::yield_now();
+                }
             }
-            sys::yield_now();
         }
-        if got > 0 { reply_val(ep_cap, got as i64); }
-        else if saw_eof { reply_val(ep_cap, 0); }
-        else { reply_val(ep_cap, -EAGAIN); }
+        if total > 0 {
+            if src_addr_ptr != 0 {
+                let mut sa_buf = [0u8; 16];
+                sa_buf[0] = 2; // AF_INET
+                ctx.guest_write(src_addr_ptr, &sa_buf);
+                if addrlen_ptr != 0 {
+                    ctx.guest_write(addrlen_ptr, &16u32.to_le_bytes());
+                }
+            }
+            reply_val(ep_cap, total as i64);
+        } else if saw_eof {
+            reply_val(ep_cap, 0);
+        } else {
+            reply_val(ep_cap, -EAGAIN);
+        }
     }
 }
 

@@ -582,10 +582,19 @@ pub fn write_fork_tls_trampoline(fs_base: u64, gs_base: u64) {
 }
 
 /// Same as `write_fork_tls_trampoline` but writes to a separate address space.
+///
+/// This function is CoW-safe: it allocates a new physical frame for the vDSO page
+/// in the target AS, copies the existing content, writes the trampoline, and maps
+/// the new frame. This avoids corrupting shared CoW frames (which `protect_in` +
+/// direct write would do, since `protect_page` doesn't handle CoW).
+///
+/// Must be called AFTER `clone_cow()` with the **child's** AS cap, not the parent's.
 pub fn write_fork_tls_trampoline_in(as_cap: u64, fs_base: u64, gs_base: u64) {
+    use sotos_common::sys;
+
     let addr = FORK_TLS_TRAMPOLINE_ADDR;
-    // Make vDSO page writable in target AS
-    let _ = sotos_common::sys::protect_in(as_cap, addr & !0xFFF, 2);
+    let page = addr & !0xFFF; // 0xB80000
+
     // Build trampoline code in a local buffer (max 49 bytes with GS, 27 without)
     let mut buf = [0u8; 64];
     let mut off = 0usize;
@@ -619,8 +628,17 @@ pub fn write_fork_tls_trampoline_in(as_cap: u64, fs_base: u64, gs_base: u64) {
     buf[off] = 0xE9; off += 1;
     buf[off..off+4].copy_from_slice(&rel.to_le_bytes()); off += 4;
 
-    // Write to target AS
-    let _ = sotos_common::sys::vm_write(as_cap, addr, buf.as_ptr() as u64, off as u64);
-    // Make vDSO page executable again (read+execute, no write)
-    let _ = sotos_common::sys::protect_in(as_cap, addr & !0xFFF, 0);
+    // CoW-safe write: allocate a private frame for the child's vDSO page,
+    // copy the parent's content, then write the trampoline into the private copy.
+    if let Ok(nf) = sys::frame_alloc() {
+        if sys::frame_copy(nf, as_cap, page).is_ok() {
+            let _ = sys::unmap_from(as_cap, page);
+            // Map writable so vm_write doesn't trigger another CoW allocation
+            let _ = sys::map_into(as_cap, page, nf, 2); // 2 = writable
+            // Write trampoline into the private frame
+            let _ = sys::vm_write(as_cap, addr, buf.as_ptr() as u64, off as u64);
+            // Restore R+X permissions (executable, not writable)
+            let _ = sys::protect_in(as_cap, page, 0);
+        }
+    }
 }

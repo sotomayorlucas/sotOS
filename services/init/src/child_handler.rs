@@ -142,7 +142,7 @@ pub(crate) fn open_virtual_file(name: &[u8], dir_buf: &mut [u8]) -> Option<usize
             dir_buf[..c.len()].copy_from_slice(c);
             gen_len = c.len();
         } else if name == b"/etc/hosts" {
-            let c = b"127.0.0.1 localhost\n::1 localhost\n";
+            let c = b"127.0.0.1 localhost\n::1 localhost\n104.18.27.120 example.com\n151.101.130.132 dl-cdn.alpinelinux.org\n";
             dir_buf[..c.len()].copy_from_slice(c);
             gen_len = c.len();
         } else if name == b"/etc/nsswitch.conf" {
@@ -319,6 +319,9 @@ pub(crate) extern "C" fn child_handler() -> ! {
     }
     let mut ep_cap = CHILD_SETUP_EP.load(Ordering::Acquire);
     let pid = CHILD_SETUP_PID.load(Ordering::Acquire) as usize;
+    print(b"CHILD-HANDLER pid="); print_u64(pid as u64);
+    print(b" ep="); print_u64(ep_cap);
+    print(b"\n");
     let clone_flags = CHILD_SETUP_FLAGS.load(Ordering::Acquire);
     let mut child_as_cap = CHILD_SETUP_AS_CAP.load(Ordering::Acquire);
     // Signal that we consumed the setup
@@ -496,8 +499,8 @@ pub(crate) extern "C" fn child_handler() -> ! {
         // PIPE_RETRY_TAG it will re-increment via mark_pipe_retry().
         clear_pipe_retry(pid);
 
-        // Trace syscalls for child processes (P3+ covers all user commands)
-        if pid >= 3 {
+        // Trace syscalls for Wine/package manager child processes (P6+)
+        if pid >= 6 {
             print(b"AS-SYS P"); print_u64(pid as u64);
             print(b" #"); print_u64(syscall_nr);
             print(b" ep="); print_u64(ep_cap);
@@ -1065,41 +1068,34 @@ pub(crate) extern "C" fn child_handler() -> ! {
                         }
                     }
 
-                    // Write TLS/GS trampoline before cloning (child sees it in CoW copy)
+                    // Determine child entry point (trampoline needed if TLS/GS is set)
                     let need_trampoline = fork_fsbase != 0 || fork_gsbase != 0;
-                    if need_trampoline {
-                        if parent_as != 0 {
-                            vdso::write_fork_tls_trampoline_in(parent_as, fork_fsbase, fork_gsbase);
-                        } else {
-                            vdso::write_fork_tls_trampoline(fork_fsbase, fork_gsbase);
-                        }
-                    }
                     let child_entry = if need_trampoline {
                         vdso::FORK_TLS_TRAMPOLINE_ADDR
                     } else {
                         vdso::COW_FORK_RESTORE_ADDR
                     };
 
-                    print(b"FK1 P"); print_u64(pid as u64); print(b"\n");
-                    // Diagnostic: check PTE at 0x10428000 before clone_cow
-                    if clone_source != 0 {
-                        if let Ok((phys, fl)) = sys::pte_read(clone_source, 0x10428000) {
-                            print(b"FK-PTE-B p="); crate::framebuffer::print_hex64(phys);
-                            print(b" f="); crate::framebuffer::print_hex64(fl); print(b"\n");
-                        } else { print(b"FK-PTE-B ABSENT\n"); }
+                    // Write TLS/GS trampoline to parent BEFORE cloning ONLY for
+                    // init's own AS (parent_as == 0) where there is no CoW sharing.
+                    // For separate AS (parent_as != 0), we write to the CHILD's AS
+                    // after clone_cow to avoid corrupting shared CoW frames.
+                    if need_trampoline && parent_as == 0 {
+                        vdso::write_fork_tls_trampoline(fork_fsbase, fork_gsbase);
                     }
+
+                    print(b"FK1 P"); print_u64(pid as u64); print(b"\n");
                     let child_as_cap = match sys::addr_space_clone(clone_source) {
                         Ok(cap) => cap,
                         Err(_) => { reply_val(ep_cap, -ENOMEM); continue; }
                     };
-                    // Diagnostic: check PTE at 0x10428000 after clone_cow
-                    if clone_source != 0 {
-                        if let Ok((phys, fl)) = sys::pte_read(clone_source, 0x10428000) {
-                            print(b"FK-PTE-A p="); crate::framebuffer::print_hex64(phys);
-                            print(b" f="); crate::framebuffer::print_hex64(fl); print(b"\n");
-                        } else { print(b"FK-PTE-A ABSENT\n"); }
-                    }
                     print(b"FK2 P"); print_u64(pid as u64); print(b"\n");
+
+                    // For separate AS: write TLS trampoline to the CHILD's private
+                    // vDSO page (CoW-safe: allocates new frame, copies, writes).
+                    if need_trampoline && parent_as != 0 {
+                        vdso::write_fork_tls_trampoline_in(child_as_cap, fork_fsbase, fork_gsbase);
+                    }
                     // Directly test if code after FK2 runs at all
                     // Fix glibc fork linked list spin: glibc's fork handler iterates
                     // the atfork handler list (linked list at RBX+0x1088). After CoW fork,
@@ -1495,30 +1491,22 @@ pub(crate) extern "C" fn child_handler() -> ! {
                     }
                 }
 
-                // Write TLS/GS trampoline that sets FS_BASE and GS_BASE BEFORE the child
-                // touches any TLS-dependent or GS-dependent code.
+                // Determine child entry point (trampoline needed if TLS/GS is set)
                 let need_trampoline = fork_fsbase != 0 || fork_gsbase != 0;
-                if need_trampoline {
-                    if parent_as != 0 {
-                        vdso::write_fork_tls_trampoline_in(parent_as, fork_fsbase, fork_gsbase);
-                    } else {
-                        vdso::write_fork_tls_trampoline(fork_fsbase, fork_gsbase);
-                    }
-                }
                 let child_entry = if need_trampoline {
                     vdso::FORK_TLS_TRAMPOLINE_ADDR
                 } else {
                     vdso::COW_FORK_RESTORE_ADDR
                 };
 
-                // Clone the address space with CoW semantics
-                // Diagnostic: check PTE at 0x10428000 before clone_cow
-                if clone_source != 0 {
-                    if let Ok((phys, fl)) = sys::pte_read(clone_source, 0x10428000) {
-                        print(b"FK-PTE-B p="); crate::framebuffer::print_hex64(phys);
-                        print(b" f="); crate::framebuffer::print_hex64(fl); print(b"\n");
-                    } else { print(b"FK-PTE-B ABSENT\n"); }
+                // Write TLS/GS trampoline to parent BEFORE cloning ONLY for
+                // init's own AS (parent_as == 0) where there is no CoW sharing.
+                // For separate AS, we write to the CHILD's AS after clone_cow.
+                if need_trampoline && parent_as == 0 {
+                    vdso::write_fork_tls_trampoline(fork_fsbase, fork_gsbase);
                 }
+
+                // Clone the address space with CoW semantics
                 let child_as_cap = match sys::addr_space_clone(clone_source) {
                     Ok(cap) => cap,
                     Err(_) => {
@@ -1526,12 +1514,11 @@ pub(crate) extern "C" fn child_handler() -> ! {
                         continue;
                     }
                 };
-                // Diagnostic: check PTE at 0x10428000 after clone_cow
-                if clone_source != 0 {
-                    if let Ok((phys, fl)) = sys::pte_read(clone_source, 0x10428000) {
-                        print(b"FK-PTE-A p="); crate::framebuffer::print_hex64(phys);
-                        print(b" f="); crate::framebuffer::print_hex64(fl); print(b"\n");
-                    } else { print(b"FK-PTE-A ABSENT\n"); }
+
+                // For separate AS: write TLS trampoline to the CHILD's private
+                // vDSO page (CoW-safe: allocates new frame, copies, writes).
+                if need_trampoline && parent_as != 0 {
+                    vdso::write_fork_tls_trampoline_in(child_as_cap, fork_fsbase, fork_gsbase);
                 }
 
                 // Fix glibc fork atfork list (same as SYS_CLONE path).

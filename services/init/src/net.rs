@@ -10,3 +10,4 @@ pub(crate) const NET_CMD_UDP_SENDTO: u64 = 9;
 pub(crate) const NET_CMD_UDP_RECV: u64 = 10;
 pub(crate) const NET_CMD_TCP_STATUS: u64 = 11;
 pub(crate) const NET_CMD_MIRROR: u64 = 12;
+pub(crate) const NET_CMD_UDP_HAS_DATA: u64 = 13;

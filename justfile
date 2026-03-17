@@ -38,6 +38,7 @@ LIBGCC_S := "libgcc_s.so.1"
 LIBSTDCPP := "libstdc++.so.6"
 LIBZ := "libz.so.1"
 USER_FASTFETCH := "fastfetch"
+USER_APK := "apk"
 INITRD := "target/initrd.img"
 
 # Default: build and run
@@ -101,7 +102,7 @@ release:
 
 # Create CPIO initrd from userspace binaries
 initrd: build-user build-shell build-kbd build-net build-nvme build-xhci build-vmm build-hello build-hello-linux build-net-test build-testlib
-    python scripts/mkinitrd.py --output {{INITRD}} --file init={{USER_INIT}} --file shell={{USER_SHELL}} --file kbd={{USER_KBD}} --file net={{USER_NET}} --file nvme={{USER_NVME}} --file xhci={{USER_XHCI}} --file vmm={{USER_VMM}} --file hello={{USER_HELLO}} --file hello-linux={{USER_HELLO_LINUX}} --file hello-musl={{USER_HELLO_MUSL}} --file hello_dynamic={{USER_HELLO_DYNAMIC}} --file ld-musl-x86_64.so.1={{MUSL_LD}} --file nano={{USER_NANO}} --file libncursesw.so.6={{LIBNCURSESW}} --file xterm={{TERMINFO_XTERM}} --file libtest.so={{TESTLIB}} --file net-test={{USER_NET_TEST}} --file busybox={{USER_BUSYBOX}} --file links={{USER_LINKS}} --file hello_glibc={{USER_HELLO_GLIBC}} --file ld-linux-x86-64.so.2={{GLIBC_LD}} --file libc.so.6={{GLIBC_LIBC}} --file toybox={{USER_TOYBOX}} --file jq={{USER_JQ}} --file bash-static={{USER_BASH}} --file grep_alpine={{USER_GREP}} --file sed_alpine={{USER_SED}} --file hello_gnu={{USER_HELLO_GNU}} --file libgcc_s.so.1={{LIBGCC_S}} --file libstdc++.so.6={{LIBSTDCPP}} --file libz.so.1={{LIBZ}} --file fastfetch={{USER_FASTFETCH}}
+    python scripts/mkinitrd.py --output {{INITRD}} --file init={{USER_INIT}} --file shell={{USER_SHELL}} --file kbd={{USER_KBD}} --file net={{USER_NET}} --file nvme={{USER_NVME}} --file xhci={{USER_XHCI}} --file vmm={{USER_VMM}} --file hello={{USER_HELLO}} --file hello-linux={{USER_HELLO_LINUX}} --file hello-musl={{USER_HELLO_MUSL}} --file hello_dynamic={{USER_HELLO_DYNAMIC}} --file ld-musl-x86_64.so.1={{MUSL_LD}} --file nano={{USER_NANO}} --file libncursesw.so.6={{LIBNCURSESW}} --file xterm={{TERMINFO_XTERM}} --file libtest.so={{TESTLIB}} --file net-test={{USER_NET_TEST}} --file busybox={{USER_BUSYBOX}} --file links={{USER_LINKS}} --file hello_glibc={{USER_HELLO_GLIBC}} --file ld-linux-x86-64.so.2={{GLIBC_LD}} --file libc.so.6={{GLIBC_LIBC}} --file toybox={{USER_TOYBOX}} --file jq={{USER_JQ}} --file bash-static={{USER_BASH}} --file grep_alpine={{USER_GREP}} --file sed_alpine={{USER_SED}} --file hello_gnu={{USER_HELLO_GNU}} --file libgcc_s.so.1={{LIBGCC_S}} --file libstdc++.so.6={{LIBSTDCPP}} --file libz.so.1={{LIBZ}} --file fastfetch={{USER_FASTFETCH}} --file apk={{USER_APK}}
 
 # Create the bootable disk image (BIOS + Limine)
 image: build initrd
@@ -161,7 +162,7 @@ run-net: image create-test-disk
         -drive format=raw,file={{IMAGE}} \
         -drive if=none,format=raw,file=target/disk.img,id=disk0 \
         -device virtio-blk-pci,drive=disk0,disable-modern=on \
-        -netdev user,id=net0,hostfwd=udp::5555-:5555,hostfwd=tcp::7777-:7 \
+        -netdev user,id=net0,dns=8.8.8.8,hostfwd=udp::5555-:5555,hostfwd=tcp::7777-:7 \
         -device virtio-net-pci,netdev=net0,disable-modern=on \
         -serial stdio \
         -no-reboot \
@@ -173,7 +174,7 @@ run-net-pcap: image create-test-disk
         -drive format=raw,file={{IMAGE}} \
         -drive if=none,format=raw,file=target/disk.img,id=disk0 \
         -device virtio-blk-pci,drive=disk0,disable-modern=on \
-        -netdev user,id=net0,hostfwd=udp::5555-:5555,hostfwd=tcp::7777-:7 \
+        -netdev user,id=net0,dns=8.8.8.8,hostfwd=udp::5555-:5555,hostfwd=tcp::7777-:7 \
         -device virtio-net-pci,netdev=net0,disable-modern=on \
         -object filter-dump,id=dump0,netdev=net0,file=target/net.pcap \
         -serial stdio \
@@ -226,7 +227,7 @@ run-full: image create-test-disk create-nvme-disk
         -device virtio-blk-pci,drive=disk0,disable-modern=on \
         -drive file=target/nvme-disk.img,format=raw,if=none,id=nvme0 \
         -device nvme,serial=sotOS-NVMe,drive=nvme0 \
-        -netdev user,id=net0,hostfwd=udp::5555-:5555,hostfwd=tcp::7777-:7 \
+        -netdev user,id=net0,dns=8.8.8.8,hostfwd=udp::5555-:5555,hostfwd=tcp::7777-:7 \
         -device virtio-net-pci,netdev=net0,disable-modern=on \
         -device qemu-xhci,id=xhci \
         -device usb-kbd,bus=xhci.0 \
@@ -244,7 +245,7 @@ run-all: image create-test-disk
         -drive format=raw,file={{IMAGE}} \
         -drive if=none,format=raw,file=target/disk.img,id=disk0 \
         -device virtio-blk-pci,drive=disk0,disable-modern=on \
-        -netdev user,id=net0 \
+        -netdev user,id=net0,dns=8.8.8.8 \
         -device virtio-net-pci,netdev=net0,disable-modern=on \
         -serial stdio \
         -display none \
@@ -288,7 +289,7 @@ run-linux: image build-sysroot
         -drive format=raw,file={{IMAGE}} \
         -drive if=none,format=raw,file=target/sysroot.img,id=disk0 \
         -device virtio-blk-pci,drive=disk0,disable-modern=on \
-        -netdev user,id=net0 \
+        -netdev user,id=net0,dns=8.8.8.8 \
         -device virtio-net-pci,netdev=net0,disable-modern=on \
         -serial stdio \
         -no-reboot \
