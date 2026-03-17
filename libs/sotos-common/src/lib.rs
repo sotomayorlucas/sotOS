@@ -474,6 +474,27 @@ pub mod sys {
         ret
     }
 
+    /// Raw syscall with 5 arguments (nr, rdi, rsi, rdx, r8, r10).
+    #[inline(always)]
+    pub fn syscall5(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+        let ret: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") nr => ret,
+                in("rdi") a1,
+                in("rsi") a2,
+                in("rdx") a3,
+                in("r8") a4,
+                in("r10") a5,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
     /// Check a raw syscall return: negative → Err, otherwise Ok(value).
     #[inline(always)]
     fn check_val(ret: u64) -> Result<u64, i64> {
@@ -1030,7 +1051,13 @@ pub mod sys {
     /// `redirect_ep_cap` = 0 means no redirect; non-zero = endpoint cap for syscall redirect.
     #[inline(always)]
     pub fn thread_create_in(as_cap: u64, rip: u64, rsp: u64, redirect_ep_cap: u64) -> Result<u64, i64> {
-        check_val(syscall4(super::Syscall::ThreadCreateIn as u64, as_cap, rip, rsp, redirect_ep_cap))
+        thread_create_in_sig(as_cap, rip, rsp, redirect_ep_cap, 0)
+    }
+
+    /// Create a thread in a target AS with signal trampoline set atomically.
+    /// Prevents the race where the thread faults before signal_entry() is called.
+    pub fn thread_create_in_sig(as_cap: u64, rip: u64, rsp: u64, redirect_ep_cap: u64, signal_tramp: u64) -> Result<u64, i64> {
+        check_val(syscall5(super::Syscall::ThreadCreateIn as u64, as_cap, rip, rsp, redirect_ep_cap, signal_tramp))
     }
 
     /// Unmap a page from a target address space.

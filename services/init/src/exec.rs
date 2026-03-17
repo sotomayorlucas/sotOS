@@ -906,7 +906,9 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
         }
     };
     let new_thread = if target_as != 0 {
-        match sys::thread_create_in(target_as, child_entry, rsp, new_ep) {
+        // Atomic: set redirect_ep + signal_trampoline BEFORE thread is enqueued.
+        // Prevents race where thread faults before signal_entry() is called.
+        match sys::thread_create_in_sig(target_as, child_entry, rsp, new_ep, vdso::SIGNAL_TRAMPOLINE_ADDR) {
             Ok(t) => t,
             Err(_) => {
                 unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
@@ -922,7 +924,10 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
             }
         }
     };
-    let _ = sys::signal_entry(new_thread, vdso::SIGNAL_TRAMPOLINE_ADDR);
+    // For same-AS, still need post-hoc signal_entry (no race since handler is ready)
+    if target_as == 0 {
+        let _ = sys::signal_entry(new_thread, vdso::SIGNAL_TRAMPOLINE_ADDR);
+    }
 
     // NOTE: vDSO page is already mapped by the pre-TLS trampoline code above
     // (it creates a custom copy with the trampoline embedded). Do NOT re-map

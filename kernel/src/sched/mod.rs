@@ -523,17 +523,26 @@ pub fn spawn(entry: fn() -> !) -> ThreadId {
 
 /// Spawn a new user thread that enters Ring 3 at `user_rip`.
 pub fn spawn_user(user_rip: u64, user_rsp: u64, cr3: u64) -> ThreadId {
-    spawn_user_opt(user_rip, user_rsp, cr3, None)
+    spawn_user_opt(user_rip, user_rsp, cr3, None, 0)
 }
 
 /// Spawn a new user thread with an optional pre-set redirect endpoint.
 /// The redirect is set atomically before the thread is enqueued, avoiding
 /// race conditions where the thread runs before redirect_set is called.
 pub fn spawn_user_with_redirect(user_rip: u64, user_rsp: u64, cr3: u64, ep_id: u32) -> ThreadId {
-    spawn_user_opt(user_rip, user_rsp, cr3, Some(ep_id))
+    spawn_user_opt(user_rip, user_rsp, cr3, Some(ep_id), 0)
 }
 
-fn spawn_user_opt(user_rip: u64, user_rsp: u64, cr3: u64, redirect_ep: Option<u32>) -> ThreadId {
+/// Spawn a new user thread with redirect endpoint AND signal trampoline
+/// set atomically before enqueue. Prevents the race where the thread
+/// faults before signal_entry() is called.
+pub fn spawn_user_with_redirect_and_signal(
+    user_rip: u64, user_rsp: u64, cr3: u64, ep_id: u32, signal_tramp: u64,
+) -> ThreadId {
+    spawn_user_opt(user_rip, user_rsp, cr3, Some(ep_id), signal_tramp)
+}
+
+fn spawn_user_opt(user_rip: u64, user_rsp: u64, cr3: u64, redirect_ep: Option<u32>, signal_tramp: u64) -> ThreadId {
     let mut sched = SCHEDULER.lock();
     let id = sched.next_id;
     sched.next_id += 1;
@@ -541,6 +550,9 @@ fn spawn_user_opt(user_rip: u64, user_rsp: u64, cr3: u64, redirect_ep: Option<u3
     let mut t = Thread::new_user(id, user_rip, user_rsp, cr3, user_thread_trampoline);
     t.timeslice = TIMESLICE;
     t.redirect_ep = redirect_ep;
+    if signal_tramp != 0 {
+        t.signal_trampoline = signal_tramp;
+    }
     let tid = t.id;
 
     let handle = sched.threads.alloc(t);

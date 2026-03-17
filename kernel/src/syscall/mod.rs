@@ -1308,12 +1308,14 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
 
         // SYS_THREAD_CREATE_IN — create a thread in a target address space
         // rdi = as_cap (WRITE), rsi = rip, rdx = rsp, r8 = redirect_ep_cap (0 = none)
+        // r10 = signal_trampoline (0 = none) — set atomically before enqueue
         SYS_THREAD_CREATE_IN => {
             match cap::validate(frame.rdi as u32, Rights::WRITE) {
                 Ok(CapObject::AddrSpace { cr3 }) => {
                     let rip = frame.rsi;
                     let rsp = frame.rdx;
                     let redirect_cap = frame.r8;
+                    let signal_tramp = frame.r10;
                     if rip == 0 || rsp == 0 || rip >= USER_ADDR_LIMIT || rsp >= USER_ADDR_LIMIT {
                         frame.rax = SysError::InvalidArg as i64 as u64;
                     } else {
@@ -1330,7 +1332,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
                             None
                         };
                         let tid = if let Some(ep_id) = redirect_ep {
-                            sched::spawn_user_with_redirect(rip, rsp, cr3, ep_id)
+                            sched::spawn_user_with_redirect_and_signal(rip, rsp, cr3, ep_id, signal_tramp)
                         } else {
                             sched::spawn_user(rip, rsp, cr3)
                         };
