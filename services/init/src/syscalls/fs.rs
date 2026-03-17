@@ -2189,6 +2189,7 @@ pub(crate) fn sys_access(ctx: &mut SyscallContext, msg: &IpcMsg, syscall_nr: u64
         || name == b"/lib" || name == b"/lib64"
         || name == b"/bin" || name == b"/sbin"
         || name == b"/tmp" || name == b"/home" || name == b"/var"
+        || name == b"/proc" || name == b"/sys" || name == b"/dev"
         || name == b"/usr/bin" || name == b"/usr/lib"
         || name == b"/usr/sbin" || name == b"/usr/lib64"
         || name == b"/usr/share" || name == b"/usr/share/terminfo";

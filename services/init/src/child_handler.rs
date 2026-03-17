@@ -593,7 +593,6 @@ pub(crate) extern "C" fn child_handler() -> ! {
 
         let syscall_nr = msg.tag;
 
-
         // === PWC watchpoint: detect spurious pipe close (should not fire after deadlock fix) ===
         if pid >= 3 && pid <= 5 {
             use core::sync::atomic::Ordering as Ord;
