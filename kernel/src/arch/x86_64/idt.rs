@@ -220,10 +220,36 @@ extern "x86-interrupt" fn general_protection_handler(frame: InterruptStackFrame,
                     frame.instruction_pointer.as_u64(), frame.stack_pointer.as_u64(), n);
             }
         }
-        // Set SIGSEGV pending and exit the thread. Wine will see
-        // WIFSIGNALED(SIGSEGV) on waitpid() and handle it.
-        // We can't return to the faulting instruction (infinite #GP loop)
-        // and we can't use the VMM fault queue (#GP is not a page fault).
+        // Deliver SIGSEGV via signal trampoline. Wine's exception handler
+        // catches SIGSEGV and processes it (e.g., for RWX page faults,
+        // misaligned SSE, or intentional probing).
+        let percpu = super::percpu::current_percpu();
+        let idx = percpu.current_thread;
+        if idx != usize::MAX {
+            let tramp = crate::sched::get_signal_trampoline_by_idx(idx as u32);
+            if tramp != 0 {
+                // Set pending SIGSEGV + redirect to trampoline.
+                // Save minimal context (RIP/RSP from interrupt frame).
+                let saved_gprs = [0u64; 15]; // zeroed — not ideal but safe
+                let rip = frame.instruction_pointer.as_u64();
+                let rsp = frame.stack_pointer.as_u64();
+                let rflags = frame.cpu_flags.bits();
+                if let Some(tid) = crate::sched::current_tid() {
+                    crate::sched::clear_signal_ctx(tid);
+                }
+                crate::sched::save_signal_context_current(&saved_gprs, rip, rsp, rflags);
+                crate::sched::set_kernel_signal_current(11); // SIGSEGV
+                crate::sched::set_fault_info_current(rip, code);
+                if let Some(tid) = crate::sched::current_tid() {
+                    crate::sched::set_pending_signal(tid, 11);
+                }
+                // Fault the thread — scheduler will pick it up and the timer
+                // handler will deliver SIGSEGV via the trampoline.
+                crate::sched::fault_current();
+                return;
+            }
+        }
+        // No trampoline — kill thread (old behavior)
         if let Some(tid) = crate::sched::current_tid() {
             crate::sched::set_pending_signal(tid, 11);
         }

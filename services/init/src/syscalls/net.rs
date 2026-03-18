@@ -580,28 +580,41 @@ pub(crate) fn sys_sendmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
             }
             reply_val(ep_cap, 0); return;
         }
-        // Read first iovec
-        let mut iov_buf = [0u8; 16];
-        ctx.guest_read(msg_iov, &mut iov_buf);
-        let iov_base = u64::from_le_bytes([iov_buf[0], iov_buf[1], iov_buf[2], iov_buf[3], iov_buf[4], iov_buf[5], iov_buf[6], iov_buf[7]]);
-        let iov_len = u64::from_le_bytes([iov_buf[8], iov_buf[9], iov_buf[10], iov_buf[11], iov_buf[12], iov_buf[13], iov_buf[14], iov_buf[15]]) as usize;
+        // Read ALL iovecs (Wine's wineserver protocol uses multi-iovec sendmsg)
+        let iovcnt = msg_iovlen.min(16);
+        let mut iov_raw = [0u8; 16 * 16]; // max 16 iovecs
+        let iov_bytes = iovcnt * 16;
+        if msg_iov != 0 && iov_bytes > 0 {
+            ctx.guest_read(msg_iov, &mut iov_raw[..iov_bytes]);
+        }
         if conn < crate::fd::MAX_UNIX_CONNS {
             let pipe_id = if ctx.child_fds[fd] == 27 {
                 unsafe { crate::fd::UNIX_CONN_PIPE_A[conn] as usize }
             } else {
                 unsafe { crate::fd::UNIX_CONN_PIPE_B[conn] as usize }
             };
-            let safe_len = iov_len.min(4096);
-            let mut local_buf = [0u8; 4096];
-            ctx.guest_read(iov_base, &mut local_buf[..safe_len]);
             let mut written = 0usize;
-            while written < safe_len {
-                let n = pipe_write(pipe_id, &local_buf[written..safe_len]);
-                if n > 0 { written += n; }
-                else {
-                    sys::yield_now(); // reader may be slow, keep trying
-                    sys::yield_now();
+            for vi in 0..iovcnt {
+                let off = vi * 16;
+                let iov_base = u64::from_le_bytes(iov_raw[off..off+8].try_into().unwrap());
+                let iov_len = u64::from_le_bytes(iov_raw[off+8..off+16].try_into().unwrap()) as usize;
+                if iov_base == 0 || iov_len == 0 { continue; }
+                // Write full iovec in 4096-byte chunks (blocking)
+                let mut iov_off = 0usize;
+                while iov_off < iov_len {
+                    let chunk = (iov_len - iov_off).min(4096);
+                    let mut local_buf = [0u8; 4096];
+                    ctx.guest_read(iov_base + iov_off as u64, &mut local_buf[..chunk]);
+                    let mut coff = 0usize;
+                    while coff < chunk {
+                        let n = pipe_write(pipe_id, &local_buf[coff..chunk]);
+                        if n > 0 { coff += n; }
+                        else { sys::yield_now(); sys::yield_now(); }
+                    }
+                    iov_off += coff;
+                    if coff < chunk { break; }
                 }
+                written += iov_off;
             }
             // Record message boundary so recvmsg reads exactly one sendmsg worth
             let direction = if ctx.child_fds[fd] == 27 { 0usize } else { 1 };

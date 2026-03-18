@@ -362,8 +362,8 @@ pub(crate) fn sys_read(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 static mut PIPE_EOF_COUNT: [u32; 64] = [0; 64];
                 let eof_count = unsafe { &mut PIPE_EOF_COUNT[fd.min(63)] };
                 *eof_count += 1;
-                if *eof_count > 500 {
-                    *eof_count = 0;
+                if *eof_count > 100 {
+                    // Keep returning -EIO permanently (don't reset counter)
                     reply_val(ctx.ep_cap, -5); // -EIO
                 } else {
                     reply_val(ctx.ep_cap, 0); // EOF
@@ -2059,31 +2059,18 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 print(b"\n");
             }
         }
+        // Pre-read ALL iovec entries in one bulk guest_read to avoid
+        // per-entry vm_read races with CoW page faults.
+        let mut iov_raw = [0u8; 16 * 16]; // max 16 iovecs * 16 bytes each
+        let iov_bytes = cnt * 16;
+        if iov_ptr + iov_bytes as u64 <= 0x0000_8000_0000_0000 {
+            ctx.guest_read(iov_ptr, &mut iov_raw[..iov_bytes]);
+        }
         for i in 0..cnt {
-            let entry = iov_ptr + (i as u64) * 16;
-            if entry + 16 > 0x0000_8000_0000_0000 { break; }
-            let base = ctx.guest_read_u64(entry);
-            let ilen = ctx.guest_read_u64(entry + 8) as usize;
-            if ilen == 0 { continue; }
-            // If base reads as 0 but len > 0, retry with yields (vm_read may
-            // race with CoW faults being processed by the VMM). Wine's IPC
-            // writev uses large multi-iovec messages that need all pages present.
-            let base = if base == 0 && ilen > 0 {
-                let mut retry_val = 0u64;
-                for _attempt in 0..10 {
-                    sys::yield_now();
-                    retry_val = ctx.guest_read_u64(entry);
-                    if retry_val != 0 { break; }
-                }
-                if retry_val == 0 {
-                    continue;
-                }
-                retry_val
-            } else if base == 0 {
-                continue;
-            } else {
-                base
-            };
+            let off = i * 16;
+            let base = u64::from_le_bytes(iov_raw[off..off+8].try_into().unwrap());
+            let ilen = u64::from_le_bytes(iov_raw[off+8..off+16].try_into().unwrap()) as usize;
+            if ilen == 0 || base == 0 { continue; }
             // Write full iovec in 4096-byte chunks (blocking).
             // Previous code truncated to 4096 — Wine requests can be larger.
             let mut iov_written = 0usize;
@@ -2141,11 +2128,16 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
             };
             let cnt = iovcnt.min(16);
             let mut total = 0usize;
+            // Bulk-read iovec array to avoid per-entry vm_read races
+            let mut iov_unix = [0u8; 16 * 16];
+            let iov_sz = cnt * 16;
+            if iov_ptr + iov_sz as u64 <= 0x0000_8000_0000_0000 {
+                ctx.guest_read(iov_ptr, &mut iov_unix[..iov_sz]);
+            }
             for i in 0..cnt {
-                let entry = iov_ptr + (i as u64) * 16;
-                if entry + 16 > 0x0000_8000_0000_0000 { break; }
-                let base = ctx.guest_read_u64(entry);
-                let ilen = ctx.guest_read_u64(entry + 8) as usize;
+                let off = i * 16;
+                let base = u64::from_le_bytes(iov_unix[off..off+8].try_into().unwrap());
+                let ilen = u64::from_le_bytes(iov_unix[off+8..off+16].try_into().unwrap()) as usize;
                 if base == 0 || ilen == 0 { continue; }
                 // Write full iovec (blocking)
                 let mut iov_written = 0usize;
@@ -2167,6 +2159,20 @@ pub(crate) fn sys_writev(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 }
                 total += iov_written;
                 if iov_written < ilen { break; }
+            }
+            // Diagnostic: detect partial writes on Unix socket (Wine IPC)
+            let mut expected = 0usize;
+            for i in 0..cnt {
+                let off = i * 16;
+                let il = u64::from_le_bytes(iov_unix[off+8..off+16].try_into().unwrap()) as usize;
+                expected += il;
+            }
+            if total != expected && expected > 0 && ctx.pid >= 2 {
+                print(b"UXW-PARTIAL P"); print_u64(ctx.pid as u64);
+                print(b" wrote="); print_u64(total as u64);
+                print(b"/"); print_u64(expected as u64);
+                print(b" cnt="); print_u64(cnt as u64);
+                print(b"\n");
             }
             reply_val(ctx.ep_cap, total as i64);
         } else {
