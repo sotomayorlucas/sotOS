@@ -74,7 +74,7 @@ pub(crate) static LAST_EXEC_ELF_HI: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LAST_EXEC_HAS_INTERP: AtomicU64 = AtomicU64::new(0);
 // Address constants centralized in sotos_common
 pub(crate) use sotos_common::{EXEC_BUF_BASE, INTERP_BUF_BASE, INTERP_LOAD_BASE};
-pub(crate) const EXEC_BUF_PAGES: u64 = 12288; // 48 MiB (mesa is 38 MB)
+pub(crate) const EXEC_BUF_PAGES: u64 = 16384; // 64 MiB (weston + pixman)
 pub(crate) const EXEC_TEMP_MAP: u64 = 0x8400000; // past EXEC_BUF_BASE + 12288*4K
 pub(crate) const INTERP_BUF_PAGES: u64 = 220; // ~900 KiB, enough for ld-musl (~845 KiB)
 /// Each ET_EXEC exec allocates a unique 2MB slot from NEXT_INTERP_BASE so
@@ -691,17 +691,17 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
     let phdr_vaddr = elf_base + elf_info.phoff as u64;
 
     // Environment: user envp first (overrides defaults), then defaults for non-overridden keys
-    let defaults: [&[u8]; 8] = [
+    let defaults: [&[u8]; 9] = [
         b"TERM=xterm\0", b"HOME=/root\0",
         b"TERMINFO=/usr/share/terminfo\0", b"PATH=/usr/bin:/bin:/usr/sbin:/sbin\0",
         b"XDG_RUNTIME_DIR=/tmp\0",
         b"XKB_CONFIG_ROOT=/usr/share/X11/xkb\0",
         b"XKB_DEFAULT_RULES=evdev\0",
         b"LIBSEAT_BACKEND=builtin\0",
+        b"WESTON_RENDERER=pixman\0",
     ];
-    let default_keys: [&[u8]; 8] = [b"TERM", b"HOME", b"TERMINFO", b"PATH", b"XDG_RUNTIME_DIR", b"XKB_CONFIG_ROOT", b"XKB_DEFAULT_RULES", b"LIBSEAT_BACKEND"];
-    let mut env_addrs = [0u64; MAX_EXEC_ENVS + 8];
-    let mut env_addrs = [0u64; MAX_EXEC_ENVS + 6];
+    let default_keys: [&[u8]; 9] = [b"TERM", b"HOME", b"TERMINFO", b"PATH", b"XDG_RUNTIME_DIR", b"XKB_CONFIG_ROOT", b"XKB_DEFAULT_RULES", b"LIBSEAT_BACKEND", b"WESTON_RENDERER"];
+    let mut env_addrs = [0u64; MAX_EXEC_ENVS + 9];
     let mut env_count: usize = 0;
 
     // User env vars first (they take priority — libc uses first occurrence)
@@ -720,7 +720,7 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
     }
 
     // Defaults only if key not already provided by user
-    for d in 0..5 {
+    for d in 0..9 {
         let mut overridden = false;
         for e in 0..envp.len() {
             if env_key_eq(&envp[e], default_keys[d]) { overridden = true; break; }

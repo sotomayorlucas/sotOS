@@ -63,6 +63,7 @@ fn poll_fd_readable(ctx: &SyscallContext, fd: usize) -> bool {
         }
         17 => true, // UDP: report readable — recvfrom does the real waiting via CMD_UDP_RECV
         2 | 8 | 12 | 13 | 14 | 15 | 16 | 22 | 23 | 25 => true, // always "ready"
+        30 => crate::drm::drm_poll_readable(),
         _ => true, // default: report readable
     }
 }
@@ -1590,8 +1591,8 @@ pub(crate) fn sys_epoll_wait(ctx: &mut SyscallContext, msg: &IpcMsg) {
                         let device = if kind == 31 { 0u8 } else { 1u8 };
                         if crate::evdev::evdev_poll(device) & 1 != 0 { revents |= 1; }
                     } else if kind == 30 {
-                        // DRM: always readable (for page flip events)
-                        revents |= 1;
+                        // DRM: readable only when page-flip event pending
+                        if crate::drm::drm_poll_readable() { revents |= 1; }
                     } else if kind == 33 {
                         // seatd: always readable (inline responses)
                         revents |= 1;
