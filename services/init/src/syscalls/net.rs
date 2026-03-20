@@ -1030,6 +1030,10 @@ pub(crate) fn sys_recvmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 print(b"seatd: SCM_RIGHTS fd=");
                 crate::framebuffer::print_u64(drm_fd as u64);
                 print(b"\n");
+            } else {
+                print(b"seatd: SCM_RIGHTS fd=");
+                crate::framebuffer::print_u64(drm_fd as u64);
+                print(b" no msg_control\n");
             }
         } else {
             // No SCM pending: clear msg_controllen and msg_flags

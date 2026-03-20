@@ -55,6 +55,8 @@ const EVIOCGVERSION_NR: u64 = 0x01;
 const EVIOCGID_NR: u64 = 0x02;
 const EVIOCGREP_NR: u64 = 0x03;
 const EVIOCGNAME_NR: u64 = 0x06;
+const EVIOCGPHYS_NR: u64 = 0x07;
+const EVIOCGUNIQ_NR: u64 = 0x08;
 const EVIOCGPROP_NR: u64 = 0x09;
 const EVIOCGKEY_NR: u64 = 0x18;
 const EVIOCGLED_NR: u64 = 0x19;
@@ -528,6 +530,26 @@ pub(crate) fn evdev_ioctl(ctx: &mut SyscallContext, _fd: usize, cmd: u64, arg: u
         }
 
         // ---------------------------------------------------------------
+        // EVIOCGPHYS — physical path (empty string)
+        // ---------------------------------------------------------------
+        EVIOCGPHYS_NR => {
+            let phys = b"\0";
+            let len = phys.len().min(size);
+            ctx.guest_write(arg, &phys[..len]);
+            0
+        }
+
+        // ---------------------------------------------------------------
+        // EVIOCGUNIQ — unique identifier (empty string)
+        // ---------------------------------------------------------------
+        EVIOCGUNIQ_NR => {
+            let uniq = b"\0";
+            let len = uniq.len().min(size);
+            ctx.guest_write(arg, &uniq[..len]);
+            0
+        }
+
+        // ---------------------------------------------------------------
         // EVIOCGPROP — device properties (empty)
         // ---------------------------------------------------------------
         EVIOCGPROP_NR => {
@@ -552,6 +574,16 @@ pub(crate) fn evdev_ioctl(ctx: &mut SyscallContext, _fd: usize, cmd: u64, arg: u
         // EVIOCGLED — LED state (empty)
         // ---------------------------------------------------------------
         EVIOCGLED_NR => {
+            let zeros = [0u8; 8];
+            let len = size.min(8);
+            ctx.guest_write(arg, &zeros[..len]);
+            0
+        }
+
+        // ---------------------------------------------------------------
+        // EVIOCGSW — switch state (empty)
+        // ---------------------------------------------------------------
+        0x1b => {
             let zeros = [0u8; 8];
             let len = size.min(8);
             ctx.guest_write(arg, &zeros[..len]);

@@ -209,7 +209,7 @@ pub(crate) fn open_virtual_file(name: &[u8], dir_buf: &mut [u8]) -> Option<usize
             dir_buf[..c.len()].copy_from_slice(c);
             gen_len = c.len();
         } else if let Some(content) = crate::udev::sys_class_drm_content(name) {
-            // DRM device sysfs entries (for libudev device enumeration)
+            // DRM/input device sysfs entries (for libudev device enumeration)
             let n = content.len().min(dir_buf.len());
             dir_buf[..n].copy_from_slice(&content[..n]);
             gen_len = n;

@@ -377,6 +377,19 @@ pub(crate) fn sys_fstat(ctx: &mut SyscallContext, msg: &IpcMsg) {
         // DRM device: report as S_IFCHR with major 226
         crate::drm::drm_fstat(ctx, stat_ptr);
         reply_val(ctx.ep_cap, 0);
+    } else if ctx.child_fds[fd] == 31 || ctx.child_fds[fd] == 32 {
+        // evdev input device: S_IFCHR, major=13 (INPUT_MAJOR), minor=64/65
+        let minor: u64 = if ctx.child_fds[fd] == 31 { 64 } else { 65 };
+        let mut st = [0u8; 144];
+        st[8..16].copy_from_slice(&(minor + 1).to_le_bytes()); // st_ino
+        st[16..20].copy_from_slice(&1u32.to_le_bytes()); // st_nlink
+        let mode: u32 = 0o020000 | 0o660; // S_IFCHR | 0660
+        st[24..28].copy_from_slice(&mode.to_le_bytes()); // st_mode
+        let rdev: u64 = (13u64 << 8) | minor; // makedev(13, minor)
+        st[40..48].copy_from_slice(&rdev.to_le_bytes()); // st_rdev
+        st[56..60].copy_from_slice(&4096i32.to_le_bytes()); // st_blksize
+        ctx.guest_write(stat_ptr, &st);
+        reply_val(ctx.ep_cap, 0);
     } else {
         let buf = build_linux_stat(fd as u64, 0, false);
         ctx.guest_write(stat_ptr, &buf);
@@ -645,24 +658,10 @@ pub(crate) fn sys_open(ctx: &mut SyscallContext, msg: &IpcMsg) {
         } else {
             reply_val(ctx.ep_cap, -EMFILE);
         }
-    } else if let Some((xkb_iname, xkb_nlen)) = crate::xkb::xkb_initrd_name(name) {
-        // XKB files from initrd (kind=15, serves via dir_buf, first 4KB)
-        let read_sz = if let Ok(sz) = sotos_common::sys::initrd_read(
-            xkb_iname.as_ptr() as u64, xkb_nlen as u64,
-            ctx.dir_buf.as_mut_ptr() as u64, ctx.dir_buf.len() as u64,
-        ) { (sz as usize).min(ctx.dir_buf.len()) } else { 0 };
-        if read_sz > 0 {
-            *ctx.dir_len = read_sz;
-            *ctx.dir_pos = 0;
-            let mut fd = None;
-            for i in 3..GRP_MAX_FDS { if ctx.child_fds[i] == 0 { fd = Some(i); break; } }
-            if let Some(f) = fd {
-                ctx.child_fds[f] = 15;
-                reply_val(ctx.ep_cap, f as i64);
-            } else { reply_val(ctx.ep_cap, -EMFILE); }
-        } else {
-            reply_val(ctx.ep_cap, -ENOENT);
-        }
+    } else if false && crate::xkb::xkb_initrd_name(name).is_some() {
+        // XKB files: DISABLED — served via VFS (kind=13) instead of dir_buf (kind=15)
+        // VFS supports arbitrary file sizes and per-fd tracking
+        unreachable!();
     } else if name == b"/sys/class" || name == b"/sys/class/" {
         let mut fd = None;
         for i in 3..GRP_MAX_FDS { if ctx.child_fds[i] == 0 { fd = Some(i); break; } }
@@ -695,7 +694,7 @@ pub(crate) fn sys_open(ctx: &mut SyscallContext, msg: &IpcMsg) {
         return;
     } else if starts_with(name, b"/etc/") || starts_with(name, b"/proc/")
            || starts_with(name, b"/sys/")
-           || starts_with(name, b"/usr/share/terminfo/")
+           || starts_with(name, b"/usr/share/")
            || starts_with(name, b"/run/udev/") {
         let virt_len = open_virtual_file(name, ctx.dir_buf);
         if let Some(gen_len) = virt_len {
@@ -1024,24 +1023,10 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
         } else {
             reply_val(ctx.ep_cap, -EMFILE);
         }
-    } else if let Some((xkb_iname, xkb_nlen)) = crate::xkb::xkb_initrd_name(name) {
-        // XKB files from initrd (kind=15, serves via dir_buf, first 4KB)
-        let read_sz = if let Ok(sz) = sotos_common::sys::initrd_read(
-            xkb_iname.as_ptr() as u64, xkb_nlen as u64,
-            ctx.dir_buf.as_mut_ptr() as u64, ctx.dir_buf.len() as u64,
-        ) { (sz as usize).min(ctx.dir_buf.len()) } else { 0 };
-        if read_sz > 0 {
-            *ctx.dir_len = read_sz;
-            *ctx.dir_pos = 0;
-            let mut fd = None;
-            for i in 3..GRP_MAX_FDS { if ctx.child_fds[i] == 0 { fd = Some(i); break; } }
-            if let Some(f) = fd {
-                ctx.child_fds[f] = 15;
-                reply_val(ctx.ep_cap, f as i64);
-            } else { reply_val(ctx.ep_cap, -EMFILE); }
-        } else {
-            reply_val(ctx.ep_cap, -ENOENT);
-        }
+    } else if false && crate::xkb::xkb_initrd_name(name).is_some() {
+        // XKB files: DISABLED — served via VFS (kind=13) instead of dir_buf (kind=15)
+        // VFS supports arbitrary file sizes and per-fd tracking
+        unreachable!();
     } else if name == b"/sys/class" || name == b"/sys/class/" {
         let mut fd = None;
         for i in 3..GRP_MAX_FDS { if ctx.child_fds[i] == 0 { fd = Some(i); break; } }
@@ -1074,7 +1059,7 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
         return;
     } else if starts_with(name, b"/etc/") || starts_with(name, b"/proc/")
            || starts_with(name, b"/sys/")
-           || starts_with(name, b"/usr/share/terminfo/")
+           || starts_with(name, b"/usr/share/")
            || starts_with(name, b"/run/udev/") {
         let virt_len = open_virtual_file(name, ctx.dir_buf);
         if let Some(gen_len) = virt_len {
