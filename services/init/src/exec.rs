@@ -697,7 +697,7 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
         b"XDG_RUNTIME_DIR=/tmp\0",
         b"XKB_CONFIG_ROOT=/usr/share/X11/xkb\0",
         b"XKB_DEFAULT_RULES=evdev\0",
-        b"LIBSEAT_BACKEND=builtin\0",
+        b"LIBSEAT_BACKEND=seatd\0",
         b"WESTON_RENDERER=pixman\0",
     ];
     let default_keys: [&[u8]; 9] = [b"TERM", b"HOME", b"TERMINFO", b"PATH", b"XDG_RUNTIME_DIR", b"XKB_CONFIG_ROOT", b"XKB_DEFAULT_RULES", b"LIBSEAT_BACKEND", b"WESTON_RENDERER"];

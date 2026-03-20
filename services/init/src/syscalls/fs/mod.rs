@@ -104,6 +104,7 @@ pub(crate) fn sys_read(ctx: &mut SyscallContext, msg: &IpcMsg) {
             let ret = crate::seatd::seatd_read(ctx, fd, buf_ptr, len as u64);
             reply_val(ctx.ep_cap, ret);
         }
+        34 => reply_val(ctx.ep_cap, -11), // netlink dummy: -EAGAIN
         _  => reply_val(ctx.ep_cap, -EBADF),
     }
 }
