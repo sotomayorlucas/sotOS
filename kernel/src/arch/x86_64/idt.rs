@@ -630,6 +630,22 @@ extern "C" fn page_fault_user_handler(gprs: *mut u64, iframe: *mut u64) {
         let percpu = super::percpu::current_percpu();
         let idx = percpu.current_thread;
         if idx != usize::MAX {
+            // Detect repeated fault at same RIP (signal handler didn't fix it).
+            // Like Linux's force_sigsegv: if the handler returns without fixing
+            // the fault, the same instruction faults again → force-kill.
+            let last_rip = crate::sched::get_last_fault_rip_by_idx(idx as u32);
+            if last_rip == rip && rip != 0 {
+                kprintln!("#PF-REPEATED tid={} rip={:#x} cr2={:#x} → force kill",
+                    tid, rip, addr);
+                crate::sched::set_last_fault_rip_by_idx(idx as u32, 0);
+                if let Some(tid) = crate::sched::current_tid() {
+                    crate::sched::set_pending_signal(tid, 11);
+                }
+                crate::sched::exit_current();
+                return;
+            }
+            crate::sched::set_last_fault_rip_by_idx(idx as u32, rip);
+
             let tramp = crate::sched::get_signal_trampoline_by_idx(idx as u32);
             if tramp != 0 {
                 // Save real GPRs (not fake zeros!)
@@ -648,14 +664,8 @@ extern "C" fn page_fault_user_handler(gprs: *mut u64, iframe: *mut u64) {
                 // Store kernel-generated signal number and fault info.
                 crate::sched::set_kernel_signal_current(11); // SIGSEGV
                 crate::sched::set_fault_info_current(addr, code_bits);
-                // Debug: show ALL saved GPRs for signal context
-                // gprs layout: [rax(0),rbx(1),rcx(2),rdx(3),rsi(4),rdi(5),rbp(6),r8(7)..r15(14)]
                 kprintln!("#PF-SIG tid={} rip={:#x} rsp={:#x} cr2={:#x} code={:#x}",
                     tid, rip, rsp, addr, code_bits);
-                kprintln!("  gprs: rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x}",
-                    real_gprs[0], real_gprs[1], real_gprs[2], real_gprs[3], real_gprs[4], real_gprs[5], real_gprs[6]);
-                kprintln!("  gprs: r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
-                    real_gprs[7], real_gprs[8], real_gprs[9], real_gprs[10], real_gprs[11], real_gprs[12], real_gprs[13], real_gprs[14]);
                 // Do NOT set pending_signals — we redirect directly below.
                 // Redirect: overwrite RIP in interrupt frame → iret goes to trampoline.
                 unsafe { *iframe.add(1) = tramp; }

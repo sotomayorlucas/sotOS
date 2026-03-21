@@ -477,6 +477,12 @@ pub(crate) static UNIX_CONN_ACTIVE: [AtomicU64; MAX_UNIX_CONNS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
     [INIT; MAX_UNIX_CONNS]
 };
+/// Reference count for each AF_UNIX connection. Incremented on fork inheritance,
+/// decremented on close. Only free connection when refs reach 0.
+pub(crate) static UNIX_CONN_REFS: [AtomicU64; MAX_UNIX_CONNS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_UNIX_CONNS]
+};
 
 /// Pending connection queue: connect() pushes, accept() pops.
 /// Each entry is a connection slot index (0xFF = empty).
@@ -498,6 +504,7 @@ pub(crate) fn unix_conn_alloc() -> Option<(usize, usize, usize)> {
                 UNIX_CONN_PIPE_A[i] = pipe_a as u16;
                 UNIX_CONN_PIPE_B[i] = pipe_b as u16;
             }
+            UNIX_CONN_REFS[i].store(1, Ordering::Release); // connect() side; accept() adds 1
             return Some((i, pipe_a, pipe_b));
         }
     }

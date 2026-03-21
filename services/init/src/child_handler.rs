@@ -1043,6 +1043,9 @@ pub(crate) extern "C" fn child_handler() -> ! {
                         let p = unsafe { THREAD_GROUPS[cidx].sock_conn_id[cfd] } as usize;
                         if k == 11 && p < MAX_PIPES { PIPE_WRITE_REFS[p].fetch_add(1, Ordering::AcqRel); }
                         else if k == 10 && p < MAX_PIPES { PIPE_READ_REFS[p].fetch_add(1, Ordering::AcqRel); }
+                        if (k == 27 || k == 28) && p < crate::fd::MAX_UNIX_CONNS {
+                            crate::fd::UNIX_CONN_REFS[p].fetch_add(1, Ordering::AcqRel);
+                        }
                     }
 
                     unsafe {

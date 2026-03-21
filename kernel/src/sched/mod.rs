@@ -498,6 +498,7 @@ pub fn init() {
         pending_signals: 0,
         kernel_signal: 0,
         fpu_state: thread::FpuState::zeroed(),
+        last_fault_rip: 0,
         fault_addr: 0,
         fault_code: 0,
         signal_saved_rip: 0,
@@ -556,6 +557,7 @@ pub fn create_idle_thread() -> usize {
         pending_signals: 0,
         kernel_signal: 0,
         fpu_state: thread::FpuState::zeroed(),
+        last_fault_rip: 0,
         fault_addr: 0,
         fault_code: 0,
         signal_saved_rip: 0,
@@ -1187,6 +1189,24 @@ pub fn get_signal_trampoline_by_idx(idx: u32) -> u64 {
         t.signal_trampoline
     } else {
         0
+    }
+}
+
+/// Get the last fault RIP for a thread (by index, no lock needed for read).
+pub fn get_last_fault_rip_by_idx(idx: u32) -> u64 {
+    let sched = SCHEDULER.lock();
+    if let Some(t) = sched.threads.get_by_index(idx) {
+        t.last_fault_rip
+    } else {
+        0
+    }
+}
+
+/// Set the last fault RIP for a thread (by index).
+pub fn set_last_fault_rip_by_idx(idx: u32, rip: u64) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(t) = sched.threads.get_mut_by_index(idx) {
+        t.last_fault_rip = rip;
     }
 }
 

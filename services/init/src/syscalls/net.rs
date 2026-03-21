@@ -1791,6 +1791,8 @@ pub(crate) fn sys_accept(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     // Server side: kind=28, reads from pipe_a, writes to pipe_b
                     ctx.child_fds[nf] = 28;
                     ctx.sock_conn_id[nf] = conn_slot as u32;
+                    // Increment connection ref (connect() set refs=1, accept adds another)
+                    crate::fd::UNIX_CONN_REFS[conn_slot].fetch_add(1, core::sync::atomic::Ordering::AcqRel);
                     // Write sockaddr_un if requested
                     if addr_ptr != 0 {
                         let mut sa = [0u8; 2];
