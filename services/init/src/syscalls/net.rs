@@ -1058,6 +1058,7 @@ pub(crate) fn sys_recvmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 if scm_count > 0 && msg_control != 0 && msg_controllen >= 16 + scm_count * 4 {
                     // Allocate new fds in receiver's fd table and build cmsg
                     let mut new_fds = [0i32; crate::fd::MAX_SCM_FDS];
+                    let mut alloc_failed = false;
                     for fi in 0..scm_count {
                         // Find free fd in receiver
                         let mut nfd = -1i32;
@@ -1070,6 +1071,10 @@ pub(crate) fn sys_recvmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
                                 let p = scm_conns[fi] as usize;
                                 if scm_kinds[fi] == 10 && p < MAX_PIPES { PIPE_READ_REFS[p].fetch_add(1, Ordering::AcqRel); }
                                 if scm_kinds[fi] == 11 && p < MAX_PIPES { PIPE_WRITE_REFS[p].fetch_add(1, Ordering::AcqRel); }
+                                // Increment unix connection refcount for kind 27/28
+                                if (scm_kinds[fi] == 27 || scm_kinds[fi] == 28) && p < crate::fd::MAX_UNIX_CONNS {
+                                    crate::fd::UNIX_CONN_ACTIVE[p].fetch_add(1, Ordering::AcqRel);
+                                }
                                 // For VFS files (kind=13), create a vfs_files entry in receiver
                                 if scm_kinds[fi] == 13 && scm_oids[fi] != 0 {
                                     for vs in 0..GRP_MAX_VFS {
@@ -1089,21 +1094,24 @@ pub(crate) fn sys_recvmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
                                 break;
                             }
                         }
+                        if nfd == -1 { alloc_failed = true; }
                         new_fds[fi] = nfd;
                     }
                     // Build cmsghdr: len(8) + level(4) + type(4) + fds(4*N)
-                    let cmsg_len = 16 + scm_count * 4;
+                    let effective_scm = if alloc_failed { 0 } else { scm_count };
+                    let cmsg_len = 16 + effective_scm * 4;       // CMSG_LEN
+                    let cmsg_space = (cmsg_len + 7) & !7;        // CMSG_SPACE (8-byte aligned)
                     let mut cmsg_buf = [0u8; 128];
                     cmsg_buf[..8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
                     cmsg_buf[8..12].copy_from_slice(&1i32.to_le_bytes()); // SOL_SOCKET
                     cmsg_buf[12..16].copy_from_slice(&1i32.to_le_bytes()); // SCM_RIGHTS
-                    for fi in 0..scm_count {
+                    for fi in 0..effective_scm {
                         let off = 16 + fi * 4;
                         cmsg_buf[off..off+4].copy_from_slice(&new_fds[fi].to_le_bytes());
                     }
-                    ctx.guest_write(msg_control, &cmsg_buf[..cmsg_len]);
-                    // Update msg_controllen in msghdr
-                    ctx.guest_write(msghdr_ptr + 40, &(cmsg_len as u64).to_le_bytes());
+                    ctx.guest_write(msg_control, &cmsg_buf[..cmsg_space]);
+                    // Update msg_controllen in msghdr (CMSG_SPACE aligned)
+                    ctx.guest_write(msghdr_ptr + 40, &(cmsg_space as u64).to_le_bytes());
                 } else {
                     // No SCM fds: set msg_controllen = 0
                     ctx.guest_write(msghdr_ptr + 40, &0u64.to_le_bytes());
