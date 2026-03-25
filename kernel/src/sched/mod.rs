@@ -498,6 +498,7 @@ pub fn init() {
         pending_signals: 0,
         kernel_signal: 0,
         fpu_state: thread::FpuState::zeroed(),
+        last_fault_rip: 0,
         fault_addr: 0,
         fault_code: 0,
         signal_saved_rip: 0,
@@ -556,6 +557,7 @@ pub fn create_idle_thread() -> usize {
         pending_signals: 0,
         kernel_signal: 0,
         fpu_state: thread::FpuState::zeroed(),
+        last_fault_rip: 0,
         fault_addr: 0,
         fault_code: 0,
         signal_saved_rip: 0,
@@ -636,12 +638,28 @@ pub fn exit_current() -> ! {
         let idx = percpu.current_thread;
         if idx != usize::MAX {
             let sched = SCHEDULER.lock();
-            sched.threads.get_by_index(idx as u32)
-                .and_then(|t| t.redirect_ep)
+            let rep = sched.threads.get_by_index(idx as u32)
+                .and_then(|t| t.redirect_ep);
+            rep
         } else {
             None
         }
     };
+    // Diagnostic: log thread death (lock-free serial write)
+    {
+        use crate::arch::serial;
+        for b in b"EXIT-T " { serial::write_byte(*b); }
+        let percpu = percpu::current_percpu();
+        let idx = percpu.current_thread as u64;
+        // Write index as decimal
+        if idx >= 10 { serial::write_byte(b'0' + ((idx / 10) % 10) as u8); }
+        serial::write_byte(b'0' + (idx % 10) as u8);
+        if redirect_ep.is_some() {
+            for b in b" redir=Y\n" { serial::write_byte(*b); }
+        } else {
+            for b in b" redir=N\n" { serial::write_byte(*b); }
+        }
+    }
     // Send synthetic SYS_EXIT_GROUP to the handler so it can clean up
     // (pipe refs, memory, etc.) instead of blocking on recv forever.
     if let Some(ep_raw) = redirect_ep {
@@ -1187,6 +1205,24 @@ pub fn get_signal_trampoline_by_idx(idx: u32) -> u64 {
         t.signal_trampoline
     } else {
         0
+    }
+}
+
+/// Get the last fault RIP for a thread (by index, no lock needed for read).
+pub fn get_last_fault_rip_by_idx(idx: u32) -> u64 {
+    let sched = SCHEDULER.lock();
+    if let Some(t) = sched.threads.get_by_index(idx) {
+        t.last_fault_rip
+    } else {
+        0
+    }
+}
+
+/// Set the last fault RIP for a thread (by index).
+pub fn set_last_fault_rip_by_idx(idx: u32, rip: u64) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(t) = sched.threads.get_mut_by_index(idx) {
+        t.last_fault_rip = rip;
     }
 }
 

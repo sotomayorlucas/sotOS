@@ -64,6 +64,11 @@ fn poll_fd_readable(ctx: &SyscallContext, fd: usize) -> bool {
         17 => true, // UDP: report readable — recvfrom does the real waiting via CMD_UDP_RECV
         2 | 8 | 12 | 13 | 14 | 15 | 16 | 22 | 23 | 25 => true, // always "ready"
         30 => crate::drm::drm_poll_readable(),
+        33 => {
+            let slot = ctx.sock_conn_id[fd] as usize;
+            crate::seatd::seatd_poll_readable(slot)
+        }
+        34 => false, // netlink dummy: never readable
         _ => true, // default: report readable
     }
 }
@@ -292,6 +297,21 @@ pub(crate) fn sys_socket(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 }
                 None => reply_val(ep_cap, -EMFILE),
             }
+        }
+    } else if domain == 16 {
+        // AF_NETLINK: dummy fd for libudev monitor (no real netlink delivery)
+        let mut fd = None;
+        for f in 3..GRP_MAX_FDS {
+            if ctx.child_fds[f] == 0 { fd = Some(f); break; }
+        }
+        match fd {
+            Some(f) => {
+                ctx.child_fds[f] = 34; // kind 34 = netlink dummy
+                if sock_nonblock != 0 { ctx.fd_flags[f] = 0x800; }
+                if sock_cloexec != 0 && f < 128 { *ctx.fd_cloexec |= 1u128 << f; }
+                reply_val(ep_cap, f as i64);
+            }
+            None => reply_val(ep_cap, -EMFILE),
         }
     } else {
         reply_val(ep_cap, -EAFNOSUPPORT);
@@ -990,21 +1010,37 @@ pub(crate) fn sys_recvmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
 
         // If OPEN_DEVICE response, attach DRM fd via SCM_RIGHTS
         if let Some(drm_fd) = crate::seatd::seatd_get_scm_fd(slot) {
-            if msg_control != 0 && msg_controllen >= 20 {
-                // Build cmsg: cmsg_len(8) + level(4) + type(4) + fd(4)
+            if msg_control != 0 && msg_controllen >= 24 {
+                // Build cmsg: CMSG_LEN(4)=20, CMSG_SPACE(4)=24 on x86_64
                 let mut cmsg = [0u8; 24];
-                cmsg[0..8].copy_from_slice(&20u64.to_ne_bytes()); // CMSG_LEN(4)
+                cmsg[0..8].copy_from_slice(&20u64.to_ne_bytes()); // cmsg_len = CMSG_LEN(sizeof(int))
                 cmsg[8..12].copy_from_slice(&1i32.to_ne_bytes()); // SOL_SOCKET
                 cmsg[12..16].copy_from_slice(&1i32.to_ne_bytes()); // SCM_RIGHTS
                 cmsg[16..20].copy_from_slice(&(drm_fd as i32).to_ne_bytes());
-                let write_len = 20.min(msg_controllen);
-                ctx.guest_write(msg_control, &cmsg[..write_len]);
-                // Update msg_controllen in the header
-                hdr[40..48].copy_from_slice(&(write_len as u64).to_le_bytes());
+                // bytes 20..24 = padding (already zeroed)
+                ctx.guest_write(msg_control, &cmsg);
+                // Update msg_controllen = CMSG_SPACE(4) = 24, msg_flags = 0
+                hdr[40..48].copy_from_slice(&24u64.to_le_bytes());
+                hdr[48..52].copy_from_slice(&0i32.to_le_bytes()); // msg_flags = 0
                 ctx.guest_write(msghdr_ptr, &hdr);
+                // Set FD_CLOEXEC if requested (MSG_CMSG_CLOEXEC=0x40000000)
+                if drm_fd < 128 {
+                    *ctx.fd_cloexec |= 1u128 << drm_fd;
+                }
                 print(b"seatd: SCM_RIGHTS fd=");
                 crate::framebuffer::print_u64(drm_fd as u64);
                 print(b"\n");
+            } else {
+                print(b"seatd: SCM_RIGHTS fd=");
+                crate::framebuffer::print_u64(drm_fd as u64);
+                print(b" no msg_control\n");
+            }
+        } else {
+            // No SCM pending: clear msg_controllen and msg_flags
+            if msg_control != 0 {
+                hdr[40..48].copy_from_slice(&0u64.to_le_bytes());
+                hdr[48..52].copy_from_slice(&0i32.to_le_bytes());
+                ctx.guest_write(msghdr_ptr, &hdr);
             }
         }
 
@@ -1039,6 +1075,31 @@ pub(crate) fn sys_recvmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
             let want = if msg_len > 0 { iov_len.min(msg_len).min(4096) } else { iov_len.min(4096) };
             let mut tmp = [0u8; 4096];
             let n = pipe_read(pipe_id, &mut tmp[..want]);
+            // Diagnostic: dump recvmsg for AF_UNIX on P5 (wineserver receives SCM fds)
+            if ctx.pid == 5 && (ctx.child_fds[fd] == 27 || ctx.child_fds[fd] == 28) {
+                print(b"RCVM-UX P5 fd="); print_u64(fd as u64);
+                print(b" conn="); print_u64(conn as u64);
+                print(b" pipe="); print_u64(pipe_id as u64);
+                print(b" n="); print_u64(n as u64);
+                print(b" ml="); print_u64(msg_len as u64);
+                print(b" ctl="); print_u64(msg_controllen as u64);
+                print(b"\n");
+            }
+            // Diagnostic: dump recvmsg data for P7 (Wine client ↔ wineserver)
+            if ctx.pid == 7 && n > 0 {
+                print(b"RCVM P7 fd="); print_u64(fd as u64);
+                print(b" n="); print_u64(n as u64);
+                print(b" [");
+                // Print first 16 bytes as hex
+                for i in 0..n.min(16) {
+                    let hi = tmp[i] >> 4;
+                    let lo = tmp[i] & 0xF;
+                    let hc = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
+                    let lc = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
+                    crate::framebuffer::print(&[hc, lc]);
+                }
+                print(b"]\n");
+            }
             if n > 0 {
                 // Pop the boundary marker and get per-message SCM count
                 let msg_scm_limit = if msg_len > 0 && n >= msg_len {
@@ -1594,8 +1655,8 @@ pub(crate) fn sys_epoll_wait(ctx: &mut SyscallContext, msg: &IpcMsg) {
                         // DRM: readable only when page-flip event pending
                         if crate::drm::drm_poll_readable() { revents |= 1; }
                     } else if kind == 33 {
-                        // seatd: always readable (inline responses)
-                        revents |= 1;
+                        let slot = ctx.sock_conn_id[rfd] as usize;
+                        if crate::seatd::seatd_poll_readable(slot) { revents |= 1; }
                     }
                 }
                 if wanted & 4 != 0 {
@@ -1657,6 +1718,10 @@ pub(crate) fn sys_epoll_wait(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     }
                     if wanted & 1 != 0 && (kind == 26 || kind == 27 || kind == 28) {
                         if poll_fd_readable(ctx, rfd) { rev |= 1; }
+                    }
+                    if wanted & 1 != 0 && kind == 33 {
+                        let slot = ctx.sock_conn_id[rfd] as usize;
+                        if crate::seatd::seatd_poll_readable(slot) { rev |= 1; }
                     }
                     if rev != 0 {
                         let ep = events_ptr + (ready_count as u64) * 12;
@@ -1751,6 +1816,8 @@ pub(crate) fn sys_accept(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     // Server side: kind=28, reads from pipe_a, writes to pipe_b
                     ctx.child_fds[nf] = 28;
                     ctx.sock_conn_id[nf] = conn_slot as u32;
+                    // Increment connection ref (connect() set refs=1, accept adds another)
+                    crate::fd::UNIX_CONN_REFS[conn_slot].fetch_add(1, core::sync::atomic::Ordering::AcqRel);
                     // Write sockaddr_un if requested
                     if addr_ptr != 0 {
                         let mut sa = [0u8; 2];

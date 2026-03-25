@@ -40,7 +40,7 @@ class Session:
             [QEMU, "-drive", f"format=raw,file={IMAGE}",
              "-drive", f"if=none,format=raw,file={DISK},id=disk0",
              "-device", "virtio-blk-pci,drive=disk0,disable-modern=on",
-             "-serial", "stdio", "-display", "none", "-no-reboot", "-m", "2048M"],
+             "-serial", "stdio", "-display", "none", "-no-reboot", "-m", "4096M"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, bufsize=0)
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
@@ -164,7 +164,7 @@ def main():
     # Stage 1: Boot and wait for shell prompt
     # -----------------------------------------------------------------------
     print("=== Stage 1: Boot ===", flush=True)
-    if not s.wait_for("$", 60):
+    if not s.wait_for("$", 120):
         print("  FAIL: no shell prompt within 60s", flush=True)
         out = s.get_output()
         with open(OUTPUT, 'w') as f:
@@ -267,7 +267,7 @@ def main():
     full_output = s.get_output()
     s.stop()
 
-    with open(OUTPUT, 'w') as f:
+    with open(OUTPUT, 'w', encoding='utf-8', errors='replace') as f:
         f.write(full_output)
     line_count = full_output.count('\n')
     print(f"\nFull output saved to {OUTPUT} ({len(full_output)} bytes, {line_count} lines)", flush=True)

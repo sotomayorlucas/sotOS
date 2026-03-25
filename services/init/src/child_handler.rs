@@ -192,6 +192,17 @@ pub(crate) extern "C" fn child_handler() -> ! {
         }}
     }
 
+    // Activate LAPIC RIP profiler for P7+ (Wine grandchild processes).
+    // This lets the kernel sample the user-mode RIP via timer interrupt
+    // so we can see where P7 is stuck if it stops making syscalls.
+    if pid >= 7 && child_as_cap != 0 {
+        print(b"PROF-ENABLE P"); print_u64(pid as u64);
+        print(b" as_cap="); print_u64(child_as_cap);
+        print(b"\n");
+        // syscall 256 = SYS_DEBUG_PROFILE_CR3, arg = as_cap
+        let _ = sys::syscall1(256, child_as_cap);
+    }
+
     // All processes use the same generous timeout.
     // Short timeouts cause a race: recv_timeout expiry coincides with the
     // child's endpoint::call(), consuming the message and leaving the child
@@ -258,12 +269,28 @@ pub(crate) extern "C" fn child_handler() -> ! {
         // Clear retry state before dispatch. If the handler sends
         // PIPE_RETRY_TAG it will re-increment via mark_pipe_retry().
         clear_pipe_retry(pid);
+        // Detect symlink/symlinkat calls from ANY process (Wine dosdevices debug)
+        if syscall_nr == 88 || syscall_nr == 266 {
+            print(b"!! SYMLINK-CALL P"); print_u64(pid as u64);
+            print(b" nr="); print_u64(syscall_nr);
+            print(b"\n");
+        }
 
         // Trace syscalls for separate-AS child processes (P6+)
         if pid >= 6 {
             print(b"AS-SYS P"); print_u64(pid as u64);
             print(b" #"); print_u64(syscall_nr);
-            print(b" ep="); print_u64(ep_cap);
+            // Show fd for read/write/close on P7
+            if pid == 7 && (syscall_nr == 0 || syscall_nr == 1 || syscall_nr == 3) {
+                print(b" fd="); print_u64(msg.regs[0]);
+            }
+            print(b"\n");
+        }
+        // Log P5 (wineserver) key syscalls
+        if pid == 5 && (syscall_nr == 0 || syscall_nr == 1 || syscall_nr == 20
+           || syscall_nr == 47 || syscall_nr == 46 || syscall_nr == 232) {
+            print(b"WS5 #"); print_u64(syscall_nr);
+            print(b" fd="); print_u64(msg.regs[0]);
             print(b"\n");
         }
 
@@ -1043,6 +1070,9 @@ pub(crate) extern "C" fn child_handler() -> ! {
                         let p = unsafe { THREAD_GROUPS[cidx].sock_conn_id[cfd] } as usize;
                         if k == 11 && p < MAX_PIPES { PIPE_WRITE_REFS[p].fetch_add(1, Ordering::AcqRel); }
                         else if k == 10 && p < MAX_PIPES { PIPE_READ_REFS[p].fetch_add(1, Ordering::AcqRel); }
+                        if (k == 27 || k == 28) && p < crate::fd::MAX_UNIX_CONNS {
+                            crate::fd::UNIX_CONN_REFS[p].fetch_add(1, Ordering::AcqRel);
+                        }
                     }
 
                     unsafe {
@@ -1589,9 +1619,11 @@ pub(crate) extern "C" fn child_handler() -> ! {
 
             // SYS_openat — /dev files + initrd files + VFS files
             SYS_OPENAT => {
-                print(b"CH-OA P"); crate::framebuffer::print_u64(pid as u64);
-                print(b" ptr="); crate::framebuffer::print_hex64(msg.regs[1]);
-                print(b"\n");
+                if pid >= 6 {
+                    print(b"CH-OA P"); crate::framebuffer::print_u64(pid as u64);
+                    print(b" ptr="); crate::framebuffer::print_hex64(msg.regs[1]);
+                    print(b"\n");
+                }
                 let mut ctx = make_ctx!();
                 syscalls_fs::sys_openat(&mut ctx, &msg);
             }
@@ -1935,10 +1967,44 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 reply_val(ep_cap, -EPERM);
             }
 
+            // SYS_SYMLINK(88) / SYS_SYMLINKAT(266): create symlink
+            SYS_SYMLINK | SYS_SYMLINKAT => {
+                let mut ctx = make_ctx!();
+                // Read target and linkpath from guest memory
+                let (target_ptr, linkpath_ptr) = if syscall_nr == SYS_SYMLINKAT {
+                    (msg.regs[0], msg.regs[2]) // symlinkat(target, newdirfd, linkpath)
+                } else {
+                    (msg.regs[0], msg.regs[1]) // symlink(target, linkpath)
+                };
+                let mut target = [0u8; 128];
+                let mut linkpath = [0u8; 128];
+                if child_as_cap != 0 {
+                    let _ = sys::vm_read(child_as_cap, target_ptr, target.as_mut_ptr() as u64, 128);
+                    let _ = sys::vm_read(child_as_cap, linkpath_ptr, linkpath.as_mut_ptr() as u64, 128);
+                } else {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(target_ptr as *const u8, target.as_mut_ptr(), 128);
+                        core::ptr::copy_nonoverlapping(linkpath_ptr as *const u8, linkpath.as_mut_ptr(), 128);
+                    }
+                }
+                let tlen = target.iter().position(|&b| b == 0).unwrap_or(127);
+                let llen = linkpath.iter().position(|&b| b == 0).unwrap_or(127);
+                // Resolve linkpath with CWD if relative
+                let mut resolved = [0u8; 256];
+                let rlen = crate::fd::resolve_with_cwd(&ctx.cwd, &linkpath[..llen], &mut resolved);
+                crate::fd::symlink_register(&resolved[..rlen], &target[..tlen]);
+                print(b"SYMLINK [");
+                for &b in &resolved[..rlen] { if b >= 0x20 && b < 0x7F { sys::debug_print(b); } }
+                print(b"] -> [");
+                for &b in &target[..tlen] { if b >= 0x20 && b < 0x7F { sys::debug_print(b); } }
+                print(b"]\n");
+                reply_val(ep_cap, 0);
+            }
+
             // File metadata stubs — return 0 (pretend success)
-            SYS_SYMLINK | SYS_FCHMOD | SYS_FCHOWN | SYS_LCHOWN
+            SYS_FCHMOD | SYS_FCHOWN | SYS_LCHOWN
             | SYS_FLOCK | SYS_FALLOCATE | SYS_UTIMES
-            | SYS_SYMLINKAT | SYS_FCHMODAT | SYS_FCHOWNAT
+            | SYS_FCHMODAT | SYS_FCHOWNAT
             | SYS_UTIMENSAT | SYS_FUTIMESAT | SYS_MKNOD | SYS_MKNODAT
             => {
                 let mut ctx = make_ctx!();

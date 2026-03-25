@@ -189,6 +189,10 @@ pub struct Thread {
     /// causing corruption in musl's SSE-optimized memcpy/strcmp.
     pub fpu_state: FpuState,
 
+    /// Last fault RIP — used to detect repeated faults at the same instruction.
+    /// If the same RIP faults twice, the signal handler didn't fix it → force kill.
+    pub last_fault_rip: u64,
+
     /// Fault address (CR2) from the last #PF that generated a kernel signal.
     /// Passed to init for siginfo.si_addr and ucontext gregs[22] (CR2).
     pub fault_addr: u64,
@@ -267,6 +271,7 @@ impl Thread {
             signal_trampoline: 0,
             pending_signals: 0,
             kernel_signal: 0,
+            last_fault_rip: 0,
             fpu_state: FpuState::zeroed(),
             fault_addr: 0,
             fault_code: 0,
@@ -339,6 +344,7 @@ impl Thread {
             signal_trampoline: 0,
             pending_signals: 0,
             kernel_signal: 0,
+            last_fault_rip: 0,
             fpu_state: FpuState::zeroed(),
             fault_addr: 0,
             fault_code: 0,

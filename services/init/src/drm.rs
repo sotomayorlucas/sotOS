@@ -32,6 +32,13 @@ const DRM_IOCTL_MODE_CREATE_DUMB: u8  = 0xB2;
 const DRM_IOCTL_MODE_MAP_DUMB: u8     = 0xB3;
 const DRM_IOCTL_MODE_DESTROY_DUMB: u8 = 0xB4;
 const DRM_IOCTL_MODE_ADDFB2: u8       = 0xB8;
+const DRM_IOCTL_SET_CLIENT_CAP: u8    = 0x0D;
+const DRM_IOCTL_MODE_CURSOR: u8       = 0xA3;
+const DRM_IOCTL_MODE_CURSOR2: u8      = 0xBB;
+const DRM_IOCTL_MODE_GETPROPERTY: u8  = 0xAA;
+const DRM_IOCTL_MODE_GETPLANERESOURCES: u8 = 0xB5;
+const DRM_IOCTL_MODE_GETPLANE: u8     = 0xB6;
+const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u8 = 0xB9;
 
 /// DRM ioctl type byte ('d' = 0x64).
 const DRM_IOCTL_TYPE: u8 = 0x64;
@@ -40,6 +47,29 @@ const DRM_IOCTL_TYPE: u8 = 0x64;
 const DRM_CAP_DUMB_BUFFER: u64         = 0x01;
 const DRM_CAP_PRIME: u64               = 0x05;
 const DRM_CAP_TIMESTAMP_MONOTONIC: u64 = 0x06;
+const DRM_CAP_CURSOR_WIDTH: u64        = 0x08;
+const DRM_CAP_CURSOR_HEIGHT: u64       = 0x09;
+const DRM_CAP_ADDFB2_MODIFIERS: u64    = 0x10;
+const DRM_CAP_CRTC_IN_VBLANK_EVENT: u64 = 0x12;
+
+/// DRM client capability IDs.
+const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
+const DRM_CLIENT_CAP_ATOMIC: u64           = 3;
+
+/// DRM object type IDs.
+const DRM_MODE_OBJECT_CRTC: u32      = 0xcccccccc;
+const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0c0c0;
+const DRM_MODE_OBJECT_PLANE: u32     = 0xeeeeeeee;
+
+/// Plane/property IDs (stable synthetic values).
+const PLANE_ID_PRIMARY: u32 = 100;
+const PROP_ID_TYPE: u32      = 1;
+const PROP_ID_CRTC_ID: u32   = 2;
+const PROP_ID_FB_ID: u32     = 3;
+const PROP_ID_ACTIVE: u32    = 10;
+const PROP_ID_MODE_ID: u32   = 11;
+const PROP_ID_DPMS: u32      = 20;
+const PROP_ID_CONN_CRTC: u32 = 21;
 
 /// FD kind value for DRM device files (used by openat/ioctl/mmap dispatch).
 #[allow(dead_code)]
@@ -253,13 +283,16 @@ pub(crate) fn drm_ioctl(ctx: &mut SyscallContext, cmd: u64, arg: u64) -> i64 {
     match nr {
         DRM_IOCTL_VERSION       => ioctl_version(ctx, arg),
         DRM_IOCTL_GET_CAP       => ioctl_get_cap(ctx, arg),
+        DRM_IOCTL_SET_CLIENT_CAP => ioctl_set_client_cap(ctx, arg),
         DRM_IOCTL_SET_MASTER    => 0,
         DRM_IOCTL_DROP_MASTER   => 0,
         DRM_IOCTL_MODE_GETRESOURCES => ioctl_get_resources(ctx, arg),
         DRM_IOCTL_MODE_GETCRTC      => ioctl_get_crtc(ctx, arg),
         DRM_IOCTL_MODE_SETCRTC      => ioctl_set_crtc(ctx, arg),
+        DRM_IOCTL_MODE_CURSOR | DRM_IOCTL_MODE_CURSOR2 => 0, // cursor: stub success
         DRM_IOCTL_MODE_GETENCODER   => ioctl_get_encoder(ctx, arg),
         DRM_IOCTL_MODE_GETCONNECTOR => ioctl_get_connector(ctx, arg),
+        DRM_IOCTL_MODE_GETPROPERTY  => ioctl_get_property(ctx, arg),
         DRM_IOCTL_MODE_ADDFB        => ioctl_add_fb(ctx, arg),
         DRM_IOCTL_MODE_ADDFB2       => ioctl_add_fb2(ctx, arg),
         DRM_IOCTL_MODE_RMFB         => ioctl_rm_fb(ctx, arg),
@@ -267,6 +300,9 @@ pub(crate) fn drm_ioctl(ctx: &mut SyscallContext, cmd: u64, arg: u64) -> i64 {
         DRM_IOCTL_MODE_CREATE_DUMB  => ioctl_create_dumb(ctx, arg),
         DRM_IOCTL_MODE_MAP_DUMB     => ioctl_map_dumb(ctx, arg),
         DRM_IOCTL_MODE_DESTROY_DUMB => ioctl_destroy_dumb(ctx, arg),
+        DRM_IOCTL_MODE_GETPLANERESOURCES => ioctl_get_plane_resources(ctx, arg),
+        DRM_IOCTL_MODE_GETPLANE     => ioctl_get_plane(ctx, arg),
+        DRM_IOCTL_MODE_OBJ_GETPROPERTIES => ioctl_obj_get_properties(ctx, arg),
         _ => {
             print(b"DRM-IOCTL unknown nr=0x");
             print_hex64(nr as u64);
@@ -348,9 +384,13 @@ fn ioctl_get_cap(ctx: &mut SyscallContext, arg: u64) -> i64 {
     ctx.guest_read(arg, &mut buf);
     let cap_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
     let value: u64 = match cap_id {
-        DRM_CAP_DUMB_BUFFER         => 1,
-        DRM_CAP_TIMESTAMP_MONOTONIC => 1,
-        DRM_CAP_PRIME               => 0,
+        DRM_CAP_DUMB_BUFFER          => 1,
+        DRM_CAP_TIMESTAMP_MONOTONIC  => 1,
+        DRM_CAP_PRIME                => 0,
+        DRM_CAP_CURSOR_WIDTH         => 64,
+        DRM_CAP_CURSOR_HEIGHT        => 64,
+        DRM_CAP_ADDFB2_MODIFIERS     => 0,
+        DRM_CAP_CRTC_IN_VBLANK_EVENT => 1,
         _ => 0,
     };
     buf[8..16].copy_from_slice(&value.to_le_bytes());
@@ -521,7 +561,10 @@ fn ioctl_get_connector(ctx: &mut SyscallContext, arg: u64) -> i64 {
 
     let encoders_ptr    = u64::from_le_bytes(buf[0..8].try_into().unwrap());
     let modes_ptr       = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let props_ptr       = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+    let pvals_ptr       = u64::from_le_bytes(buf[24..32].try_into().unwrap());
     let count_modes     = u32::from_le_bytes(buf[32..36].try_into().unwrap());
+    let count_props     = u32::from_le_bytes(buf[36..40].try_into().unwrap());
     let count_encoders  = u32::from_le_bytes(buf[40..44].try_into().unwrap());
 
     // If caller provided buffer for modes (second pass), write the mode
@@ -536,9 +579,19 @@ fn ioctl_get_connector(ctx: &mut SyscallContext, arg: u64) -> i64 {
         ctx.guest_write(encoders_ptr, &1u32.to_le_bytes()); // encoder_id=1
     }
 
+    // Connector properties: CRTC_ID(21), DPMS(20)
+    if count_props >= 2 && props_ptr != 0 {
+        ctx.guest_write(props_ptr, &PROP_ID_CONN_CRTC.to_le_bytes());
+        ctx.guest_write(props_ptr + 4, &PROP_ID_DPMS.to_le_bytes());
+        if pvals_ptr != 0 {
+            ctx.guest_write(pvals_ptr, &1u64.to_le_bytes()); // CRTC_ID=1
+            ctx.guest_write(pvals_ptr + 8, &0u64.to_le_bytes()); // DPMS=ON(0)
+        }
+    }
+
     // Fill counts and fields
     buf[32..36].copy_from_slice(&1u32.to_le_bytes());  // count_modes = 1
-    buf[36..40].copy_from_slice(&0u32.to_le_bytes());  // count_props = 0
+    buf[36..40].copy_from_slice(&2u32.to_le_bytes());  // count_props = 2
     buf[40..44].copy_from_slice(&1u32.to_le_bytes());  // count_encoders = 1
     buf[44..48].copy_from_slice(&1u32.to_le_bytes());  // encoder_id = 1
     buf[48..52].copy_from_slice(&1u32.to_le_bytes());  // connector_id = 1
@@ -892,6 +945,294 @@ fn ioctl_destroy_dumb(ctx: &mut SyscallContext, arg: u64) -> i64 {
         }
     }
     -22 // EINVAL
+}
+
+// ---------------------------------------------------------------------------
+// Universal planes + properties ioctls (Weston 14 requires these)
+// ---------------------------------------------------------------------------
+
+/// DRM_IOCTL_SET_CLIENT_CAP (0x0D)
+///
+/// struct drm_set_client_cap { __u64 capability; __u64 value; };
+fn ioctl_set_client_cap(ctx: &mut SyscallContext, arg: u64) -> i64 {
+    let mut buf = [0u8; 16];
+    ctx.guest_read(arg, &mut buf);
+    let cap = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    match cap {
+        DRM_CLIENT_CAP_UNIVERSAL_PLANES => {
+            print(b"DRM: universal planes enabled\n");
+            0
+        }
+        DRM_CLIENT_CAP_ATOMIC => {
+            print(b"DRM: atomic rejected (legacy mode)\n");
+            -95 // EOPNOTSUPP — force legacy DRM path
+        }
+        _ => 0,
+    }
+}
+
+/// DRM_IOCTL_MODE_GETPLANERESOURCES (0xB5)
+///
+/// struct drm_mode_get_plane_res {
+///     __u64 plane_id_ptr;    // 0
+///     __u32 count_planes;    // 8
+/// };
+fn ioctl_get_plane_resources(ctx: &mut SyscallContext, arg: u64) -> i64 {
+    let mut buf = [0u8; 16];
+    ctx.guest_read(arg, &mut buf);
+
+    let plane_id_ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let count = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+
+    // 1 primary plane
+    if count >= 1 && plane_id_ptr != 0 {
+        ctx.guest_write(plane_id_ptr, &PLANE_ID_PRIMARY.to_le_bytes());
+    }
+
+    buf[8..12].copy_from_slice(&1u32.to_le_bytes());
+    ctx.guest_write(arg, &buf);
+    print(b"DRM: GETPLANERESOURCES count=1\n");
+    0
+}
+
+/// DRM_IOCTL_MODE_GETPLANE (0xB6)
+///
+/// struct drm_mode_get_plane {
+///     __u32 plane_id;            // 0
+///     __u32 crtc_id;             // 4
+///     __u32 fb_id;               // 8
+///     __u32 possible_crtcs;      // 12
+///     __u32 gamma_size;          // 16
+///     __u32 count_format_codes;  // 20
+///     __u64 format_type_ptr;     // 24
+/// };
+fn ioctl_get_plane(ctx: &mut SyscallContext, arg: u64) -> i64 {
+    let mut buf = [0u8; 32];
+    ctx.guest_read(arg, &mut buf);
+
+    let format_ptr = u64::from_le_bytes(buf[24..32].try_into().unwrap());
+    let count = u32::from_le_bytes(buf[20..24].try_into().unwrap());
+
+    // Supported pixel formats
+    const XRGB8888: u32 = 0x34325258; // fourcc('X','R','2','4')
+    const ARGB8888: u32 = 0x34325241; // fourcc('A','R','2','4')
+
+    if count >= 2 && format_ptr != 0 {
+        ctx.guest_write(format_ptr, &XRGB8888.to_le_bytes());
+        ctx.guest_write(format_ptr + 4, &ARGB8888.to_le_bytes());
+    }
+
+    buf[0..4].copy_from_slice(&PLANE_ID_PRIMARY.to_le_bytes());
+    buf[4..8].copy_from_slice(&0u32.to_le_bytes());   // crtc_id (not bound)
+    buf[8..12].copy_from_slice(&0u32.to_le_bytes());   // fb_id (not bound)
+    buf[12..16].copy_from_slice(&1u32.to_le_bytes());  // possible_crtcs = bit 0
+    buf[16..20].copy_from_slice(&0u32.to_le_bytes());  // gamma_size
+    buf[20..24].copy_from_slice(&2u32.to_le_bytes());  // count_format_codes
+
+    ctx.guest_write(arg, &buf);
+    print(b"DRM: GETPLANE id=");
+    print_u64(PLANE_ID_PRIMARY as u64);
+    print(b"\n");
+    0
+}
+
+/// DRM_IOCTL_MODE_OBJ_GETPROPERTIES (0xB9)
+///
+/// struct drm_mode_obj_get_properties {
+///     __u64 props_ptr;       // 0
+///     __u64 prop_values_ptr; // 8
+///     __u32 count_props;     // 16
+///     __u32 obj_id;          // 20
+///     __u32 obj_type;        // 24
+///     __u32 pad;             // 28
+/// };
+fn ioctl_obj_get_properties(ctx: &mut SyscallContext, arg: u64) -> i64 {
+    let mut buf = [0u8; 32];
+    ctx.guest_read(arg, &mut buf);
+
+    let props_ptr  = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let values_ptr = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let count      = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+    let _obj_id    = u32::from_le_bytes(buf[20..24].try_into().unwrap());
+    let obj_type   = u32::from_le_bytes(buf[24..28].try_into().unwrap());
+
+    match obj_type {
+        DRM_MODE_OBJECT_PLANE => {
+            // Plane properties: type(1), CRTC_ID(2), FB_ID(3)
+            let ids: [u32; 3] = [PROP_ID_TYPE, PROP_ID_CRTC_ID, PROP_ID_FB_ID];
+            let vals: [u64; 3] = [1, 0, 0]; // type=PRIMARY(1)
+            let num = 3u32;
+            if count >= num && props_ptr != 0 {
+                for i in 0..3usize {
+                    ctx.guest_write(props_ptr + (i as u64) * 4, &ids[i].to_le_bytes());
+                    ctx.guest_write(values_ptr + (i as u64) * 8, &vals[i].to_le_bytes());
+                }
+            }
+            buf[16..20].copy_from_slice(&num.to_le_bytes());
+        }
+        DRM_MODE_OBJECT_CRTC => {
+            let ids: [u32; 2] = [PROP_ID_ACTIVE, PROP_ID_MODE_ID];
+            let vals: [u64; 2] = [1, 0]; // ACTIVE=1, MODE_ID=0
+            let num = 2u32;
+            if count >= num && props_ptr != 0 {
+                for i in 0..2usize {
+                    ctx.guest_write(props_ptr + (i as u64) * 4, &ids[i].to_le_bytes());
+                    ctx.guest_write(values_ptr + (i as u64) * 8, &vals[i].to_le_bytes());
+                }
+            }
+            buf[16..20].copy_from_slice(&num.to_le_bytes());
+        }
+        DRM_MODE_OBJECT_CONNECTOR => {
+            let ids: [u32; 2] = [PROP_ID_CONN_CRTC, PROP_ID_DPMS];
+            let vals: [u64; 2] = [1, 0]; // CRTC_ID=1, DPMS=ON
+            let num = 2u32;
+            if count >= num && props_ptr != 0 {
+                for i in 0..2usize {
+                    ctx.guest_write(props_ptr + (i as u64) * 4, &ids[i].to_le_bytes());
+                    ctx.guest_write(values_ptr + (i as u64) * 8, &vals[i].to_le_bytes());
+                }
+            }
+            buf[16..20].copy_from_slice(&num.to_le_bytes());
+        }
+        _ => {
+            buf[16..20].copy_from_slice(&0u32.to_le_bytes());
+        }
+    }
+
+    ctx.guest_write(arg, &buf);
+    0
+}
+
+/// DRM_IOCTL_MODE_GETPROPERTY (0xAA)
+///
+/// struct drm_mode_get_property {
+///     __u64 values_ptr;       // 0
+///     __u64 enum_blob_ptr;    // 8
+///     __u32 prop_id;          // 16
+///     __u32 flags;            // 20
+///     char name[32];          // 24..56
+///     __u32 count_values;     // 56
+///     __u32 count_enum_blobs; // 60
+/// };
+fn ioctl_get_property(ctx: &mut SyscallContext, arg: u64) -> i64 {
+    let mut buf = [0u8; 64];
+    ctx.guest_read(arg, &mut buf);
+
+    let values_ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let enum_ptr   = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let prop_id    = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+    let count_vals = u32::from_le_bytes(buf[56..60].try_into().unwrap());
+    let count_enum = u32::from_le_bytes(buf[60..64].try_into().unwrap());
+
+    // DRM_MODE_PROP flags
+    const PROP_RANGE: u32     = 1 << 1;
+    const PROP_IMMUTABLE: u32 = 1 << 2;
+    const PROP_ENUM: u32      = 1 << 3;
+    const PROP_OBJECT: u32    = (1 << 6) | (1 << 1);
+
+    // Zero the name field
+    buf[24..56].copy_from_slice(&[0u8; 32]);
+
+    match prop_id {
+        PROP_ID_TYPE => {
+            // "type" — plane type enum (immutable)
+            buf[20..24].copy_from_slice(&(PROP_ENUM | PROP_IMMUTABLE).to_le_bytes());
+            buf[24..28].copy_from_slice(b"type");
+            buf[56..60].copy_from_slice(&3u32.to_le_bytes());
+            buf[60..64].copy_from_slice(&3u32.to_le_bytes());
+
+            if count_enum >= 3 && enum_ptr != 0 {
+                // struct drm_mode_property_enum { __u64 value; char name[32]; } = 40 bytes
+                let enums: [(&[u8], u64); 3] = [
+                    (b"Overlay", 0),
+                    (b"Primary", 1),
+                    (b"Cursor", 2),
+                ];
+                for (i, (name, val)) in enums.iter().enumerate() {
+                    let off = enum_ptr + (i as u64) * 40;
+                    ctx.guest_write(off, &val.to_le_bytes());
+                    let mut nbuf = [0u8; 32];
+                    let n = name.len().min(31);
+                    nbuf[..n].copy_from_slice(&name[..n]);
+                    ctx.guest_write(off + 8, &nbuf);
+                }
+            }
+            if count_vals >= 3 && values_ptr != 0 {
+                for i in 0..3u64 {
+                    ctx.guest_write(values_ptr + i * 8, &i.to_le_bytes());
+                }
+            }
+        }
+        PROP_ID_CRTC_ID => {
+            buf[20..24].copy_from_slice(&PROP_OBJECT.to_le_bytes());
+            buf[24..31].copy_from_slice(b"CRTC_ID");
+            buf[56..60].copy_from_slice(&0u32.to_le_bytes());
+            buf[60..64].copy_from_slice(&0u32.to_le_bytes());
+        }
+        PROP_ID_FB_ID => {
+            buf[20..24].copy_from_slice(&PROP_OBJECT.to_le_bytes());
+            buf[24..29].copy_from_slice(b"FB_ID");
+            buf[56..60].copy_from_slice(&0u32.to_le_bytes());
+            buf[60..64].copy_from_slice(&0u32.to_le_bytes());
+        }
+        PROP_ID_ACTIVE => {
+            buf[20..24].copy_from_slice(&PROP_RANGE.to_le_bytes());
+            buf[24..30].copy_from_slice(b"ACTIVE");
+            buf[56..60].copy_from_slice(&2u32.to_le_bytes());
+            buf[60..64].copy_from_slice(&0u32.to_le_bytes());
+            if count_vals >= 2 && values_ptr != 0 {
+                ctx.guest_write(values_ptr, &0u64.to_le_bytes());     // min
+                ctx.guest_write(values_ptr + 8, &1u64.to_le_bytes()); // max
+            }
+        }
+        PROP_ID_MODE_ID => {
+            buf[20..24].copy_from_slice(&((1u32 << 4) | (1 << 2)).to_le_bytes()); // BLOB | IMMUTABLE
+            buf[24..31].copy_from_slice(b"MODE_ID");
+            buf[56..60].copy_from_slice(&0u32.to_le_bytes());
+            buf[60..64].copy_from_slice(&0u32.to_le_bytes());
+        }
+        PROP_ID_DPMS => {
+            buf[20..24].copy_from_slice(&PROP_ENUM.to_le_bytes());
+            buf[24..28].copy_from_slice(b"DPMS");
+            buf[56..60].copy_from_slice(&4u32.to_le_bytes());
+            buf[60..64].copy_from_slice(&4u32.to_le_bytes());
+            if count_enum >= 4 && enum_ptr != 0 {
+                let dpms: [(&[u8], u64); 4] = [
+                    (b"On", 0), (b"Standby", 1), (b"Suspend", 2), (b"Off", 3),
+                ];
+                for (i, (name, val)) in dpms.iter().enumerate() {
+                    let off = enum_ptr + (i as u64) * 40;
+                    ctx.guest_write(off, &val.to_le_bytes());
+                    let mut nbuf = [0u8; 32];
+                    let n = name.len().min(31);
+                    nbuf[..n].copy_from_slice(&name[..n]);
+                    ctx.guest_write(off + 8, &nbuf);
+                }
+            }
+            if count_vals >= 4 && values_ptr != 0 {
+                for i in 0..4u64 {
+                    ctx.guest_write(values_ptr + i * 8, &i.to_le_bytes());
+                }
+            }
+        }
+        PROP_ID_CONN_CRTC => {
+            buf[20..24].copy_from_slice(&PROP_OBJECT.to_le_bytes());
+            buf[24..31].copy_from_slice(b"CRTC_ID");
+            buf[56..60].copy_from_slice(&0u32.to_le_bytes());
+            buf[60..64].copy_from_slice(&0u32.to_le_bytes());
+        }
+        _ => {
+            // Unknown property — return zeroed
+            let mut name = [0u8; 32];
+            name[0..8].copy_from_slice(b"unknown\0");
+            buf[24..56].copy_from_slice(&name);
+            buf[56..60].copy_from_slice(&0u32.to_le_bytes());
+            buf[60..64].copy_from_slice(&0u32.to_le_bytes());
+        }
+    }
+
+    ctx.guest_write(arg, &buf);
+    0
 }
 
 // ---------------------------------------------------------------------------
