@@ -775,3 +775,141 @@ pub(crate) fn resolve_with_cwd(cwd: &[u8; GRP_CWD_MAX], path: &[u8], out: &mut [
     out[pos] = 0;
     pos
 }
+
+// ---------------------------------------------------------------------------
+// Symlink table (Wine dosdevices compat)
+// ---------------------------------------------------------------------------
+const MAX_SYMLINKS: usize = 16;
+const SYMLINK_LEN: usize = 128;
+/// Symlink source paths (absolute). Zeroed = unused slot.
+pub(crate) static mut SYMLINK_PATH: [[u8; SYMLINK_LEN]; MAX_SYMLINKS] = [[0; SYMLINK_LEN]; MAX_SYMLINKS];
+/// Symlink targets (may be relative).
+pub(crate) static mut SYMLINK_TARGET: [[u8; SYMLINK_LEN]; MAX_SYMLINKS] = [[0; SYMLINK_LEN]; MAX_SYMLINKS];
+pub(crate) static mut SYMLINK_COUNT: usize = 0;
+
+/// Register a symlink: linkpath → target.
+pub(crate) fn symlink_register(linkpath: &[u8], target: &[u8]) {
+    unsafe {
+        if SYMLINK_COUNT >= MAX_SYMLINKS { return; }
+        let i = SYMLINK_COUNT;
+        let plen = linkpath.len().min(SYMLINK_LEN - 1);
+        let tlen = target.len().min(SYMLINK_LEN - 1);
+        SYMLINK_PATH[i][..plen].copy_from_slice(&linkpath[..plen]);
+        SYMLINK_PATH[i][plen] = 0;
+        SYMLINK_TARGET[i][..tlen].copy_from_slice(&target[..tlen]);
+        SYMLINK_TARGET[i][tlen] = 0;
+        SYMLINK_COUNT += 1;
+    }
+}
+
+/// Find needle in haystack, return position of start. None if not found.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.len() > haystack.len() { return None; }
+    for i in 0..=(haystack.len() - needle.len()) {
+        if &haystack[i..i + needle.len()] == needle { return Some(i); }
+    }
+    None
+}
+
+/// Normalize a path by substituting symlink components.
+/// Also handles Wine dosdevices: .wine/dosdevices/X: → .wine/drive_X
+/// Returns the new length written into `out`.
+pub(crate) fn symlink_resolve(path: &[u8], out: &mut [u8; 256]) -> usize {
+    // Wine compat: rewrite dosdevices/c: → drive_c (and z: → /)
+    // Pattern: .../.wine/dosdevices/X:/rest → .../.wine/drive_X/rest
+    if let Some(dd_pos) = find_subslice(path, b"/dosdevices/") {
+        let letter_pos = dd_pos + b"/dosdevices/".len();
+        if letter_pos + 1 < path.len() && path[letter_pos + 1] == b':' {
+            let letter = path[letter_pos];
+            if letter == b'z' || letter == b'Z' {
+                // z: → / (root filesystem)
+                let rest_start = letter_pos + 2; // skip "z:"
+                let rest = &path[rest_start..];
+                if rest.is_empty() || rest == b"/" {
+                    out[0] = b'/';
+                    out[1] = 0;
+                    return 1;
+                }
+                let n = rest.len().min(255);
+                out[..n].copy_from_slice(&rest[..n]);
+                out[n] = 0;
+                return n;
+            }
+            // c: → drive_c (relative to .wine parent)
+            let wine_parent_end = dd_pos; // position of /dosdevices
+            let mut pos = 0usize;
+            // Copy path up to and including /.wine
+            if wine_parent_end > 0 {
+                out[..wine_parent_end].copy_from_slice(&path[..wine_parent_end]);
+                pos = wine_parent_end;
+            }
+            // Append /drive_X
+            let drive = [b'/', b'd', b'r', b'i', b'v', b'e', b'_', letter];
+            let cp = drive.len().min(255 - pos);
+            out[pos..pos + cp].copy_from_slice(&drive[..cp]);
+            pos += cp;
+            // Append rest after "X:"
+            let rest_start = letter_pos + 2;
+            if rest_start < path.len() {
+                let rest = &path[rest_start..];
+                let rn = rest.len().min(255 - pos);
+                out[pos..pos + rn].copy_from_slice(&rest[..rn]);
+                pos += rn;
+            }
+            out[pos] = 0;
+            return pos;
+        }
+    }
+    unsafe {
+        for i in 0..SYMLINK_COUNT {
+            let sp = &SYMLINK_PATH[i];
+            let slen = sp.iter().position(|&b| b == 0).unwrap_or(SYMLINK_LEN);
+            if slen == 0 { continue; }
+            // Check if path starts with this symlink path
+            if path.len() >= slen && &path[..slen] == &sp[..slen]
+                && (path.len() == slen || path[slen] == b'/') {
+                let tgt = &SYMLINK_TARGET[i];
+                let tlen = tgt.iter().position(|&b| b == 0).unwrap_or(SYMLINK_LEN);
+                if tlen == 0 { continue; }
+                // Build resolved path
+                let mut pos = 0usize;
+                if tgt[0] == b'/' {
+                    // Absolute target: target + rest
+                    let cp = tlen.min(255);
+                    out[..cp].copy_from_slice(&tgt[..cp]);
+                    pos = cp;
+                } else {
+                    // Relative target: parent_of(symlink) + / + target + rest
+                    // Find parent directory of the symlink
+                    let mut last_slash = 0;
+                    for j in 0..slen {
+                        if sp[j] == b'/' { last_slash = j; }
+                    }
+                    if last_slash > 0 {
+                        out[..last_slash].copy_from_slice(&sp[..last_slash]);
+                        pos = last_slash;
+                    }
+                    out[pos] = b'/';
+                    pos += 1;
+                    let cp = tlen.min(255 - pos);
+                    out[pos..pos + cp].copy_from_slice(&tgt[..cp]);
+                    pos += cp;
+                }
+                // Append remaining path after symlink
+                let rest_start = slen;
+                let rest_len = path.len() - rest_start;
+                if rest_len > 0 && pos + rest_len <= 255 {
+                    out[pos..pos + rest_len].copy_from_slice(&path[rest_start..]);
+                    pos += rest_len;
+                }
+                out[pos] = 0;
+                return pos;
+            }
+        }
+    }
+    // No symlink match — copy as-is
+    let n = path.len().min(255);
+    out[..n].copy_from_slice(&path[..n]);
+    out[n] = 0;
+    n
+}

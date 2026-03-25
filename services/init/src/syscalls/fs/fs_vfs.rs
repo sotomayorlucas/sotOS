@@ -417,6 +417,15 @@ pub(crate) fn sys_stat(ctx: &mut SyscallContext, msg: &IpcMsg) {
     } else {
         (path, path_len)
     };
+    // Resolve symlinks
+    let (path, path_len) = {
+        let mut resolved = [0u8; 256];
+        let rlen = crate::fd::symlink_resolve(&path[..path_len], &mut resolved);
+        let mut out = [0u8; 128];
+        let n = rlen.min(127);
+        out[..n].copy_from_slice(&resolved[..n]);
+        (out, n)
+    };
     let name = &path[..path_len];
 
     let mut basename_start = 0usize;
@@ -981,6 +990,15 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
     } else {
         (path, path_len)
     };
+    // Resolve symlinks (Wine dosdevices compat)
+    let (path, path_len) = {
+        let mut resolved = [0u8; 256];
+        let rlen = crate::fd::symlink_resolve(&path[..path_len], &mut resolved);
+        let mut out = [0u8; 128];
+        let n = rlen.min(127);
+        out[..n].copy_from_slice(&resolved[..n]);
+        (out, n)
+    };
     let name = &path[..path_len];
 
     // Synthetic directory open: /dev/dri/, /dev/input/
@@ -1202,7 +1220,7 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
             }
         }
     } else {
-        if starts_with(name, b"/lib/") || starts_with(name, b"/usr/lib/") {
+        if starts_with(name, b"/lib/") || starts_with(name, b"/usr/lib/") || ctx.pid >= 9 {
             print(b"OA P"); crate::framebuffer::print_u64(ctx.pid as u64);
             print(b" ["); for &b in name { sys::debug_print(b); } print(b"]\n");
         }
@@ -1645,7 +1663,32 @@ pub(crate) fn sys_readlinkat(ctx: &mut SyscallContext, msg: &IpcMsg) {
         ctx.guest_write(out_buf, &target[..n]);
         reply_val(ctx.ep_cap, n as i64);
     } else {
-        reply_val(ctx.ep_cap, -EINVAL);
+        // Check symlink table (Wine dosdevices compat)
+        let mut abs = [0u8; 256];
+        let alen = if rpath_len > 0 && rpath[0] != b'/' {
+            crate::fd::resolve_with_cwd(ctx.cwd, rname, &mut abs)
+        } else {
+            let n = rpath_len.min(255);
+            abs[..n].copy_from_slice(&rpath[..n]);
+            n
+        };
+        let mut found = false;
+        unsafe {
+            for i in 0..crate::fd::SYMLINK_COUNT.min(16) {
+                let sp = &crate::fd::SYMLINK_PATH[i];
+                let slen = sp.iter().position(|&b| b == 0).unwrap_or(128);
+                if slen > 0 && alen == slen && abs[..alen] == sp[..slen] {
+                    let tgt = &crate::fd::SYMLINK_TARGET[i];
+                    let tlen = tgt.iter().position(|&b| b == 0).unwrap_or(128);
+                    let n = tlen.min(bufsiz);
+                    ctx.guest_write(out_buf, &tgt[..n]);
+                    reply_val(ctx.ep_cap, n as i64);
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found { reply_val(ctx.ep_cap, -EINVAL); }
     }
 }
 

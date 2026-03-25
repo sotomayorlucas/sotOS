@@ -269,6 +269,12 @@ pub(crate) extern "C" fn child_handler() -> ! {
         // Clear retry state before dispatch. If the handler sends
         // PIPE_RETRY_TAG it will re-increment via mark_pipe_retry().
         clear_pipe_retry(pid);
+        // Detect symlink/symlinkat calls from ANY process (Wine dosdevices debug)
+        if syscall_nr == 88 || syscall_nr == 266 {
+            print(b"!! SYMLINK-CALL P"); print_u64(pid as u64);
+            print(b" nr="); print_u64(syscall_nr);
+            print(b"\n");
+        }
 
         // Trace syscalls for separate-AS child processes (P6+)
         if pid >= 6 {
@@ -1961,10 +1967,44 @@ pub(crate) extern "C" fn child_handler() -> ! {
                 reply_val(ep_cap, -EPERM);
             }
 
+            // SYS_SYMLINK(88) / SYS_SYMLINKAT(266): create symlink
+            SYS_SYMLINK | SYS_SYMLINKAT => {
+                let mut ctx = make_ctx!();
+                // Read target and linkpath from guest memory
+                let (target_ptr, linkpath_ptr) = if syscall_nr == SYS_SYMLINKAT {
+                    (msg.regs[0], msg.regs[2]) // symlinkat(target, newdirfd, linkpath)
+                } else {
+                    (msg.regs[0], msg.regs[1]) // symlink(target, linkpath)
+                };
+                let mut target = [0u8; 128];
+                let mut linkpath = [0u8; 128];
+                if child_as_cap != 0 {
+                    let _ = sys::vm_read(child_as_cap, target_ptr, target.as_mut_ptr() as u64, 128);
+                    let _ = sys::vm_read(child_as_cap, linkpath_ptr, linkpath.as_mut_ptr() as u64, 128);
+                } else {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(target_ptr as *const u8, target.as_mut_ptr(), 128);
+                        core::ptr::copy_nonoverlapping(linkpath_ptr as *const u8, linkpath.as_mut_ptr(), 128);
+                    }
+                }
+                let tlen = target.iter().position(|&b| b == 0).unwrap_or(127);
+                let llen = linkpath.iter().position(|&b| b == 0).unwrap_or(127);
+                // Resolve linkpath with CWD if relative
+                let mut resolved = [0u8; 256];
+                let rlen = crate::fd::resolve_with_cwd(&ctx.cwd, &linkpath[..llen], &mut resolved);
+                crate::fd::symlink_register(&resolved[..rlen], &target[..tlen]);
+                print(b"SYMLINK [");
+                for &b in &resolved[..rlen] { if b >= 0x20 && b < 0x7F { sys::debug_print(b); } }
+                print(b"] -> [");
+                for &b in &target[..tlen] { if b >= 0x20 && b < 0x7F { sys::debug_print(b); } }
+                print(b"]\n");
+                reply_val(ep_cap, 0);
+            }
+
             // File metadata stubs — return 0 (pretend success)
-            SYS_SYMLINK | SYS_FCHMOD | SYS_FCHOWN | SYS_LCHOWN
+            SYS_FCHMOD | SYS_FCHOWN | SYS_LCHOWN
             | SYS_FLOCK | SYS_FALLOCATE | SYS_UTIMES
-            | SYS_SYMLINKAT | SYS_FCHMODAT | SYS_FCHOWNAT
+            | SYS_FCHMODAT | SYS_FCHOWNAT
             | SYS_UTIMENSAT | SYS_FUTIMESAT | SYS_MKNOD | SYS_MKNODAT
             => {
                 let mut ctx = make_ctx!();
