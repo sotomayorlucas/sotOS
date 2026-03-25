@@ -74,6 +74,9 @@ pub(crate) struct ProcessState {
 
     // Executable path for /proc/self/exe (set at exec time)
     pub exe_path: [AtomicU64; 4],       // up to 32 bytes (NUL-terminated)
+
+    // Personality (0=default/musl, 1=glibc) — controls library resolution
+    pub personality: core::sync::atomic::AtomicU8,
 }
 
 impl ProcessState {
@@ -110,6 +113,7 @@ impl ProcessState {
             robust_list_len: AtomicU64::new(0),
             proc_name: [const { AtomicU64::new(0) }; 2],
             exe_path: [const { AtomicU64::new(0) }; 4],
+            personality: core::sync::atomic::AtomicU8::new(0),
         }
     }
 }
@@ -121,6 +125,19 @@ pub(crate) static PROCESSES: [ProcessState; MAX_PROCS] =
 /// Init's own address space capability (from BootInfo.self_as_cap).
 /// Set once at startup, read by child_handler for CoW fork.
 pub(crate) static INIT_SELF_AS_CAP: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// Personality: controls library resolution (initrd skip for glibc processes)
+// ---------------------------------------------------------------------------
+#[allow(dead_code)]
+pub(crate) const PERS_DEFAULT: u8 = 0;
+pub(crate) const PERS_GLIBC: u8 = 1;
+
+/// Read the personality byte for a given pid (0 if invalid pid).
+pub(crate) fn get_personality(pid: usize) -> u8 {
+    if pid == 0 || pid > MAX_PROCS { return 0; }
+    PROCESSES[pid - 1].personality.load(core::sync::atomic::Ordering::Acquire)
+}
 
 // Signal constants
 pub(crate) const _SA_NOCLDSTOP: u64 = 1;

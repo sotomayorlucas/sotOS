@@ -866,7 +866,11 @@ pub(crate) fn sys_open(ctx: &mut SyscallContext, msg: &IpcMsg) {
             return;
         }
 
-        // Step 2: Try initrd
+        // Step 2: Try initrd (skip for GLIBC processes on library paths —
+        // prevents glibc ld.so from loading musl libc from initrd, which
+        // causes a fatal dual-libc assertion crash)
+        let skip_initrd = get_personality(ctx.pid) == PERS_GLIBC
+            && (starts_with(name, b"/lib/") || starts_with(name, b"/usr/lib/"));
         let mut basename_start = 0usize;
         for idx in 0..path_len {
             if name[idx] == b'/' { basename_start = idx + 1; }
@@ -874,7 +878,7 @@ pub(crate) fn sys_open(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let basename = &name[basename_start..];
         let mut opened_initrd = false;
 
-        if !basename.is_empty() {
+        if !skip_initrd && !basename.is_empty() {
             let mut slot = None;
             for s in 0..GRP_MAX_INITRD {
                 if ctx.initrd_files[s][0] == 0 { slot = Some(s); break; }
@@ -1277,7 +1281,11 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
             return;
         }
 
-        // Step 2: Try initrd
+        // Step 2: Try initrd (skip for GLIBC processes on library paths —
+        // prevents glibc ld.so from loading musl libc from initrd, which
+        // causes a fatal dual-libc assertion crash)
+        let skip_initrd = get_personality(ctx.pid) == PERS_GLIBC
+            && (starts_with(name, b"/lib/") || starts_with(name, b"/usr/lib/"));
         let mut basename_start = 0usize;
         for idx in 0..path_len {
             if name[idx] == b'/' { basename_start = idx + 1; }
@@ -1285,7 +1293,7 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let basename = &name[basename_start..];
         let mut opened_initrd = false;
 
-        if !basename.is_empty() {
+        if !skip_initrd && !basename.is_empty() {
             let mut slot = None;
             for s in 0..GRP_MAX_INITRD {
                 if ctx.initrd_files[s][0] == 0 { slot = Some(s); break; }
