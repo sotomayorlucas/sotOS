@@ -1494,7 +1494,26 @@ pub(crate) fn sys_getsockopt(ctx: &mut SyscallContext, msg: &IpcMsg) {
     reply_val(ep_cap, 0);
 }
 
-pub(crate) fn sys_shutdown(ctx: &mut SyscallContext, _msg: &IpcMsg) {
+pub(crate) fn sys_shutdown(ctx: &mut SyscallContext, msg: &IpcMsg) {
+    let fd = msg.regs[0] as usize;
+    let how = msg.regs[1] as u32;
+    // For AF_UNIX socketpair (kind 27/28), shutdown SHUT_WR marks the
+    // write direction as closed so poll/epoll detects POLLHUP on the peer.
+    if fd < GRP_MAX_FDS {
+        let kind = ctx.child_fds[fd];
+        if (kind == 27 || kind == 28) && (how == 1 || how == 2) {
+            // SHUT_WR (1) or SHUT_RDWR (2): mark the pipe as write-closed
+            let conn = ctx.sock_conn_id[fd] as usize;
+            if conn < crate::fd::MAX_UNIX_CONNS {
+                let pipe_id = if kind == 27 {
+                    unsafe { crate::fd::UNIX_CONN_PIPE_A[conn] as usize }
+                } else {
+                    unsafe { crate::fd::UNIX_CONN_PIPE_B[conn] as usize }
+                };
+                crate::fd::pipe_set_write_closed(pipe_id);
+            }
+        }
+    }
     reply_val(ctx.ep_cap, 0);
 }
 

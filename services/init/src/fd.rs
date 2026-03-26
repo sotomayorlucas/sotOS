@@ -410,6 +410,13 @@ pub(crate) fn pipe_reader_closed(pipe_id: usize) -> bool {
     PIPE_READ_CLOSED[pipe_id].load(Ordering::Acquire) != 0
 }
 
+/// Mark a pipe's write direction as closed (used by shutdown SHUT_WR).
+pub(crate) fn pipe_set_write_closed(pipe_id: usize) {
+    if pipe_id < MAX_PIPES {
+        PIPE_WRITE_CLOSED[pipe_id].store(1, Ordering::Release);
+    }
+}
+
 pub(crate) fn pipe_writer_closed(pipe_id: usize) -> bool {
     if pipe_id >= MAX_PIPES { return false; }
     if PIPE_WRITE_CLOSED[pipe_id].load(Ordering::Acquire) == 0 { return false; }

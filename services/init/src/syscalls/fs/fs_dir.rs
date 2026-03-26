@@ -233,12 +233,18 @@ pub(crate) fn sys_getcwd(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let mut cwd_len = 0;
     while cwd_len < GRP_CWD_MAX && ctx.cwd[cwd_len] != 0 { cwd_len += 1; }
     if cwd_len == 0 { cwd_len = 1; ctx.cwd[0] = b'/'; }
+    trace!(Debug, FS, {
+        print(b"GETCWD P"); print_u64(ctx.pid as u64);
+        print(b" len="); print_u64(cwd_len as u64);
+        print(b" ["); for i in 0..cwd_len.min(40) { sys::debug_print(ctx.cwd[i]); } print(b"]");
+    });
     if size > cwd_len {
         let mut tmp = [0u8; GRP_CWD_MAX + 1];
         tmp[..cwd_len].copy_from_slice(&ctx.cwd[..cwd_len]);
         tmp[cwd_len] = 0;
         ctx.guest_write(buf_addr, &tmp[..cwd_len + 1]);
-        reply_val(ctx.ep_cap, buf_addr as i64);
+        // Linux raw syscall returns length (including NUL), not pointer
+        reply_val(ctx.ep_cap, (cwd_len + 1) as i64);
     } else {
         reply_val(ctx.ep_cap, -ERANGE);
     }
