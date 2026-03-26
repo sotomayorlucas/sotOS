@@ -230,6 +230,15 @@ pub(crate) extern "C" fn child_handler() -> ! {
             },
         };
 
+        // SIGKILL check: if another process killed us, exit the handler loop.
+        // Without this, a killed process keeps issuing syscalls (read→0 spin).
+        if PROCESSES[pid - 1].state.load(Ordering::Acquire) == 2 {
+            trace!(Info, PROCESS, {
+                print(b"ZOMBIE-EXIT P"); print_u64(pid as u64);
+            });
+            break;
+        }
+
         // Cache the kernel thread ID for async signal injection
         let kernel_tid = msg.regs[6];
         if kernel_tid != 0 {
