@@ -1209,7 +1209,10 @@ pub(crate) fn sys_recvmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 if nonblock {
                     reply_val(ep_cap, -EAGAIN);
                 } else {
-                    // Block: retry via PIPE_RETRY_TAG
+                    // Block: yield then retry via PIPE_RETRY_TAG.
+                    // Without yield, the retry loop starves other processes
+                    // (e.g., P3 recvmsg spins waiting for P5 to finish init).
+                    for _ in 0..8 { sys::yield_now(); }
                     mark_pipe_retry_on(ctx.pid, pipe_id);
                     let reply = sotos_common::IpcMsg { tag: sotos_common::PIPE_RETRY_TAG, regs: [0; 8] };
                     let _ = sys::send(ep_cap, &reply);

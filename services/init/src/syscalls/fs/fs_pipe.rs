@@ -101,6 +101,8 @@ pub(crate) fn read_pipe(ctx: &mut SyscallContext, fd: usize, buf_ptr: u64, len: 
                 // pipe_writer_closed() returns true -> normal EOF.
             }
         }
+        // Yield before retry to avoid starving other processes
+        for _ in 0..8 { sys::yield_now(); }
         mark_pipe_retry_on(ctx.pid, pipe_id);
         let reply = sotos_common::IpcMsg {
             tag: sotos_common::PIPE_RETRY_TAG,
@@ -144,6 +146,7 @@ pub(crate) fn read_unix_socket(ctx: &mut SyscallContext, fd: usize, buf_ptr: u64
         } else if pipe_writer_closed(pipe_id) {
             reply_val(ctx.ep_cap, 0); // EOF
         } else {
+            for _ in 0..8 { sys::yield_now(); }
             mark_pipe_retry_on(ctx.pid, pipe_id);
             let reply = sotos_common::IpcMsg {
                 tag: sotos_common::PIPE_RETRY_TAG,
@@ -286,7 +289,8 @@ pub(crate) fn readv_pipe(ctx: &mut SyscallContext, fd: usize, iov_ptr: u64, iovc
         });
         reply_val(ctx.ep_cap, 0); // EOF
     } else {
-        // No data, writer alive -- ask kernel to retry
+        // No data, writer alive -- yield then ask kernel to retry
+        for _ in 0..8 { sys::yield_now(); }
         mark_pipe_retry_on(ctx.pid, pipe_id);
         let reply = sotos_common::IpcMsg {
             tag: sotos_common::PIPE_RETRY_TAG,
