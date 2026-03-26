@@ -39,19 +39,20 @@ fn wine_patch_shared_user_data(ctx: &mut SyscallContext, addr: u64) {
     // Read current SystemCall byte at offset 0x308
     let mut flag = [0u8; 1];
     ctx.guest_read(0x7ffe0308, &mut flag);
-    print(b"WINE-KUSD P"); crate::framebuffer::print_u64(ctx.pid as u64);
-    print(b" [0x308]="); crate::framebuffer::print_u64(flag[0] as u64);
+    trace!(Debug, MM, {
+        print(b"WINE-KUSD P"); crate::framebuffer::print_u64(ctx.pid as u64);
+        print(b" [0x308]="); crate::framebuffer::print_u64(flag[0] as u64)
+    });
 
     if flag[0] & 1 == 0 {
         ctx.guest_write(0x7ffe0308, &[1u8]);
-        print(b" ->1");
     }
 
     // Set up dispatcher pointer at 0x7ffe1000
     let pid = ctx.pid;
     let ntdll_base = unsafe { (*NTDLL_SO_BASE.get())[pid] };
     if ntdll_base == 0 {
-        print(b" NO-BASE\n");
+        trace!(Debug, MM, { print(b"WINE-KUSD NO-BASE") });
         return;
     }
     // __wine_syscall_dispatcher at file offset 0x3caf4 in ntdll.so
@@ -60,7 +61,6 @@ fn wine_patch_shared_user_data(ctx: &mut SyscallContext, addr: u64) {
     let mut disp_ptr = [0u8; 8];
     ctx.guest_read(0x7ffe1000, &mut disp_ptr);
     let ptr_val = u64::from_le_bytes(disp_ptr);
-    print(b" disp="); crate::framebuffer::print_hex64(ptr_val);
 
     if ptr_val == 0 {
         // Try writing directly first (page may already be mapped by Wine)
@@ -70,7 +70,9 @@ fn wine_patch_shared_user_data(ctx: &mut SyscallContext, addr: u64) {
         ctx.guest_read(0x7ffe1000, &mut disp_ptr);
         let check = u64::from_le_bytes(disp_ptr);
         if check == disp_addr {
-            print(b" wrote-disp="); crate::framebuffer::print_hex64(disp_addr);
+            trace!(Debug, MM, {
+                print(b"WINE-KUSD wrote-disp="); crate::framebuffer::print_hex64(disp_addr)
+            });
             unsafe { (*WINE_KUSD_DONE.get())[ctx.pid] = true; }
         } else {
             // Page not mapped — allocate and map it
@@ -78,7 +80,9 @@ fn wine_patch_shared_user_data(ctx: &mut SyscallContext, addr: u64) {
                 if ctx.guest_map(0x7ffe1000, f, 2).is_ok() {
                     ctx.guest_zero_page(0x7ffe1000);
                     ctx.guest_write(0x7ffe1000, &ptr_bytes);
-                    print(b" mapped-disp="); crate::framebuffer::print_hex64(disp_addr);
+                    trace!(Debug, MM, {
+                        print(b"WINE-KUSD mapped-disp="); crate::framebuffer::print_hex64(disp_addr)
+                    });
                     unsafe { (*WINE_KUSD_DONE.get())[ctx.pid] = true; }
                 }
             }
@@ -87,12 +91,13 @@ fn wine_patch_shared_user_data(ctx: &mut SyscallContext, addr: u64) {
         // Wine wrote something else — overwrite with correct dispatcher
         let ptr_bytes = disp_addr.to_le_bytes();
         ctx.guest_write(0x7ffe1000, &ptr_bytes);
-        print(b" fix-disp="); crate::framebuffer::print_hex64(disp_addr);
+        trace!(Debug, MM, {
+            print(b"WINE-KUSD fix-disp="); crate::framebuffer::print_hex64(disp_addr)
+        });
         unsafe { (*WINE_KUSD_DONE.get())[ctx.pid] = true; }
     } else {
         unsafe { (*WINE_KUSD_DONE.get())[ctx.pid] = true; }
     }
-    print(b"\n");
 }
 /// MAP_NORESERVE: don't reserve swap (we treat as hint for lazy alloc).
 const MAP_NORESERVE_FLAG: u32 = 0x4000;
@@ -165,13 +170,14 @@ pub(crate) fn sys_mmap(ctx: &mut SyscallContext, msg: &IpcMsg) {
     // binary search generates thousands of these, flooding serial).
     let is_noreplace_probe = prot == 0 && (flags & MAP_FIXED_NOREPLACE_FLAG) != 0;
     if !is_noreplace_probe && ctx.pid >= 6 {
-        print(b"MMAP P"); crate::framebuffer::print_u64(ctx.pid as u64);
-        print(b" addr="); crate::framebuffer::print_hex64(req_addr);
-        print(b" fd="); crate::framebuffer::print_u64(fd as u64);
-        print(b" len="); crate::framebuffer::print_hex64(len);
-        print(b" prot="); crate::framebuffer::print_u64(prot);
-        print(b" fl="); crate::framebuffer::print_hex64(flags as u64);
-        print(b"\n");
+        trace!(Debug, MM, {
+            print(b"mmap P"); crate::framebuffer::print_u64(ctx.pid as u64);
+            print(b" addr="); crate::framebuffer::print_hex64(req_addr);
+            print(b" fd="); crate::framebuffer::print_u64(fd as u64);
+            print(b" len="); crate::framebuffer::print_hex64(len);
+            print(b" prot="); crate::framebuffer::print_u64(prot);
+            print(b" fl="); crate::framebuffer::print_hex64(flags as u64);
+        });
     }
 
     let mflags = MFlags::from_bits_truncate(flags);
@@ -191,9 +197,10 @@ pub(crate) fn sys_mmap(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let overlaps = unsafe { VMA_LISTS[ctx.memg].overlaps(req_addr, req_addr + aligned_len) };
         if overlaps {
             if ctx.pid == 3 {
-                print(b"MMAP-FAIL P3 -EEXIST addr="); crate::framebuffer::print_hex64(req_addr);
-                print(b" len="); crate::framebuffer::print_hex64(aligned_len);
-                print(b"\n");
+                trace!(Error, MM, {
+                    print(b"MMAP-FAIL P3 -EEXIST addr="); crate::framebuffer::print_hex64(req_addr);
+                    print(b" len="); crate::framebuffer::print_hex64(aligned_len)
+                });
             }
             reply_val(ctx.ep_cap, -EEXIST);
             return;
@@ -248,9 +255,10 @@ pub(crate) fn sys_mmap(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let ntdll_fd = unsafe { (*NTDLL_SO_FD.get())[ctx.pid] };
         if ntdll_fd != 0xFF && fd as u8 == ntdll_fd {
             unsafe { (*NTDLL_SO_BASE.get())[ctx.pid] = base; }
-            print(b"NTDLL-BASE P"); crate::framebuffer::print_u64(ctx.pid as u64);
-            print(b" base="); crate::framebuffer::print_hex64(base);
-            print(b"\n");
+            trace!(Debug, MM, {
+                print(b"NTDLL-BASE P"); crate::framebuffer::print_u64(ctx.pid as u64);
+                print(b" base="); crate::framebuffer::print_hex64(base)
+            });
             // Re-trigger SharedUserData patch now that we know the ntdll base.
             // The 0x7ffe0000 mmap may have happened BEFORE ntdll base was known,
             // causing the patch to bail with "NO-BASE". Now we can compute the
@@ -341,9 +349,10 @@ pub(crate) fn sys_mmap(ctx: &mut SyscallContext, msg: &IpcMsg) {
 
         if file_data == 0 && !is_vfs {
             if ctx.pid == 3 {
-                print(b"MMAP-FAIL P3 -EBADF fd="); crate::framebuffer::print_u64(fd as u64);
-                print(b" kind="); crate::framebuffer::print_u64(if fdu < GRP_MAX_FDS { ctx.child_fds[fdu] as u64 } else { 99 });
-                print(b"\n");
+                trace!(Error, MM, {
+                    print(b"MMAP-FAIL P3 -EBADF fd="); crate::framebuffer::print_u64(fd as u64);
+                    print(b" kind="); crate::framebuffer::print_u64(if fdu < GRP_MAX_FDS { ctx.child_fds[fdu] as u64 } else { 99 })
+                });
             }
             reply_val(ctx.ep_cap, -EBADF);
             return;
@@ -395,9 +404,10 @@ pub(crate) fn sys_mmap(ctx: &mut SyscallContext, msg: &IpcMsg) {
             reply_val(ctx.ep_cap, base as i64);
         } else {
             if ctx.pid >= 3 {
-                print(b"MMAP-FAIL P"); crate::framebuffer::print_u64(ctx.pid as u64);
-                print(b" -ENOMEM(file) pages="); crate::framebuffer::print_u64(pages);
-                print(b"\n");
+                trace!(Error, MM, {
+                    print(b"MMAP-FAIL P"); crate::framebuffer::print_u64(ctx.pid as u64);
+                    print(b" -ENOMEM(file) pages="); crate::framebuffer::print_u64(pages)
+                });
             }
             reply_val(ctx.ep_cap, -ENOMEM);
         }
@@ -426,11 +436,12 @@ pub(crate) fn sys_mmap(ctx: &mut SyscallContext, msg: &IpcMsg) {
     } else {
         if ctx.pid >= 3 {
             let free = sys::debug_free_frames();
-            print(b"MMAP-FAIL P"); crate::framebuffer::print_u64(ctx.pid as u64);
-            print(b" -ENOMEM(anon) pg="); crate::framebuffer::print_u64(pages);
-            print(b" base="); crate::framebuffer::print_hex64(base);
-            print(b" free="); crate::framebuffer::print_u64(free);
-            print(b"\n");
+            trace!(Error, MM, {
+                print(b"MMAP-FAIL P"); crate::framebuffer::print_u64(ctx.pid as u64);
+                print(b" -ENOMEM(anon) pg="); crate::framebuffer::print_u64(pages);
+                print(b" base="); crate::framebuffer::print_hex64(base);
+                print(b" free="); crate::framebuffer::print_u64(free)
+            });
         }
         reply_val(ctx.ep_cap, -ENOMEM);
     }

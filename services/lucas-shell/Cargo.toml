@@ -5,6 +5,11 @@ edition = "2021"
 
 [dependencies]
 sotos-lua = { path = "../../libs/sotos-lua" }
+sotos-common = { path = "../../libs/sotos-common" }
+
+[features]
+default = ["trace"]
+trace = []
 
 [profile.dev]
 panic = "abort"

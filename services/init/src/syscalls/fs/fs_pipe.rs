@@ -20,10 +20,10 @@ pub(crate) fn read_pipe(ctx: &mut SyscallContext, fd: usize, buf_ptr: u64, len: 
     let want = len.min(4096);
     let mut tmp = [0u8; 4096];
     let n = pipe_read(pipe_id, &mut tmp[..want]);
-    // Diagnostic: trace pipe reads for P7
-    if ctx.pid == 7 {
+    trace!(Trace, FS, {
         let wc = pipe_writer_closed(pipe_id);
-        print(b"PIRD P7 fd="); print_u64(fd as u64);
+        print(b"PIPE-RD P"); print_u64(ctx.pid as u64);
+        print(b" fd="); print_u64(fd as u64);
         print(b" pipe="); print_u64(pipe_id as u64);
         print(b" n="); print_u64(n as u64);
         print(b" wc="); print_u64(wc as u64);
@@ -38,8 +38,7 @@ pub(crate) fn read_pipe(ctx: &mut SyscallContext, fd: usize, buf_ptr: u64, len: 
             }
             print(b"]");
         }
-        print(b"\n");
-    }
+    });
     if n > 0 {
         crate::child_handler::clear_pipe_stall(ctx.pid);
         ctx.guest_write(buf_ptr, &tmp[..n]);
@@ -80,11 +79,12 @@ pub(crate) fn read_pipe(ctx: &mut SyscallContext, fd: usize, buf_ptr: u64, len: 
                 // Resolve deadlock: close write ends for BOTH pipes
                 // so both processes get natural EOF simultaneously.
                 let other_pipe = unsafe { crate::child_handler::PIPE_STALL_ID[other_pid] } as usize;
-                print(b"PIPE-DEADLOCK: pid="); print_u64(ctx.pid as u64);
-                print(b" pipe="); print_u64(pipe_id as u64);
-                print(b" other="); print_u64(other_pid as u64);
-                print(b" other_pipe="); print_u64(other_pipe as u64);
-                print(b"\n");
+                trace!(Error, FS, {
+                    print(b"PIPE-DEADLOCK pid="); print_u64(ctx.pid as u64);
+                    print(b" pipe="); print_u64(pipe_id as u64);
+                    print(b" other="); print_u64(other_pid as u64);
+                    print(b" other_pipe="); print_u64(other_pipe as u64);
+                });
                 crate::fd::pipe_close_all_writers(pipe_id);
                 if other_pipe < crate::fd::MAX_PIPES && other_pipe != pipe_id {
                     crate::fd::pipe_close_all_writers(other_pipe);
@@ -122,19 +122,21 @@ pub(crate) fn read_unix_socket(ctx: &mut SyscallContext, fd: usize, buf_ptr: u64
         let want = len.min(4096);
         let mut tmp = [0u8; 4096];
         let n = pipe_read(pipe_id, &mut tmp[..want]);
-        // Diagnostic: dump Unix socket read data for P7
-        if ctx.pid == 7 && n > 0 {
-            print(b"UXRD P7 fd="); print_u64(fd as u64);
-            print(b" n="); print_u64(n as u64);
-            print(b" [");
-            for i in 0..n.min(16) {
-                let hi = tmp[i] >> 4;
-                let lo = tmp[i] & 0xF;
-                let hc = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
-                let lc = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
-                print(&[hc, lc]);
-            }
-            print(b"]\n");
+        if n > 0 {
+            trace!(Trace, FS, {
+                print(b"UXRD P"); print_u64(ctx.pid as u64);
+                print(b" fd="); print_u64(fd as u64);
+                print(b" n="); print_u64(n as u64);
+                print(b" [");
+                for i in 0..n.min(16) {
+                    let hi = tmp[i] >> 4;
+                    let lo = tmp[i] & 0xF;
+                    let hc = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
+                    let lc = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
+                    print(&[hc, lc]);
+                }
+                print(b"]");
+            });
         }
         if n > 0 {
             ctx.guest_write(buf_ptr, &tmp[..n]);
@@ -157,14 +159,12 @@ pub(crate) fn read_unix_socket(ctx: &mut SyscallContext, fd: usize, buf_ptr: u64
 /// Handle sys_write for pipe write end (kind=11).
 pub(crate) fn write_pipe(ctx: &mut SyscallContext, fd: usize, buf_ptr: u64, len: usize) {
     let pipe_id = ctx.sock_conn_id[fd] as usize;
-    // Pipe write tracing (disabled for performance)
-    if false && ctx.pid >= 2 && len > 60 {
-        print(b"PW P"); print_u64(ctx.pid as u64);
+    trace!(Trace, FS, {
+        print(b"PIPE-WR P"); print_u64(ctx.pid as u64);
         print(b" fd="); print_u64(fd as u64);
         print(b" pipe="); print_u64(pipe_id as u64);
         print(b" len="); print_u64(len as u64);
-        print(b"\n");
-    }
+    });
     let mut total_written = 0usize;
     let mut broken = false;
     while total_written < len && !broken {
@@ -182,12 +182,13 @@ pub(crate) fn write_pipe(ctx: &mut SyscallContext, fd: usize, buf_ptr: u64, len:
         }
         total_written += off;
     }
-    if ctx.pid >= 2 && total_written != len {
-        print(b"PW-PARTIAL P"); print_u64(ctx.pid as u64);
-        print(b" fd="); print_u64(fd as u64);
-        print(b" wrote="); print_u64(total_written as u64);
-        print(b"/"); print_u64(len as u64);
-        print(b"\n");
+    if total_written != len {
+        trace!(Error, FS, {
+            print(b"PW-PARTIAL P"); print_u64(ctx.pid as u64);
+            print(b" fd="); print_u64(fd as u64);
+            print(b" wrote="); print_u64(total_written as u64);
+            print(b"/"); print_u64(len as u64);
+        });
     }
     if total_written > 0 {
         reply_val(ctx.ep_cap, total_written as i64);
@@ -256,36 +257,33 @@ pub(crate) fn readv_pipe(ctx: &mut SyscallContext, fd: usize, iov_ptr: u64, iovc
         let mut local_buf = [0u8; 4096];
         let n = pipe_read(pipe_id, &mut local_buf[..safe_len]);
         if n > 0 {
-            // Trace pipe readv for P3 to detect heap corruption source
-            if ctx.pid == 3 {
-                print(b"PRV P3 base="); crate::framebuffer::print_hex64(base);
+            trace!(Trace, FS, {
+                print(b"PIPE-RV P"); print_u64(ctx.pid as u64);
+                print(b" base="); crate::framebuffer::print_hex64(base);
                 print(b" ilen="); print_u64(ilen as u64);
                 print(b" n="); print_u64(n as u64);
                 print(b" iov="); print_u64(i as u64);
-                print(b"\n");
-            }
+            });
             ctx.guest_write(base, &local_buf[..n]);
         }
         total += n;
         if n < safe_len { break; }
     }
     if total > 0 {
-        // Log data read
-        if ctx.pid >= 3 {
+        trace!(Debug, FS, {
             print(b"PIPEV-R P"); print_u64(ctx.pid as u64);
             print(b" fd="); print_u64(fd as u64);
             print(b" total="); print_u64(total as u64);
             print(b" pipe="); print_u64(pipe_id as u64);
-            print(b"\n");
-        }
+        });
         reply_val(ctx.ep_cap, total as i64);
     } else if pipe_writer_closed(pipe_id) {
-        if ctx.pid >= 3 {
+        trace!(Debug, FS, {
             print(b"PIPEV-R P"); print_u64(ctx.pid as u64);
             print(b" fd="); print_u64(fd as u64);
             print(b" pipe="); print_u64(pipe_id as u64);
-            print(b" EOF\n");
-        }
+            print(b" EOF");
+        });
         reply_val(ctx.ep_cap, 0); // EOF
     } else {
         // No data, writer alive -- ask kernel to retry
@@ -303,24 +301,23 @@ pub(crate) fn writev_pipe(ctx: &mut SyscallContext, fd: usize, iov_ptr: u64, iov
     let pipe_id = ctx.sock_conn_id[fd] as usize;
     let cnt = iovcnt.min(16);
     let mut total = 0usize;
-    // Pipe writev tracing — use guest_read for cross-AS processes (P5 = wineserver)
-    if ctx.pid == 5 && cnt > 0 {
-        // Read iovecs via guest_read (not raw pointer — different address space!)
-        let mut tlen = 0usize;
-        for j in 0..cnt {
-            let e = iov_ptr + (j as u64) * 16;
-            if e + 16 > 0x0000_8000_0000_0000 { break; }
-            let il = ctx.guest_read_u64(e + 8) as usize;
-            tlen += il;
+    trace!(Trace, FS, {
+        if cnt > 0 {
+            let mut tlen = 0usize;
+            for j in 0..cnt {
+                let e = iov_ptr + (j as u64) * 16;
+                if e + 16 > 0x0000_8000_0000_0000 { break; }
+                let il = ctx.guest_read_u64(e + 8) as usize;
+                tlen += il;
+            }
+            print(b"PIPEV-W P"); print_u64(ctx.pid as u64);
+            print(b" fd="); print_u64(fd as u64);
+            print(b" pipe="); print_u64(pipe_id as u64);
+            print(b" len="); print_u64(tlen as u64);
+            print(b" iov="); crate::framebuffer::print_hex64(iov_ptr);
+            print(b" cnt="); print_u64(cnt as u64);
         }
-        print(b"PIPEV-W P"); print_u64(ctx.pid as u64);
-        print(b" fd="); print_u64(fd as u64);
-        print(b" pipe="); print_u64(pipe_id as u64);
-        print(b" len="); print_u64(tlen as u64);
-        print(b" iov="); crate::framebuffer::print_hex64(iov_ptr);
-        print(b" cnt="); print_u64(cnt as u64);
-        print(b"\n");
-    }
+    });
     // Compute expected total for partial-write detection
     let mut expected_total = 0usize;
     for j in 0..cnt {
@@ -329,19 +326,18 @@ pub(crate) fn writev_pipe(ctx: &mut SyscallContext, fd: usize, iov_ptr: u64, iov
         let il = ctx.guest_read_u64(e + 8) as usize;
         expected_total += il;
     }
-    // Dump iovec details for P2 pipe writev (Wine partial write debugging)
-    if ctx.pid == 2 {
+    trace!(Trace, FS, {
         for j in 0..cnt.min(4) {
             let e = iov_ptr + (j as u64) * 16;
             if e + 16 > 0x0000_8000_0000_0000 { break; }
             let b = ctx.guest_read_u64(e);
             let l = ctx.guest_read_u64(e + 8);
-            print(b"IOV P2 ["); print_u64(j as u64);
+            print(b"IOV P"); print_u64(ctx.pid as u64);
+            print(b" ["); print_u64(j as u64);
             print(b"] b="); crate::framebuffer::print_hex64(b);
             print(b" l="); print_u64(l);
-            print(b"\n");
         }
-    }
+    });
     // Pre-read ALL iovec entries in one bulk guest_read to avoid
     // per-entry vm_read races with CoW page faults.
     let mut iov_raw = [0u8; 16 * 16]; // max 16 iovecs * 16 bytes each
@@ -376,29 +372,28 @@ pub(crate) fn writev_pipe(ctx: &mut SyscallContext, fd: usize, iov_ptr: u64, iov
         total += iov_written;
         if iov_written < ilen { break; }
     }
-    // Diagnostic: detect partial writes (Wine IPC failure root cause)
-    if total != expected_total && expected_total > 0 && ctx.pid >= 2 {
-        print(b"PIPEV-PARTIAL P"); print_u64(ctx.pid as u64);
-        print(b" fd="); print_u64(fd as u64);
-        print(b" wrote="); print_u64(total as u64);
-        print(b"/"); print_u64(expected_total as u64);
-        print(b" as="); print_u64(ctx.child_as_cap);
-        print(b" cnt="); print_u64(cnt as u64);
-        // Dump iovec details
-        for j in 0..cnt.min(4) {
-            let e = iov_ptr + (j as u64) * 16;
-            if e + 16 > 0x0000_8000_0000_0000 { break; }
-            let b = ctx.guest_read_u64(e);
-            let l = ctx.guest_read_u64(e + 8);
-            print(b" ["); print_u64(b); print(b","); print_u64(l); print(b"]");
-        }
-        print(b"\n");
+    if total != expected_total && expected_total > 0 {
+        trace!(Error, FS, {
+            print(b"PIPEV-PARTIAL P"); print_u64(ctx.pid as u64);
+            print(b" fd="); print_u64(fd as u64);
+            print(b" wrote="); print_u64(total as u64);
+            print(b"/"); print_u64(expected_total as u64);
+            print(b" as="); print_u64(ctx.child_as_cap);
+            print(b" cnt="); print_u64(cnt as u64);
+            for j in 0..cnt.min(4) {
+                let e = iov_ptr + (j as u64) * 16;
+                if e + 16 > 0x0000_8000_0000_0000 { break; }
+                let b = ctx.guest_read_u64(e);
+                let l = ctx.guest_read_u64(e + 8);
+                print(b" ["); print_u64(b); print(b","); print_u64(l); print(b"]");
+            }
+        });
     }
-    if ctx.pid == 2 {
-        print(b"WRITEV-RET P2 total="); print_u64(total as u64);
+    trace!(Trace, FS, {
+        print(b"WRITEV-RET P"); print_u64(ctx.pid as u64);
+        print(b" total="); print_u64(total as u64);
         print(b" exp="); print_u64(expected_total as u64);
-        print(b"\n");
-    }
+    });
     reply_val(ctx.ep_cap, total as i64);
 }
 
@@ -452,12 +447,13 @@ pub(crate) fn writev_unix_socket(ctx: &mut SyscallContext, fd: usize, iov_ptr: u
             let il = u64::from_le_bytes(iov_unix[off+8..off+16].try_into().unwrap()) as usize;
             expected += il;
         }
-        if total != expected && expected > 0 && ctx.pid >= 2 {
-            print(b"UXW-PARTIAL P"); print_u64(ctx.pid as u64);
-            print(b" wrote="); print_u64(total as u64);
-            print(b"/"); print_u64(expected as u64);
-            print(b" cnt="); print_u64(cnt as u64);
-            print(b"\n");
+        if total != expected && expected > 0 {
+            trace!(Error, FS, {
+                print(b"UXW-PARTIAL P"); print_u64(ctx.pid as u64);
+                print(b" wrote="); print_u64(total as u64);
+                print(b"/"); print_u64(expected as u64);
+                print(b" cnt="); print_u64(cnt as u64);
+            });
         }
         reply_val(ctx.ep_cap, total as i64);
     } else {
@@ -564,13 +560,12 @@ pub(crate) fn sys_pipe(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 buf[4..].copy_from_slice(&(w as i32).to_le_bytes());
                 ctx.guest_write(msg.regs[0], &buf);
             }
-            if ctx.pid >= 3 {
+            trace!(Debug, FS, {
                 print(b"FD-PIPE P"); print_u64(ctx.pid as u64);
                 print(b" r="); print_u64(r as u64);
                 print(b" w="); print_u64(w as u64);
                 print(b" pipe="); print_u64(pipe_id as u64);
-                print(b"\n");
-            }
+            });
             reply_val(ctx.ep_cap, 0);
         } else {
             reply_val(ctx.ep_cap, -EMFILE);
@@ -609,14 +604,13 @@ pub(crate) fn sys_pipe2(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 buf[4..].copy_from_slice(&(w as i32).to_le_bytes());
                 ctx.guest_write(pipefd_ptr, &buf);
             }
-            if ctx.pid >= 5 {
+            trace!(Debug, FS, {
                 print(b"PIPE2 P"); print_u64(ctx.pid as u64); print(b" r="); print_u64(r as u64);
                 print(b"(k="); print_u64(ctx.child_fds[r] as u64);
                 print(b") w="); print_u64(w as u64);
                 print(b"(k="); print_u64(ctx.child_fds[w] as u64);
                 print(b") pipe="); print_u64(pipe_id as u64);
-                print(b"\n");
-            }
+            });
             reply_val(ctx.ep_cap, 0);
         } else { reply_val(ctx.ep_cap, -EMFILE); }
     } else { reply_val(ctx.ep_cap, -EMFILE); }

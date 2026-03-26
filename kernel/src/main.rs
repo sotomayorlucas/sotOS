@@ -30,6 +30,7 @@ mod shm;
 mod svc_registry;
 mod sync;
 mod syscall;
+pub mod trace;
 mod user;
 pub mod watchdog;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -140,14 +141,14 @@ extern "C" fn kmain() -> ! {
 
     // CPU structures.
     arch::gdt::init();
-    kdebug!("[ok] GDT");
+    kinfo!(sotos_common::trace::cat::PROCESS, "[ok] GDT");
 
     // Enable SSE/SSE2 so userspace can use SIMD instructions (musl requires it).
     enable_sse();
-    kdebug!("[ok] SSE");
+    kinfo!(sotos_common::trace::cat::PROCESS, "[ok] SSE");
 
     arch::idt::init();
-    kdebug!("[ok] IDT");
+    kinfo!(sotos_common::trace::cat::PROCESS, "[ok] IDT");
 
     // Physical frame allocator from bootloader memory map.
     let mmap_response = MEMORY_MAP_REQUEST
@@ -158,19 +159,19 @@ extern "C" fn kmain() -> ! {
         .expect("bootloader: no HHDM");
 
     mm::init(mmap_response, hhdm_response.offset());
-    kdebug!("[ok] Frame allocator");
+    kinfo!(sotos_common::trace::cat::MM, "[ok] Frame allocator");
 
     // Slab allocator (kernel heap).
     mm::slab::init();
-    kdebug!("[ok] Slab allocator");
+    kinfo!(sotos_common::trace::cat::MM, "[ok] Slab allocator");
 
     // Per-CPU data (GS base). Must be after slab init (heap-allocated).
     let bsp_percpu = arch::percpu::init_bsp();
-    kdebug!("[ok] PerCpu (BSP)");
+    kinfo!(sotos_common::trace::cat::PROCESS, "[ok] PerCpu (BSP)");
 
     // Per-CPU GDT + TSS (replaces early-boot static GDT).
     arch::gdt::init_percpu(bsp_percpu);
-    kdebug!("[ok] Per-CPU GDT+TSS (BSP)");
+    kinfo!(sotos_common::trace::cat::PROCESS, "[ok] Per-CPU GDT+TSS (BSP)");
 
     // Smoke test: prove alloc works.
     {
@@ -179,7 +180,7 @@ extern "C" fn kmain() -> ! {
         v.push(2);
         v.push(3);
         assert_eq!(v.iter().sum::<u64>(), 6);
-        kdebug!("[ok] Heap (Vec test)");
+        kinfo!(sotos_common::trace::cat::MM, "[ok] Heap (Vec test)");
     }
 
     // Save boot CR3 before any address space changes.
@@ -187,34 +188,34 @@ extern "C" fn kmain() -> ! {
 
     // Capability system.
     cap::init();
-    kdebug!("[ok] Capabilities");
+    kinfo!(sotos_common::trace::cat::IPC, "[ok] Capabilities");
 
     // Scheduler.
     sched::init();
-    kdebug!("[ok] Scheduler");
+    kinfo!(sotos_common::trace::cat::SCHED, "[ok] Scheduler");
 
     // SYSCALL/SYSRET MSRs.
     arch::syscall::init();
-    kdebug!("[ok] SYSCALL/SYSRET");
+    kinfo!(sotos_common::trace::cat::SYSCALL, "[ok] SYSCALL/SYSRET");
 
     // Hardware interrupts.
     arch::pic::init();
-    kdebug!("[ok] PIC");
+    kinfo!(sotos_common::trace::cat::PROCESS, "[ok] PIC");
 
     // LAPIC: per-CPU timer (replaces PIT for preemption).
     arch::lapic::init();
-    kdebug!("[ok] LAPIC");
+    kinfo!(sotos_common::trace::cat::PROCESS, "[ok] LAPIC");
 
     let lapic_ticks = arch::lapic::calibrate();
-    kdebug!("[ok] LAPIC calibrated ({} ticks/10ms)", lapic_ticks);
+    kinfo!(sotos_common::trace::cat::PROCESS, "[ok] LAPIC calibrated ({} ticks/10ms)", lapic_ticks);
 
     // Spawn init process (first userspace code).
     let user_cr3 = spawn_init_process();
-    kdebug!("[ok] Init process");
+    kinfo!(sotos_common::trace::cat::PROCESS, "[ok] Init process");
 
     // Load ELF from initramfs (if present).
     load_initrd(user_cr3);
-    kdebug!("[ok] Initrd");
+    kinfo!(sotos_common::trace::cat::PROCESS, "[ok] Initrd");
 
     // Mask PIT IRQ (no longer needed — using LAPIC timer).
     arch::pic::mask(0);

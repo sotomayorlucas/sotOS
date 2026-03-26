@@ -1,7 +1,7 @@
 use sotos_common::sys;
 use sotos_common::elf::{ElfInfo, LoadSegment, InterpInfo, MAX_LOAD_SEGMENTS};
 use core::sync::atomic::{AtomicU64, Ordering};
-use crate::framebuffer::{print, print_hex64};
+use crate::framebuffer::{print, print_hex64, print_u64};
 use crate::process::NEXT_CHILD_STACK;
 use crate::vdso;
 use crate::{vfs_lock, vfs_unlock, shared_store};
@@ -450,10 +450,12 @@ fn env_key_eq(entry: &[u8; MAX_EXEC_ARG_LEN], key: &[u8]) -> bool {
 }
 
 fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_LEN]], envp: &[[u8; MAX_EXEC_ARG_LEN]], target_as: u64) -> Result<(u64, u64), i64> {
+    trace!(Info, PROCESS, { print(b"EXEC "); print(bin_name); print(b" size="); print_u64(file_size as u64); });
     let elf_data = unsafe { core::slice::from_raw_parts(EXEC_BUF_BASE as *const u8, file_size) };
     let (elf_info, segments, seg_count, interp_info) = match parse_elf_goblin(elf_data) {
         Ok(parsed) => parsed,
         Err(e) => {
+            trace!(Error, PROCESS, { print(b"EXEC ELF parse failed err="); print_u64((-e) as u64); });
             unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
             return Err(e);
         }
@@ -464,9 +466,7 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
     // ET_EXEC uses the fixed address from the ELF (main_base = 0).
     let main_base: u64 = if elf_info.elf_type == 3 {
         let b = NEXT_DYN_BASE.fetch_add(DYN_BASE_SLOT_SIZE, Ordering::SeqCst);
-        crate::framebuffer::print(b"DYN-BASE "); crate::framebuffer::print_hex64(b);
-        crate::framebuffer::print(b" entry="); crate::framebuffer::print_hex64(b + elf_info.entry);
-        crate::framebuffer::print(b"\n");
+        trace!(Debug, PROCESS, { print(b"DYN-BASE 0x"); print_hex64(b); print(b" entry=0x"); print_hex64(b + elf_info.entry); });
         b
     } else {
         0
@@ -550,7 +550,31 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
             Err(_) => {
                 let mut vfs_size: usize = 0;
                 let interp_full = &elf_data[interp.offset..interp.offset + interp.len];
-                for try_path in [interp_full, interp_name].iter() {
+
+                // Build sysroot-prefixed path for PERS_GLIBC interpreters
+                let mut sysroot_buf = [0u8; 80];
+                let sysroot_path: Option<&[u8]> = if is_glibc {
+                    let pfx = b"/sysroot/debian";
+                    let full_len = interp.len;
+                    let total = pfx.len() + full_len;
+                    if total <= 79 {
+                        sysroot_buf[..pfx.len()].copy_from_slice(pfx);
+                        sysroot_buf[pfx.len()..total].copy_from_slice(interp_full);
+                        Some(&sysroot_buf[..total])
+                    } else { None }
+                } else { None };
+
+                // Try: full path, basename, then sysroot-prefixed path (glibc only)
+                let try_paths: [Option<&[u8]>; 3] = [
+                    Some(interp_full),
+                    Some(interp_name),
+                    sysroot_path,
+                ];
+                for try_path_opt in try_paths.iter() {
+                    let try_path = match try_path_opt {
+                        Some(p) => *p,
+                        None => continue,
+                    };
                     vfs_lock();
                     let result = unsafe { shared_store() }.and_then(|store| {
                         use sotos_objstore::ROOT_OID;
@@ -567,9 +591,7 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
                     if let Some(sz) = result { vfs_size = sz; break; }
                 }
                 if vfs_size == 0 {
-                    print(b"EXEC: interpreter not found: ");
-                    print(interp_name);
-                    print(b"\n");
+                    trace!(Error, PROCESS, { print(b"EXEC interp not found: "); print(interp_name); });
                     unmap_temp_buf(INTERP_BUF_BASE, INTERP_BUF_PAGES);
                     unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
                     return Err(-2);
@@ -966,6 +988,7 @@ fn exec_loaded_elf(file_size: usize, bin_name: &[u8], argv: &[[u8; MAX_EXEC_ARG_
     LAST_EXEC_HAS_INTERP.store(if is_dynamic { interp_base } else { 0 }, Ordering::Release);
 
     unmap_temp_buf(EXEC_BUF_BASE, EXEC_BUF_PAGES);
+    trace!(Info, PROCESS, { print(b"EXEC spawn ok ep=0x"); print_hex64(new_ep); print(b" thread=0x"); print_hex64(new_thread); });
     Ok((new_ep, new_thread))
 }
 

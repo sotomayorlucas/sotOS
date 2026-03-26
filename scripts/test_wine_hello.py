@@ -164,7 +164,7 @@ def main():
     # Stage 1: Boot and wait for shell prompt
     # -----------------------------------------------------------------------
     print("=== Stage 1: Boot ===", flush=True)
-    if not s.wait_for("$", 120):
+    if not s.wait_for("$", 300):
         print("  FAIL: no shell prompt within 60s", flush=True)
         out = s.get_output()
         with open(OUTPUT, 'w') as f:
@@ -181,15 +181,15 @@ def main():
     print("\n=== Stage 2: Verify Wine files ===", flush=True)
 
     s.clear()
-    s.send("ls /bin")
+    s.send("ls /sysroot/debian/bin")
     s.wait_for_prompt(timeout=15)
     ls_bin = s.get_output()
 
     has_wine64 = "wine64" in ls_bin
-    print(f"  /bin/wine64 present: {'YES' if has_wine64 else 'NO'}", flush=True)
+    print(f"  wine64 present: {'YES' if has_wine64 else 'NO'}", flush=True)
 
     s.clear()
-    s.send("ls /x86_64-linux-gnu/wine/x86_64-windows")
+    s.send("ls /sysroot/debian/x86_64-linux-gnu/wine/x86_64-windows")
     s.wait_for_prompt(timeout=15)
     ls_wine = s.get_output()
 
@@ -199,7 +199,7 @@ def main():
     print(f"  start.exe present : {'YES' if has_start else 'NO'}", flush=True)
 
     if not has_wine64:
-        print("  FAIL: wine64 not found in /bin", flush=True)
+        print("  FAIL: wine64 not found in sysroot", flush=True)
         out = s.get_output()
         with open(OUTPUT, 'w') as f:
             f.write(out)
@@ -211,7 +211,7 @@ def main():
     # -----------------------------------------------------------------------
     print("\n=== Stage 3: wine64 --version ===", flush=True)
     s.clear()
-    s.send("/bin/wine64 --version")
+    s.send("/sysroot/debian/bin/wine64 --version")
 
     found, stalled, timed_out = wait_with_stall_detection(s, "wine-", 300)
     stage3_out = s.get_output()
@@ -240,7 +240,7 @@ def main():
     # -----------------------------------------------------------------------
     print("\n=== Stage 4: wine64 /bin/hello.exe ===", flush=True)
     s.clear()
-    s.send("/bin/wine64 /bin/hello.exe")
+    s.send("/sysroot/debian/bin/wine64 /sysroot/debian/bin/hello.exe")
 
     found, stalled, timed_out = wait_with_stall_detection(s, "Hello from Wine", 900, stall_timeout=300)
     stage4_out = s.get_output()

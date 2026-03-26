@@ -117,11 +117,11 @@ fn sysroot_init(store: &mut ObjectStore) {
     // (needed by xkbcommon for keyboard layouts — weston requires this)
     if let Ok(usr_oid) = store.resolve_path(b"usr", ROOT_OID) {
         if let Some(share_oid) = store.find_in(b"share", usr_oid) {
-            print(b"XKB: creating /usr/share/X11...\n");
+            trace!(Debug, FS, { print(b"XKB: creating /usr/share/X11..."); });
             if store.find_in(b"X11", share_oid).is_none() {
                 match store.mkdir(b"X11", share_oid) {
-                    Ok(_) => print(b"XKB: X11 dir created\n"),
-                    Err(_) => print(b"XKB: X11 mkdir FAILED\n"),
+                    Ok(_) => { trace!(Debug, FS, { print(b"XKB: X11 dir created"); }); },
+                    Err(_) => { trace!(Error, FS, { print(b"XKB: X11 mkdir FAILED"); }); },
                 }
             }
             if let Some(x11_oid) = store.find_in(b"X11", share_oid) {
@@ -155,14 +155,14 @@ fn sysroot_init(store: &mut ObjectStore) {
                             mapped = true;
                         }
                     }
-                    print(b"XKB: mapped="); crate::framebuffer::print_u64(mapped as u64); print(b"\n");
+                    trace!(Debug, FS, { print(b"XKB: mapped="); print_u64(mapped as u64); });
                     if mapped {
                         let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, (buf_pages * 0x1000) as usize) };
                         for &(subdir, fname, initrd_name) in xkb_files {
                             if let Some(dir_oid) = store.find_in(subdir, xkb_oid) {
                                 if store.find_in(fname, dir_oid).is_none() {
                                     let name_len = initrd_name.len() - 1; // exclude NUL
-                                    print(b"XKB: reading "); print(initrd_name);
+                                    trace!(Debug, FS, { print(b"XKB: reading "); print(initrd_name); });
                                     if let Ok(sz) = sotos_common::sys::initrd_read(
                                         initrd_name.as_ptr() as u64, name_len as u64,
                                         buf.as_mut_ptr() as u64, buf.len() as u64
@@ -192,7 +192,35 @@ fn sysroot_init(store: &mut ObjectStore) {
     // Wine handles the missing musl gracefully: dlopen(ntdll.so) fails,
     // Wine re-execs itself, and the second pass works without musl.
     // If musl IS found, glibc's ld.so crashes with a dual-libc assertion.
-    print(b"LUCAS: sysroot dirs initialized\n");
+
+    // Personality-isolated sysroot directories: /sysroot/alpine/ and /sysroot/debian/
+    // Each personality sees only its own libs via openat path rewriting.
+    if store.resolve_path(b"sysroot", ROOT_OID).is_err() {
+        let _ = store.mkdir(b"sysroot", ROOT_OID);
+    }
+    if let Ok(sr_oid) = store.resolve_path(b"sysroot", ROOT_OID) {
+        for name in [b"alpine" as &[u8], b"debian"] {
+            if store.find_in(name, sr_oid).is_none() {
+                let _ = store.mkdir(name, sr_oid);
+            }
+        }
+        // Create subdirs under /sysroot/debian/ for disk-based glibc libs
+        if let Some(deb_oid) = store.find_in(b"debian", sr_oid) {
+            for sub in [b"lib" as &[u8], b"lib64", b"bin", b"usr", b"etc"] {
+                if store.find_in(sub, deb_oid).is_none() {
+                    let _ = store.mkdir(sub, deb_oid);
+                }
+            }
+            if let Some(usr_oid) = store.find_in(b"usr", deb_oid) {
+                for sub in [b"lib" as &[u8], b"lib64", b"bin"] {
+                    if store.find_in(sub, usr_oid).is_none() {
+                        let _ = store.mkdir(sub, usr_oid);
+                    }
+                }
+            }
+        }
+    }
+    trace!(Info, FS, { print(b"sysroot dirs initialized (alpine+debian)"); });
 }
 
 /// LUCAS handler — PID 1 syscall loop.
@@ -215,7 +243,7 @@ pub(crate) extern "C" fn lucas_handler() -> ! {
         }
         vdso::forge(vdso_page, boot_tsc_val);
         let _ = sys::protect(vdso::VDSO_BASE, 0);
-        print(b"LUCAS: vDSO forged at 0xB80000\n");
+        trace!(Info, PROCESS, { print(b"vDSO forged at 0xB80000"); });
     }
 
     // Register as PID 1
@@ -229,7 +257,7 @@ pub(crate) extern "C" fn lucas_handler() -> ! {
         let blk = unsafe { core::ptr::read(LUCAS_BLK_STORE as *const VirtioBlk) };
         match ObjectStore::mount(blk) {
             Ok(mut store) => {
-                print(b"LUCAS: VFS bridge active\n");
+                trace!(Info, FS, { print(b"VFS bridge active"); });
                 sysroot_init(&mut store);
                 let vfs = Vfs::new(store);
                 let store_ptr = vfs.store() as *const _ as u64;
@@ -237,9 +265,7 @@ pub(crate) extern "C" fn lucas_handler() -> ! {
                 Some(vfs)
             }
             Err(e) => {
-                print(b"LUCAS: VFS mount failed: ");
-                print(e.as_bytes());
-                print(b"\n");
+                trace!(Error, FS, { print(b"VFS mount failed: "); print(e.as_bytes()); });
                 None
             }
         }
@@ -393,9 +419,7 @@ pub(crate) extern "C" fn lucas_handler() -> ! {
             // PID-1 exclusive: exit just breaks the loop
             // ═══════════════════════════════════════════════════════════
             SYS_EXIT => {
-                print(b"LUCAS: guest exit(");
-                print_u64(msg.regs[0]);
-                print(b")\n");
+                trace!(Info, PROCESS, { print(b"LUCAS exit("); print_u64(msg.regs[0]); print(b")"); });
                 break;
             }
             SYS_EXIT_GROUP => {
@@ -658,15 +682,17 @@ pub(crate) extern "C" fn lucas_handler() -> ! {
             // Unknown syscall
             // ═══════════════════════════════════════════════════════════
             _ => {
-                print(b"LUCAS: unhandled syscall ");
-                print_u64(syscall_nr);
-                print(b"\n");
+                trace!(Warn, SYSCALL, {
+                    print(b"LUCAS unhandled ");
+                    print(sotos_common::trace::syscall_name(syscall_nr));
+                    print(b"("); print_u64(syscall_nr); print(b")");
+                });
                 reply_val(ep_cap, -ENOSYS);
             }
         }
     }
 
-    print(b"LUCAS: done\n");
+    trace!(Info, PROCESS, { print(b"LUCAS done"); });
     sys::thread_exit();
 }
 

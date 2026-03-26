@@ -216,11 +216,12 @@ fn exit_cleanup(ctx: &mut SyscallContext, status: u64) {
     if pid == 0 || pid > MAX_PROCS { return; }
     // Process death alarm — dump for all processes
     if pid >= 1 {
-        crate::framebuffer::print(b"\n!!! PROC-DEATH P");
-        crate::framebuffer::print_u64(pid as u64);
-        crate::framebuffer::print(b" exit_code=");
-        crate::framebuffer::print_u64(status);
-        crate::framebuffer::print(b"\n");
+        trace!(Info, PROCESS, {
+            crate::framebuffer::print(b"PROC-DEATH P");
+            crate::framebuffer::print_u64(pid as u64);
+            crate::framebuffer::print(b" exit_code=");
+            crate::framebuffer::print_u64(status)
+        });
         // Dump last syscalls when process dies from signal (crash)
         if status >= 128 {
             crate::syscall_log::syscall_log_dump(30);

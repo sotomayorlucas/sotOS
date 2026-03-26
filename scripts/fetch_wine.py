@@ -622,6 +622,7 @@ def main():
         print("  Extracting wine64 loader + wineserver...")
         files = extract_files_from_deb(deb_paths['wine64'][1], [
             ("usr/lib/wine/wine64", "bin/wine64"),
+            ("usr/lib/wine/wine64-preloader", "bin/wine64-preloader"),
             ("usr/lib/wine/wineserver64", "bin/wineserver64"),
             ("usr/lib/wine/wineserver64", "bin/wineserver"),
         ], SYSROOT)
@@ -659,23 +660,56 @@ def main():
                 if not os.path.isfile(dst):
                     _sh.copy2(src, dst)
 
-    # From libunwind8 package: libunwind.so.8
-    # NOTE: libunwind is served from the initrd — do NOT put on disk.
-    # Having it on disk with dev=2 while initrd has it with dev=1 triggers
-    # glibc ld.so's duplicate library detection during dlopen(ntdll.so).
+    # With per-personality sysroot isolation, glibc libs now go ON DISK under
+    # /sysroot/debian/lib/. The path rewriting in LUCAS ensures glibc processes
+    # only see /sysroot/debian/ and musl processes never see it.
+    # No more dual-identity issue because each personality has its own VFS view.
+
+    # From libc6 package: ld-linux-x86-64.so.2 + libc.so.6
+    if 'libc6' in deb_paths:
+        print("  Extracting glibc (ld-linux + libc.so.6) for Debian sysroot...")
+        # Extract to BOTH /lib/ and /lib/x86_64-linux-gnu/ — ld-linux searches the
+        # multiarch path, and some Wine code uses the short path. Also need /lib64/.
+        files = extract_files_from_deb(deb_paths['libc6'][1], [
+            ("lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", "lib/ld-linux-x86-64.so.2"),
+            ("lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", "lib64/ld-linux-x86-64.so.2"),
+            ("lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", "lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"),
+            ("lib/x86_64-linux-gnu/libc.so.6", "lib/libc.so.6"),
+            ("lib/x86_64-linux-gnu/libc.so.6", "lib/x86_64-linux-gnu/libc.so.6"),
+            ("lib/x86_64-linux-gnu/ld-2.36.so", "lib/ld-linux-x86-64.so.2"),
+            ("lib/x86_64-linux-gnu/libc-2.36.so", "lib/libc.so.6"),
+            ("lib/x86_64-linux-gnu/libpthread.so.0", "lib/libpthread.so.0"),
+            ("lib/x86_64-linux-gnu/libpthread.so.0", "lib/x86_64-linux-gnu/libpthread.so.0"),
+            ("lib/x86_64-linux-gnu/libdl.so.2", "lib/libdl.so.2"),
+            ("lib/x86_64-linux-gnu/libdl.so.2", "lib/x86_64-linux-gnu/libdl.so.2"),
+            ("lib/x86_64-linux-gnu/libm.so.6", "lib/libm.so.6"),
+            ("lib/x86_64-linux-gnu/libm.so.6", "lib/x86_64-linux-gnu/libm.so.6"),
+            ("lib/x86_64-linux-gnu/librt.so.1", "lib/librt.so.1"),
+            ("lib/x86_64-linux-gnu/libresolv.so.2", "lib/libresolv.so.2"),
+            ("lib/x86_64-linux-gnu/libnss_files.so.2", "lib/libnss_files.so.2"),
+            ("lib/x86_64-linux-gnu/libnss_dns.so.2", "lib/libnss_dns.so.2"),
+        ], SYSROOT)
+        all_extracted.update(files)
+
+    # From libunwind8 package: libunwind.so.8 (needed by ntdll.so)
+    if 'libunwind8' in deb_paths:
+        print("  Extracting libunwind for Debian sysroot...")
+        files = extract_files_from_deb(deb_paths['libunwind8'][1], [
+            ("usr/lib/x86_64-linux-gnu/libunwind.so.8", "lib/libunwind.so.8"),
+            ("usr/lib/x86_64-linux-gnu/libunwind.so.8", "lib/x86_64-linux-gnu/libunwind.so.8"),
+            ("usr/lib/x86_64-linux-gnu/libunwind-x86_64.so.8", "lib/libunwind-x86_64.so.8"),
+            ("usr/lib/x86_64-linux-gnu/libunwind-x86_64.so.8", "lib/x86_64-linux-gnu/libunwind-x86_64.so.8"),
+        ], SYSROOT)
+        all_extracted.update(files)
 
     # From liblzma5 package: liblzma.so.5 (dependency of libunwind)
-    # NOTE: liblzma is served from the initrd — same dual-identity issue.
-
-    # Fetch glibc from Debian Bookworm (2.36 — supports non-page-aligned PT_LOAD)
-    # Ubuntu 22.04's glibc 2.35 ld-linux rejects non-page-aligned segments in libc.so.6
-    # NOTE: glibc (ld-linux + libc.so.6) is served from the initrd.
-    # Do NOT put on disk — dual-identity (dev=1 vs dev=2) breaks ld.so.
-    # From musl package: libc.musl-x86_64.so.1 (Debian build, coexists with glibc)
-    # Wine's ntdll.so requires musl — Debian's musl package is built to work alongside glibc
-    # NOTE: Do NOT extract musl libc to disk — glibc's ld-linux will load it
-    # via dlopen(ntdll.so) dep resolution, causing a fatal dual-libc assertion.
-    # ntdll.so's deps (libc.so.6, libunwind.so.8) are served from the initrd.
+    if 'liblzma5' in deb_paths:
+        print("  Extracting liblzma for Debian sysroot...")
+        files = extract_files_from_deb(deb_paths['liblzma5'][1], [
+            ("usr/lib/x86_64-linux-gnu/liblzma.so.5", "lib/liblzma.so.5"),
+            ("usr/lib/x86_64-linux-gnu/liblzma.so.5", "lib/x86_64-linux-gnu/liblzma.so.5"),
+        ], SYSROOT)
+        all_extracted.update(files)
 
     # libgcc_s from project root (if available)
     import shutil
@@ -733,18 +767,22 @@ def main():
         print(f"\n[4/4] Creating disk image...")
         import subprocess
 
-        # Create tarball from sysroot
+        # Create tarball from sysroot — all paths under sysroot/debian/
+        # so personality-based routing in LUCAS can isolate glibc from musl
         sysroot_tar = "target/wine-sysroot.tar.gz"
-        print(f"  Creating tarball: {sysroot_tar}")
+        SYSROOT_PREFIX = "sysroot/debian"
+        print(f"  Creating tarball: {sysroot_tar} (prefix: /{SYSROOT_PREFIX}/)")
         with tarfile.open(sysroot_tar, 'w:gz') as tf:
             for root, dirs, files in os.walk(SYSROOT):
                 for d in sorted(dirs):
                     full = os.path.join(root, d)
-                    arcname = os.path.relpath(full, SYSROOT).replace('\\', '/')
+                    rel = os.path.relpath(full, SYSROOT).replace('\\', '/')
+                    arcname = f"{SYSROOT_PREFIX}/{rel}"
                     tf.add(full, arcname=arcname, recursive=False)
                 for f in sorted(files):
                     full = os.path.join(root, f)
-                    arcname = os.path.relpath(full, SYSROOT).replace('\\', '/')
+                    rel = os.path.relpath(full, SYSROOT).replace('\\', '/')
+                    arcname = f"{SYSROOT_PREFIX}/{rel}"
                     tf.add(full, arcname=arcname)
 
         cmd = [

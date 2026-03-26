@@ -342,17 +342,20 @@ pub(crate) fn sys_connect(ctx: &mut SyscallContext, msg: &IpcMsg) {
         abs[..alen.min(127)].copy_from_slice(&abs_full[..alen.min(127)]);
         // Special case: seatd stub socket
         if ctx.pid == 2 {
-            print(b"SEATD-CHK alen="); print_u64(alen as u64);
-            print(b" ["); for &b in &abs[..alen.min(30)] { if b != 0 { sys::debug_print(b); } } print(b"]\n");
+            trace!(Debug, NET, {
+                print(b"SEATD-CHK alen="); print_u64(alen as u64);
+                print(b" ["); for &b in &abs[..alen.min(30)] { if b != 0 { sys::debug_print(b); } } print(b"]")
+            });
         }
         if alen >= 15 && &abs[..15] == b"/run/seatd.sock" {
             if let Some(slot) = crate::seatd::seatd_alloc() {
                 ctx.child_fds[fd] = 33; // seatd socket
                 ctx.sock_conn_id[fd] = slot as u32;
-                print(b"seatd: client P"); print_u64(pid as u64);
-                print(b" fd="); print_u64(fd as u64);
-                print(b" slot="); print_u64(slot as u64);
-                print(b"\n");
+                trace!(Debug, NET, {
+                    print(b"seatd: client P"); print_u64(pid as u64);
+                    print(b" fd="); print_u64(fd as u64);
+                    print(b" slot="); print_u64(slot as u64)
+                });
                 reply_val(ep_cap, 0);
             } else {
                 reply_val(ep_cap, -ECONNREFUSED);
@@ -379,10 +382,11 @@ pub(crate) fn sys_connect(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     // Client side: kind=27, reads from pipe_b, writes to pipe_a
                     ctx.child_fds[fd] = 27;
                     ctx.sock_conn_id[fd] = conn_slot as u32;
-                    print(b"UNIX-CONN P"); print_u64(pid as u64);
-                    print(b" fd="); print_u64(fd as u64);
-                    print(b" conn="); print_u64(conn_slot as u64);
-                    print(b"\n");
+                    trace!(Debug, NET, {
+                        print(b"UNIX-CONN P"); print_u64(pid as u64);
+                        print(b" fd="); print_u64(fd as u64);
+                        print(b" conn="); print_u64(conn_slot as u64)
+                    });
                     reply_val(ep_cap, 0);
                 } else {
                     reply_val(ep_cap, -ECONNREFUSED);
@@ -391,10 +395,12 @@ pub(crate) fn sys_connect(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 reply_val(ep_cap, -ENOMEM);
             }
         } else {
-            print(b"UNIX-CONN-REFUSE P"); print_u64(pid as u64);
-            print(b" [");
-            for &b in &abs[..alen] { if b != 0 { sys::debug_print(b); } }
-            print(b"]\n");
+            trace!(Error, NET, {
+                print(b"UNIX-CONN-REFUSE P"); print_u64(pid as u64);
+                print(b" [");
+                for &b in &abs[..alen] { if b != 0 { sys::debug_print(b); } }
+                print(b"]")
+            });
             reply_val(ep_cap, -ECONNREFUSED);
         }
     } else {
@@ -420,32 +426,35 @@ pub(crate) fn sys_connect(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     if conn_id as i64 >= 0 {
                         ctx.sock_conn_id[fd] = conn_id as u32;
                         if pid > 1 {
-                            print(b"TCP-CONN: fd=");
-                            print_u64(fd as u64);
-                            print(b" conn=");
-                            print_u64(conn_id);
-                            print(b" ip=");
-                            print_u64(ip as u64);
-                            print(b":"); print_u64(port as u64);
-                            print(b"\n");
+                            trace!(Debug, NET, {
+                                print(b"TCP-CONN: fd=");
+                                print_u64(fd as u64);
+                                print(b" conn=");
+                                print_u64(conn_id);
+                                print(b" ip=");
+                                print_u64(ip as u64);
+                                print(b":"); print_u64(port as u64)
+                            });
                         }
                         reply_val(ep_cap, 0);
                     } else {
                         if pid > 1 {
-                            print(b"TCP-CONN-REFUSED ip=");
-                            print_u64(ip as u64);
-                            print(b":"); print_u64(port as u64);
-                            print(b"\n");
+                            trace!(Error, NET, {
+                                print(b"TCP-CONN-REFUSED ip=");
+                                print_u64(ip as u64);
+                                print(b":"); print_u64(port as u64)
+                            });
                         }
                         reply_val(ep_cap, -ECONNREFUSED);
                     }
                 }
                 Err(_) => {
                     if pid > 1 {
-                        print(b"TCP-CONN-TIMEOUT ip=");
-                        print_u64(ip as u64);
-                        print(b":"); print_u64(port as u64);
-                        print(b"\n");
+                        trace!(Error, NET, {
+                            print(b"TCP-CONN-TIMEOUT ip=");
+                            print_u64(ip as u64);
+                            print(b":"); print_u64(port as u64)
+                        });
                     }
                     reply_val(ep_cap, -ETIMEDOUT);
                 }
@@ -620,13 +629,14 @@ pub(crate) fn sys_sendmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
                         }
                         crate::fd::scm_push_fd(conn, direction, kind, cid, oid, fsize);
                         msg_scm_count += 1;
-                        print(b"SCM-SEND P"); print_u64(ctx.pid as u64);
-                        print(b" fd="); print_u64(sfd as u64);
-                        print(b" k="); print_u64(kind as u64);
-                        if kind == 13 {
-                            print(b" oid="); print_hex64(oid);
-                        }
-                        print(b"\n");
+                        trace!(Debug, NET, {
+                            print(b"SCM-SEND P"); print_u64(ctx.pid as u64);
+                            print(b" fd="); print_u64(sfd as u64);
+                            print(b" k="); print_u64(kind as u64);
+                            if kind == 13 {
+                                print(b" oid="); print_hex64(oid);
+                            }
+                        });
                     }
                 }
             }
@@ -1027,13 +1037,16 @@ pub(crate) fn sys_recvmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 if drm_fd < 128 {
                     *ctx.fd_cloexec |= 1u128 << drm_fd;
                 }
-                print(b"seatd: SCM_RIGHTS fd=");
-                crate::framebuffer::print_u64(drm_fd as u64);
-                print(b"\n");
+                trace!(Debug, NET, {
+                    print(b"seatd: SCM_RIGHTS fd=");
+                    crate::framebuffer::print_u64(drm_fd as u64)
+                });
             } else {
-                print(b"seatd: SCM_RIGHTS fd=");
-                crate::framebuffer::print_u64(drm_fd as u64);
-                print(b" no msg_control\n");
+                trace!(Warn, NET, {
+                    print(b"seatd: SCM_RIGHTS fd=");
+                    crate::framebuffer::print_u64(drm_fd as u64);
+                    print(b" no msg_control")
+                });
             }
         } else {
             // No SCM pending: clear msg_controllen and msg_flags
@@ -1077,28 +1090,31 @@ pub(crate) fn sys_recvmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
             let n = pipe_read(pipe_id, &mut tmp[..want]);
             // Diagnostic: dump recvmsg for AF_UNIX on P5 (wineserver receives SCM fds)
             if ctx.pid == 5 && (ctx.child_fds[fd] == 27 || ctx.child_fds[fd] == 28) {
-                print(b"RCVM-UX P5 fd="); print_u64(fd as u64);
-                print(b" conn="); print_u64(conn as u64);
-                print(b" pipe="); print_u64(pipe_id as u64);
-                print(b" n="); print_u64(n as u64);
-                print(b" ml="); print_u64(msg_len as u64);
-                print(b" ctl="); print_u64(msg_controllen as u64);
-                print(b"\n");
+                trace!(Trace, NET, {
+                    print(b"RCVM-UX P5 fd="); print_u64(fd as u64);
+                    print(b" conn="); print_u64(conn as u64);
+                    print(b" pipe="); print_u64(pipe_id as u64);
+                    print(b" n="); print_u64(n as u64);
+                    print(b" ml="); print_u64(msg_len as u64);
+                    print(b" ctl="); print_u64(msg_controllen as u64)
+                });
             }
             // Diagnostic: dump recvmsg data for P7 (Wine client ↔ wineserver)
             if ctx.pid == 7 && n > 0 {
-                print(b"RCVM P7 fd="); print_u64(fd as u64);
-                print(b" n="); print_u64(n as u64);
-                print(b" [");
-                // Print first 16 bytes as hex
-                for i in 0..n.min(16) {
-                    let hi = tmp[i] >> 4;
-                    let lo = tmp[i] & 0xF;
-                    let hc = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
-                    let lc = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
-                    crate::framebuffer::print(&[hc, lc]);
-                }
-                print(b"]\n");
+                trace!(Trace, NET, {
+                    print(b"RCVM P7 fd="); print_u64(fd as u64);
+                    print(b" n="); print_u64(n as u64);
+                    print(b" [");
+                    // Print first 16 bytes as hex
+                    for i in 0..n.min(16) {
+                        let hi = tmp[i] >> 4;
+                        let lo = tmp[i] & 0xF;
+                        let hc = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
+                        let lc = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
+                        crate::framebuffer::print(&[hc, lc]);
+                    }
+                    print(b"]")
+                });
             }
             if n > 0 {
                 // Pop the boundary marker and get per-message SCM count
@@ -1143,18 +1159,20 @@ pub(crate) fn sys_recvmsg(ctx: &mut SyscallContext, msg: &IpcMsg) {
                                         }
                                     }
                                 }
-                                print(b"SCM-RECV P"); print_u64(ctx.pid as u64);
-                                print(b" fd="); print_u64(j as u64);
-                                print(b" k="); print_u64(scm_kinds[fi] as u64);
-                                print(b"\n");
+                                trace!(Debug, NET, {
+                                    print(b"SCM-RECV P"); print_u64(ctx.pid as u64);
+                                    print(b" fd="); print_u64(j as u64);
+                                    print(b" k="); print_u64(scm_kinds[fi] as u64)
+                                });
                                 break;
                             }
                         }
                         if nfd == -1 {
                             alloc_failed = true;
-                            print(b"SCM-RECV P"); print_u64(ctx.pid as u64);
-                            print(b" EMFILE: no free fd for kind="); print_u64(scm_kinds[fi] as u64);
-                            print(b"\n");
+                            trace!(Error, NET, {
+                                print(b"SCM-RECV P"); print_u64(ctx.pid as u64);
+                                print(b" EMFILE: no free fd for kind="); print_u64(scm_kinds[fi] as u64)
+                            });
                         }
                         new_fds[fi] = nfd;
                     }
@@ -1386,12 +1404,13 @@ pub(crate) fn sys_bind(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 }
                 // Store listener slot in sock_conn_id
                 ctx.sock_conn_id[fd] = i as u32;
-                print(b"UNIX-BIND P"); print_u64(ctx.pid as u64);
-                print(b" fd="); print_u64(fd as u64);
-                print(b" [");
-                for &b in &abs[..alen] { if b != 0 { sys::debug_print(b); } }
-                print(b"] slot="); print_u64(i as u64);
-                print(b"\n");
+                trace!(Debug, NET, {
+                    print(b"UNIX-BIND P"); print_u64(ctx.pid as u64);
+                    print(b" fd="); print_u64(fd as u64);
+                    print(b" [");
+                    for &b in &abs[..alen] { if b != 0 { sys::debug_print(b); } }
+                    print(b"] slot="); print_u64(i as u64)
+                });
                 reply_val(ctx.ep_cap, 0);
                 return;
             }
@@ -1407,10 +1426,11 @@ pub(crate) fn sys_listen(ctx: &mut SyscallContext, msg: &IpcMsg) {
     if fd < GRP_MAX_FDS && ctx.child_fds[fd] == 26 {
         let slot = ctx.sock_conn_id[fd] as usize;
         if slot < MAX_UNIX_LISTENERS {
-            print(b"UNIX-LISTEN P"); print_u64(ctx.pid as u64);
-            print(b" fd="); print_u64(fd as u64);
-            print(b" slot="); print_u64(slot as u64);
-            print(b"\n");
+            trace!(Debug, NET, {
+                print(b"UNIX-LISTEN P"); print_u64(ctx.pid as u64);
+                print(b" fd="); print_u64(fd as u64);
+                print(b" slot="); print_u64(slot as u64)
+            });
         }
     }
     reply_val(ctx.ep_cap, 0);
@@ -1561,11 +1581,12 @@ pub(crate) fn sys_epoll_ctl(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 ctx.epoll_reg_events[i] = events;
                 ctx.epoll_reg_data[i] = data;
                 let kind = if (fd as usize) < GRP_MAX_FDS { ctx.child_fds[fd as usize] } else { 0 };
-                print(b"EPOLL-ADD P"); print_u64(ctx.pid as u64);
-                print(b" fd="); print_u64(fd as u64);
-                print(b" ev="); crate::framebuffer::print_hex64(events as u64);
-                print(b" k="); print_u64(kind as u64);
-                print(b"\n");
+                trace!(Trace, NET, {
+                    print(b"EPOLL-ADD P"); print_u64(ctx.pid as u64);
+                    print(b" fd="); print_u64(fd as u64);
+                    print(b" ev="); crate::framebuffer::print_hex64(events as u64);
+                    print(b" k="); print_u64(kind as u64)
+                });
             }
             reply_val(ep_cap, 0);
         }
@@ -1597,33 +1618,34 @@ pub(crate) fn sys_epoll_wait(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let show_dbg = ctx.pid < 16 && unsafe { EPOLL_DBG_COUNT[ctx.pid] } < 3;
     if show_dbg {
         unsafe { EPOLL_DBG_COUNT[ctx.pid] += 1; }
-        print(b"EPOLL-WAIT-DBG P"); print_u64(ctx.pid as u64);
-        print(b" timeout="); print_u64(timeout as u64);
-        print(b" regs:");
-        for i in 0..MAX_EPOLL_ENTRIES {
-            if ctx.epoll_reg_fd[i] >= 0 {
-                let rfd = ctx.epoll_reg_fd[i] as usize;
-                let kind = if rfd < GRP_MAX_FDS { ctx.child_fds[rfd] } else { 0 };
-                print(b" [fd="); print_u64(rfd as u64);
-                print(b" k="); print_u64(kind as u64);
-                print(b" ev="); crate::framebuffer::print_hex64(ctx.epoll_reg_events[i] as u64);
-                print(b"]");
-            }
-        }
-        // Check listener status
-        for i in 0..MAX_EPOLL_ENTRIES {
-            if ctx.epoll_reg_fd[i] >= 0 {
-                let rfd = ctx.epoll_reg_fd[i] as usize;
-                if rfd < GRP_MAX_FDS && ctx.child_fds[rfd] == 26 {
-                    let listener = ctx.sock_conn_id[rfd] as usize;
-                    let has_pending = crate::fd::unix_listener_has_pending(listener);
-                    print(b" LISTENER-fd="); print_u64(rfd as u64);
-                    print(b" slot="); print_u64(listener as u64);
-                    print(b" pending="); print_u64(has_pending as u64);
+        trace!(Trace, NET, {
+            print(b"EPOLL-WAIT-DBG P"); print_u64(ctx.pid as u64);
+            print(b" timeout="); print_u64(timeout as u64);
+            print(b" regs:");
+            for i in 0..MAX_EPOLL_ENTRIES {
+                if ctx.epoll_reg_fd[i] >= 0 {
+                    let rfd = ctx.epoll_reg_fd[i] as usize;
+                    let kind = if rfd < GRP_MAX_FDS { ctx.child_fds[rfd] } else { 0 };
+                    print(b" [fd="); print_u64(rfd as u64);
+                    print(b" k="); print_u64(kind as u64);
+                    print(b" ev="); crate::framebuffer::print_hex64(ctx.epoll_reg_events[i] as u64);
+                    print(b"]");
                 }
             }
-        }
-        print(b"\n");
+            // Check listener status
+            for i in 0..MAX_EPOLL_ENTRIES {
+                if ctx.epoll_reg_fd[i] >= 0 {
+                    let rfd = ctx.epoll_reg_fd[i] as usize;
+                    if rfd < GRP_MAX_FDS && ctx.child_fds[rfd] == 26 {
+                        let listener = ctx.sock_conn_id[rfd] as usize;
+                        let has_pending = crate::fd::unix_listener_has_pending(listener);
+                        print(b" LISTENER-fd="); print_u64(rfd as u64);
+                        print(b" slot="); print_u64(listener as u64);
+                        print(b" pending="); print_u64(has_pending as u64);
+                    }
+                }
+            }
+        });
     }
 
     let mut ready_count = 0usize;
@@ -1679,11 +1701,12 @@ pub(crate) fn sys_epoll_wait(ctx: &mut SyscallContext, msg: &IpcMsg) {
         }
         // Wineserver EPOLLHUP/ERR tracing (pid 3-5)
         if revents & 0x18 != 0 && ctx.pid >= 3 && ctx.pid <= 5 {
-            print(b"!!! EPOLL-HUP P"); print_u64(ctx.pid as u64);
-            print(b" fd="); print_u64(rfd as u64);
-            print(b" k="); print_u64(if rfd < GRP_MAX_FDS { ctx.child_fds[rfd] as u64 } else { 99 });
-            print(b" ev="); crate::framebuffer::print_hex64(revents as u64);
-            print(b"\n");
+            trace!(Warn, NET, {
+                print(b"EPOLL-HUP P"); print_u64(ctx.pid as u64);
+                print(b" fd="); print_u64(rfd as u64);
+                print(b" k="); print_u64(if rfd < GRP_MAX_FDS { ctx.child_fds[rfd] as u64 } else { 99 });
+                print(b" ev="); crate::framebuffer::print_hex64(revents as u64)
+            });
         }
         if revents != 0 {
             let ep = events_ptr + (ready_count as u64) * 12;
@@ -1696,9 +1719,11 @@ pub(crate) fn sys_epoll_wait(ctx: &mut SyscallContext, msg: &IpcMsg) {
     }
     if ready_count > 0 || timeout == 0 {
         if show_dbg {
-            print(b"EPOLL-RET P"); print_u64(ctx.pid as u64);
-            print(b" ready="); print_u64(ready_count as u64);
-            print(b" (immediate)\n");
+            trace!(Trace, NET, {
+                print(b"EPOLL-RET P"); print_u64(ctx.pid as u64);
+                print(b" ready="); print_u64(ready_count as u64);
+                print(b" (immediate)")
+            });
         }
         reply_val(ep_cap, ready_count as i64);
     } else {
@@ -1838,10 +1863,11 @@ pub(crate) fn sys_accept(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     if addrlen_ptr != 0 {
                         ctx.guest_write(addrlen_ptr, &2u32.to_le_bytes());
                     }
-                    print(b"UNIX-ACCEPT P"); print_u64(ctx.pid as u64);
-                    print(b" fd="); print_u64(nf as u64);
-                    print(b" conn="); print_u64(conn_slot as u64);
-                    print(b"\n");
+                    trace!(Debug, NET, {
+                        print(b"UNIX-ACCEPT P"); print_u64(ctx.pid as u64);
+                        print(b" fd="); print_u64(nf as u64);
+                        print(b" conn="); print_u64(conn_slot as u64)
+                    });
                     reply_val(ctx.ep_cap, nf as i64);
                 } else {
                     reply_val(ctx.ep_cap, -EMFILE);

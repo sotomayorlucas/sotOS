@@ -4,7 +4,6 @@
 // Extracted from fs.rs
 // ---------------------------------------------------------------------------
 
-use sotos_common::sys;
 use sotos_common::linux_abi::*;
 use sotos_common::IpcMsg;
 use core::sync::atomic::Ordering;
@@ -94,13 +93,14 @@ pub(crate) fn close_cloexec_fds(ctx: &mut SyscallContext) {
         let fd = bits.trailing_zeros() as usize;
         if fd >= 128 { break; }
         let k = ctx.child_fds[fd];
-        print(b"CLOEXEC-CLOSE P"); print_u64(ctx.pid as u64);
-        print(b" fd="); print_u64(fd as u64);
-        print(b" kind="); print_u64(k as u64);
-        if ctx.pid >= 5 && (k == 10 || k == 11) {
-            print(b" pipe="); print_u64(ctx.sock_conn_id[fd] as u64);
-        }
-        print(b"\n");
+        trace!(Debug, FS, {
+            print(b"CLOEXEC-CLOSE P"); print_u64(ctx.pid as u64);
+            print(b" fd="); print_u64(fd as u64);
+            print(b" kind="); print_u64(k as u64);
+            if k == 10 || k == 11 {
+                print(b" pipe="); print_u64(ctx.sock_conn_id[fd] as u64);
+            }
+        });
         close_fd_internal(ctx, fd);
         bits &= !(1u128 << fd);
     }
@@ -137,14 +137,13 @@ pub(crate) fn sys_dup(ctx: &mut SyscallContext, msg: &IpcMsg) {
             ctx.sock_udp_remote_port[nfd] = ctx.sock_udp_remote_port[oldfd];
             dup_file_slots(ctx, oldfd, nfd);
             if nfd < 128 { *ctx.fd_cloexec &= !(1u128 << nfd); }
-            if ctx.pid >= 3 {
+            trace!(Debug, FS, {
                 print(b"FD-DUP P"); print_u64(ctx.pid as u64);
                 print(b" "); print_u64(oldfd as u64);
                 print(b"->"); print_u64(nfd as u64);
                 print(b" k="); print_u64(ok as u64);
                 print(b" pipe="); print_u64(op as u64);
-                print(b"\n");
-            }
+            });
             reply_val(ctx.ep_cap, nfd as i64);
         } else {
             reply_val(ctx.ep_cap, -EMFILE);
@@ -165,9 +164,10 @@ pub(crate) fn sys_dup2(ctx: &mut SyscallContext, msg: &IpcMsg) {
             if nk == 11 && np < MAX_PIPES {
                 let prev = PIPE_WRITE_REFS[np].fetch_sub(1, Ordering::AcqRel);
                 if prev <= 1 {
-                    print(b"PWC-SET dup2 P"); print_u64(ctx.pid as u64);
-                    print(b" pipe="); print_u64(np as u64);
-                    print(b"\n");
+                    trace!(Debug, FS, {
+                        print(b"PWC-SET dup2 P"); print_u64(ctx.pid as u64);
+                        print(b" pipe="); print_u64(np as u64);
+                    });
                     PIPE_WRITE_CLOSED[np].store(1, Ordering::Release);
                 }
             } else if nk == 10 && np < MAX_PIPES {
@@ -206,7 +206,7 @@ pub(crate) fn sys_dup2(ctx: &mut SyscallContext, msg: &IpcMsg) {
         ctx.sock_udp_remote_port[newfd] = ctx.sock_udp_remote_port[oldfd];
         dup_file_slots(ctx, oldfd, newfd);
         if newfd < 128 { *ctx.fd_cloexec &= !(1u128 << newfd); }
-        if ctx.pid >= 3 {
+        trace!(Debug, FS, {
             let ok = ctx.child_fds[newfd];
             let op = ctx.sock_conn_id[newfd] as u64;
             print(b"FD-DUP2 P"); print_u64(ctx.pid as u64);
@@ -214,8 +214,7 @@ pub(crate) fn sys_dup2(ctx: &mut SyscallContext, msg: &IpcMsg) {
             print(b"->"); print_u64(newfd as u64);
             print(b" k="); print_u64(ok as u64);
             print(b" pipe="); print_u64(op);
-            print(b"\n");
-        }
+        });
         reply_val(ctx.ep_cap, newfd as i64);
     }
 }
@@ -236,9 +235,10 @@ pub(crate) fn sys_dup3(ctx: &mut SyscallContext, msg: &IpcMsg) {
             if nk == 11 && np < MAX_PIPES {
                 let prev = PIPE_WRITE_REFS[np].fetch_sub(1, Ordering::AcqRel);
                 if prev <= 1 {
-                    print(b"PWC-SET dup3 P"); print_u64(ctx.pid as u64);
-                    print(b" pipe="); print_u64(np as u64);
-                    print(b"\n");
+                    trace!(Debug, FS, {
+                        print(b"PWC-SET dup3 P"); print_u64(ctx.pid as u64);
+                        print(b" pipe="); print_u64(np as u64);
+                    });
                     PIPE_WRITE_CLOSED[np].store(1, Ordering::Release);
                 }
             } else if nk == 10 && np < MAX_PIPES {
@@ -304,15 +304,14 @@ pub(crate) fn sys_fcntl(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     if cmd == 1030 && n < 128 {
                         *ctx.fd_cloexec |= 1u128 << n;
                     }
-                    if ctx.pid >= 3 {
+                    trace!(Debug, FS, {
                         print(b"FD-FCNTL P"); print_u64(ctx.pid as u64);
                         print(b" F_DUPFD"); if cmd == 1030 { print(b"_CX"); }
                         print(b" "); print_u64(fd as u64);
                         print(b"->"); print_u64(n as u64);
                         print(b" k="); print_u64(ok as u64);
                         print(b" pipe="); print_u64(op as u64);
-                        print(b"\n");
-                    }
+                    });
                     reply_val(ctx.ep_cap, n as i64);
                 }
                 else { reply_val(ctx.ep_cap, -EMFILE); }

@@ -280,11 +280,12 @@ pub(crate) fn sys_signal_trampoline(ctx: &mut SyscallContext, msg: &IpcMsg) -> S
     if !regs_ok {
         sys::yield_now();
         if sys::get_thread_regs(child_tid, &mut saved_regs).is_err() {
-            crate::framebuffer::print(b"SIGNAL-RESUME-FAIL P");
-            crate::framebuffer::print_u64(ctx.pid as u64);
-            crate::framebuffer::print(b" tid=");
-            crate::framebuffer::print_u64(child_tid);
-            crate::framebuffer::print(b"\n");
+            trace!(Error, SIGNAL, {
+                crate::framebuffer::print(b"SIGNAL-RESUME-FAIL P");
+                crate::framebuffer::print_u64(ctx.pid as u64);
+                crate::framebuffer::print(b" tid=");
+                crate::framebuffer::print_u64(child_tid)
+            });
             let reply = sotos_common::IpcMsg {
                 tag: sotos_common::SIG_REDIRECT_TAG,
                 regs: [

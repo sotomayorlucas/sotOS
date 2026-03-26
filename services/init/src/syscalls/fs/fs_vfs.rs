@@ -192,23 +192,21 @@ pub(crate) fn write_vfs(ctx: &mut SyscallContext, fd: usize, buf_ptr: u64, len: 
                     ctx.vfs_files[s][2] += safe_len as u64;
                     let new_end = ctx.vfs_files[s][2];
                     if new_end > ctx.vfs_files[s][1] { ctx.vfs_files[s][1] = new_end; }
-                    if ctx.pid >= 5 {
+                    trace!(Debug, FS, {
                         print(b"VFS-W P"); print_u64(ctx.pid as u64);
                         print(b" fd="); print_u64(fd as u64);
                         print(b" oid=0x"); crate::framebuffer::print_hex64(oid);
                         print(b" pos="); print_u64(pos as u64);
                         print(b" len="); print_u64(safe_len as u64);
-                        print(b"\n");
-                    }
+                    });
                     reply_val(ctx.ep_cap, safe_len as i64);
                 }
                 None => {
-                    if ctx.pid >= 5 {
+                    trace!(Error, FS, {
                         print(b"VFS-W-FAIL P"); print_u64(ctx.pid as u64);
                         print(b" fd="); print_u64(fd as u64);
                         print(b" oid=0x"); crate::framebuffer::print_hex64(oid);
-                        print(b"\n");
-                    }
+                    });
                     reply_val(ctx.ep_cap, -EIO);
                 }
             }
@@ -217,11 +215,10 @@ pub(crate) fn write_vfs(ctx: &mut SyscallContext, fd: usize, buf_ptr: u64, len: 
         }
     }
     if !found {
-        if ctx.pid >= 5 {
+        trace!(Error, FS, {
             print(b"VFS-W-NOFD P"); print_u64(ctx.pid as u64);
             print(b" fd="); print_u64(fd as u64);
-            print(b"\n");
-        }
+        });
         reply_val(ctx.ep_cap, -EBADF);
     }
 }
@@ -248,14 +245,15 @@ pub(crate) fn write_tcp(ctx: &mut SyscallContext, fd: usize, buf_ptr: u64, len: 
             Ok(resp) => {
                 let n = resp.regs[0] as i64;
                 if n <= 0 {
-                    if ctx.pid > 1 && total_sent == 0 {
-                        print(b"TCP-SEND-FAIL fd=");
-                        print_u64(fd as u64);
-                        print(b" conn=");
-                        print_u64(conn_id);
-                        print(b" n=");
-                        print_u64(resp.regs[0]);
-                        print(b"\n");
+                    if total_sent == 0 {
+                        trace!(Error, FS, {
+                            print(b"TCP-SEND-FAIL fd=");
+                            print_u64(fd as u64);
+                            print(b" conn=");
+                            print_u64(conn_id);
+                            print(b" n=");
+                            print_u64(resp.regs[0]);
+                        });
                     }
                     break;
                 }
@@ -264,10 +262,11 @@ pub(crate) fn write_tcp(ctx: &mut SyscallContext, fd: usize, buf_ptr: u64, len: 
                 off += n;
             }
             Err(_) => {
-                if ctx.pid > 1 && total_sent == 0 {
-                    print(b"TCP-SEND-IPC-ERR conn=");
-                    print_u64(conn_id);
-                    print(b"\n");
+                if total_sent == 0 {
+                    trace!(Error, FS, {
+                        print(b"TCP-SEND-IPC-ERR conn=");
+                        print_u64(conn_id);
+                    });
                 }
                 break;
             }
@@ -406,10 +405,10 @@ pub(crate) fn sys_stat(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let stat_ptr = msg.regs[1];
     let mut path = [0u8; 128];
     let path_len = ctx.guest_copy_path(path_ptr, &mut path);
-    if ctx.pid >= 2 {
+    trace!(Debug, FS, {
         print(b"STAT P"); print_u64(ctx.pid as u64);
-        print(b" ["); for &b in &path[..path_len] { sys::debug_print(b); } print(b"]\n");
-    }
+        print(b" ["); for &b in &path[..path_len] { sys::debug_print(b); } print(b"]");
+    });
     let (path, path_len) = if path_len > 0 && path[0] != b'/' {
         let mut abs = [0u8; 256];
         let alen = resolve_with_cwd(ctx.cwd, &path[..path_len], &mut abs);
@@ -482,16 +481,16 @@ pub(crate) fn sys_stat(ctx: &mut SyscallContext, msg: &IpcMsg) {
             crate::drm::drm_fstat(ctx, stat_ptr);
             reply_val(ctx.ep_cap, 0);
         } else if is_known_dir {
-            if ctx.pid == 2 && starts_with(name, b"/usr/share/X11") {
-                print(b"STAT-DIR-OK ["); for &b in name { sys::debug_print(b); } print(b"]\n");
-            }
+            trace!(Debug, FS, {
+                print(b"STAT-DIR-OK ["); for &b in name { sys::debug_print(b); } print(b"]");
+            });
             let buf = build_linux_stat(0, 4096, true);
             ctx.guest_write(stat_ptr, &buf);
             reply_val(ctx.ep_cap, 0);
         } else {
-            if ctx.pid == 2 && starts_with(name, b"/usr/share/X11") {
-                print(b"STAT-ENOENT ["); for &b in name { sys::debug_print(b); } print(b"]\n");
-            }
+            trace!(Debug, FS, {
+                print(b"STAT-ENOENT ["); for &b in name { sys::debug_print(b); } print(b"]");
+            });
             reply_val(ctx.ep_cap, -ENOENT);
         }
     }
@@ -615,11 +614,11 @@ pub(crate) fn sys_open(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let flags = msg.regs[1] as u32;
     let mut path = [0u8; 128];
     let path_len = ctx.guest_copy_path(path_ptr, &mut path);
-    if ctx.pid >= 3 {
+    trace!(Debug, FS, {
         print(b"OPEN P"); print_u64(ctx.pid as u64);
         print(b" fl="); print_u64(flags as u64);
-        print(b" ["); for &b in &path[..path_len] { sys::debug_print(b); } print(b"]\n");
-    }
+        print(b" ["); for &b in &path[..path_len] { sys::debug_print(b); } print(b"]");
+    });
     let (path, path_len) = if path_len > 0 && path[0] != b'/' {
         let mut abs = [0u8; 256];
         let alen = resolve_with_cwd(ctx.cwd, &path[..path_len], &mut abs);
@@ -858,18 +857,20 @@ pub(crate) fn sys_open(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 ctx.vfs_files[vs] = [oid, size, 0, f as u64];
                 ctx.fd_flags[f] = flags;
                 if is_dir { dir_store_path(ctx, f, name); }
-                // Wine trace: VFS opens
-                if ctx.pid <= 5 && !is_dir {
-                    print(b"VFS-HIT P"); print_u64(ctx.pid as u64);
-                    print(b" fd="); print_u64(f as u64);
-                    print(b" d=2 oid="); crate::framebuffer::print_hex64(oid);
-                    print(b" ["); for &b in &name[..path_len.min(40)] { sys::debug_print(b); } print(b"]\n");
+                if !is_dir {
+                    trace!(Debug, FS, {
+                        print(b"VFS-HIT P"); print_u64(ctx.pid as u64);
+                        print(b" fd="); print_u64(f as u64);
+                        print(b" d=2 oid="); crate::framebuffer::print_hex64(oid);
+                        print(b" ["); for &b in &name[..path_len.min(40)] { sys::debug_print(b); } print(b"]");
+                    });
                 }
                 if path_len >= 8 && &name[path_len-8..path_len] == b"ntdll.so" && ctx.pid < 16 {
                     unsafe { (*crate::syscalls::mm::NTDLL_SO_FD.get())[ctx.pid] = f as u8; }
-                    print(b"NTDLL-FD P"); crate::framebuffer::print_u64(ctx.pid as u64);
-                    print(b" fd="); crate::framebuffer::print_u64(f as u64);
-                    print(b"\n");
+                    trace!(Info, FS, {
+                        print(b"NTDLL-FD P"); crate::framebuffer::print_u64(ctx.pid as u64);
+                        print(b" fd="); crate::framebuffer::print_u64(f as u64);
+                    });
                 }
                 reply_val(ctx.ep_cap, f as i64);
             } else {
@@ -885,9 +886,13 @@ pub(crate) fn sys_open(ctx: &mut SyscallContext, msg: &IpcMsg) {
         }
         let basename = &name[basename_start..];
         let mut opened_initrd = false;
-        // Personality-aware initrd filter: reserved for future use.
-        // Wine handles missing musl gracefully (re-exec), so no filtering needed.
         let skip_initrd = false;
+
+
+
+
+
+
 
         if !skip_initrd && !basename.is_empty() {
             let mut slot = None;
@@ -990,11 +995,11 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let flags = msg.regs[2] as u32;
     let mut path = [0u8; 128];
     let path_len = ctx.guest_copy_path(path_ptr, &mut path);
-    if ctx.pid == 6 {
+    trace!(Debug, FS, {
         print(b"OPENAT P"); print_u64(ctx.pid as u64);
         print(b" fl=0x"); crate::framebuffer::print_hex64(flags as u64);
-        print(b" ["); for &b in &path[..path_len] { sys::debug_print(b); } print(b"]\n");
-    }
+        print(b" ["); for &b in &path[..path_len] { sys::debug_print(b); } print(b"]");
+    });
     let (path, path_len) = if path_len > 0 && path[0] != b'/' {
         let mut abs = [0u8; 256];
         let alen = resolve_with_cwd(ctx.cwd, &path[..path_len], &mut abs);
@@ -1013,6 +1018,147 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let n = rlen.min(127);
         out[..n].copy_from_slice(&resolved[..n]);
         (out, n)
+    };
+
+    // ── Step A: Canonicalize path (resolve . and ..) ────────────────
+    // Wine uses relative paths like /sysroot/debian/bin/../../share/wine/nls/X
+    // which must be resolved to /sysroot/share/wine/nls/X before rewriting.
+    let (path, path_len) = {
+        let src = &path[..path_len];
+        let has_dotdot = {
+            let mut found = false;
+            let mut i = 0;
+            while i + 1 < src.len() {
+                if src[i] == b'.' && src[i + 1] == b'.' { found = true; break; }
+                i += 1;
+            }
+            found
+        };
+        if has_dotdot && src.len() > 1 && src[0] == b'/' {
+            let mut canon = [0u8; 128];
+            let mut depth: [usize; 16] = [0; 16]; // stack of component start offsets
+            let mut dp = 0usize; // depth pointer
+            let mut out = 1usize; // output position (start after leading /)
+            canon[0] = b'/';
+
+            let mut i = 1usize;
+            while i <= src.len() {
+                let is_sep = i == src.len() || src[i] == b'/';
+                if is_sep {
+                    let comp_start = {
+                        let mut s = i;
+                        while s > 0 && src[s - 1] != b'/' { s -= 1; }
+                        s
+                    };
+                    let comp = &src[comp_start..i];
+                    if comp == b".." {
+                        // pop one level
+                        if dp > 0 {
+                            dp -= 1;
+                            out = depth[dp];
+                        }
+                    } else if comp != b"." && !comp.is_empty() {
+                        // push component
+                        if dp < 16 { depth[dp] = out; dp += 1; }
+                        let n = comp.len().min(canon.len().saturating_sub(out + 1));
+                        canon[out..out + n].copy_from_slice(&comp[..n]);
+                        out += n;
+                        if out < canon.len() { canon[out] = b'/'; out += 1; }
+                    }
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            // Remove trailing /
+            if out > 1 && canon[out - 1] == b'/' { out -= 1; }
+            let mut result = [0u8; 128];
+            let len = out.min(127);
+            result[..len].copy_from_slice(&canon[..len]);
+            (result, len)
+        } else {
+            (path, path_len)
+        }
+    };
+
+    // ── Step B: Personality-aware path rewriting ("Fake Chroot") ──────
+    // PERS_GLIBC processes see /sysroot/debian/ as their root for libs.
+    // /lib/X  →  /sysroot/debian/lib/X   (glibc, not musl)
+    // /usr/lib/X  →  /sysroot/debian/usr/lib/X
+    // /sysroot/X (escaped via ..) → /sysroot/debian/X (re-jail)
+    // This ensures glibc ld.so never finds musl libs and vice versa.
+    let (path, path_len) = {
+        let pers = crate::process::get_personality(ctx.pid);
+        if pers == crate::process::PERS_GLIBC {
+            const SYSROOT_PFX: &[u8] = b"/sysroot/debian";
+            let name = &path[..path_len];
+
+            // Rule 1: lib/share paths → prepend /sysroot/debian
+            let rewrite_prefixes: &[&[u8]] = &[
+                b"/lib/", b"/lib64/", b"/usr/lib/", b"/usr/lib64/",
+                b"/share/", b"/usr/share/",
+            ];
+            let mut should_prepend = false;
+            for pfx in rewrite_prefixes {
+                if starts_with(name, pfx) { should_prepend = true; break; }
+            }
+            if !should_prepend && (name == b"/lib64" || name == b"/lib") {
+                should_prepend = true;
+            }
+
+            // Rule 2: /sysroot/X (not /sysroot/debian/ or /sysroot/alpine/)
+            //          → replace /sysroot/ with /sysroot/debian/ (re-jail)
+            //          Catches paths like /sysroot/share/wine/nls/ that escaped
+            //          the debian sysroot via .. resolution.
+            let mut should_rejail = false;
+            let sysroot_slash = b"/sysroot/";
+            let sysroot_debian = b"/sysroot/debian/";
+            let sysroot_alpine = b"/sysroot/alpine/";
+            if !should_prepend
+                && starts_with(name, sysroot_slash)
+                && !starts_with(name, sysroot_debian)
+                && !starts_with(name, sysroot_alpine)
+            {
+                should_rejail = true;
+            }
+
+            if should_prepend {
+                let total = SYSROOT_PFX.len() + path_len;
+                if total <= 127 {
+                    let mut rewritten = [0u8; 128];
+                    rewritten[..SYSROOT_PFX.len()].copy_from_slice(SYSROOT_PFX);
+                    rewritten[SYSROOT_PFX.len()..total].copy_from_slice(&path[..path_len]);
+                    trace!(Debug, FS, {
+                        print(b"PERS-REWRITE P"); print_u64(ctx.pid as u64);
+                        print(b" -> /sysroot/debian/...");
+                    });
+                    (rewritten, total)
+                } else {
+                    (path, path_len)
+                }
+            } else if should_rejail {
+                // /sysroot/X → /sysroot/debian/X
+                let rest = &path[sysroot_slash.len()..path_len];
+                let rest_len = rest.len();
+                let total = sysroot_debian.len() + rest_len;
+                if total <= 127 {
+                    let mut rewritten = [0u8; 128];
+                    rewritten[..sysroot_debian.len()].copy_from_slice(sysroot_debian);
+                    rewritten[sysroot_debian.len()..total].copy_from_slice(rest);
+                    trace!(Debug, FS, {
+                        print(b"PERS-REJAIL P"); print_u64(ctx.pid as u64);
+                        print(b" -> /sysroot/debian/...");
+                    });
+                    (rewritten, total)
+                } else {
+                    (path, path_len)
+                }
+            } else {
+                (path, path_len)
+            }
+        } else {
+            (path, path_len)
+        }
     };
     let name = &path[..path_len];
 
@@ -1235,10 +1381,10 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
             }
         }
     } else {
-        if starts_with(name, b"/lib/") || starts_with(name, b"/usr/lib/") || ctx.pid >= 9 {
+        trace!(Debug, FS, {
             print(b"OA P"); crate::framebuffer::print_u64(ctx.pid as u64);
-            print(b" ["); for &b in name { sys::debug_print(b); } print(b"]\n");
-        }
+            print(b" ["); for &b in name { sys::debug_print(b); } print(b"]");
+        });
         // Wine debug: log all openat results for P3 with kind + dev info
         let _wine_trace_pid = ctx.pid;
         let oflags = OFlags::from_bits_truncate(flags as u32);
@@ -1250,7 +1396,13 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
         // If the same .so exists in both VFS (disk, dev=2) and initrd (dev=1),
         // glibc ld.so loads both with different identities → fatal assertion.
         // By preferring initrd for /lib/ paths, we ensure consistent (dev, ino).
-        let initrd_first = starts_with(name, b"/lib/") || starts_with(name, b"/usr/lib/");
+        //
+        // EXCEPTION: PERS_GLIBC processes skip initrd-first entirely — their
+        // /lib/ paths are already rewritten to /sysroot/debian/lib/ which lives
+        // exclusively in VFS. This prevents glibc from accidentally finding musl.
+        let pers = crate::process::get_personality(ctx.pid);
+        let initrd_first = pers != crate::process::PERS_GLIBC
+            && (starts_with(name, b"/lib/") || starts_with(name, b"/usr/lib/"));
         if initrd_first && !has_creat {
             let mut bn_start = 0usize;
             for idx in 0..path_len { if name[idx] == b'/' { bn_start = idx + 1; } }
@@ -1335,18 +1487,20 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 ctx.vfs_files[vs] = [oid, size, 0, f as u64];
                 ctx.fd_flags[f] = flags;
                 if is_dir { dir_store_path(ctx, f, name); }
-                // Wine trace: VFS opens
-                if ctx.pid <= 5 && !is_dir {
-                    print(b"VFS-HIT P"); print_u64(ctx.pid as u64);
-                    print(b" fd="); print_u64(f as u64);
-                    print(b" d=2 oid="); crate::framebuffer::print_hex64(oid);
-                    print(b" ["); for &b in &name[..path_len.min(40)] { sys::debug_print(b); } print(b"]\n");
+                if !is_dir {
+                    trace!(Debug, FS, {
+                        print(b"VFS-HIT P"); print_u64(ctx.pid as u64);
+                        print(b" fd="); print_u64(f as u64);
+                        print(b" d=2 oid="); crate::framebuffer::print_hex64(oid);
+                        print(b" ["); for &b in &name[..path_len.min(40)] { sys::debug_print(b); } print(b"]");
+                    });
                 }
                 if path_len >= 8 && &name[path_len-8..path_len] == b"ntdll.so" && ctx.pid < 16 {
                     unsafe { (*crate::syscalls::mm::NTDLL_SO_FD.get())[ctx.pid] = f as u8; }
-                    print(b"NTDLL-FD P"); crate::framebuffer::print_u64(ctx.pid as u64);
-                    print(b" fd="); crate::framebuffer::print_u64(f as u64);
-                    print(b"\n");
+                    trace!(Info, FS, {
+                        print(b"NTDLL-FD P"); crate::framebuffer::print_u64(ctx.pid as u64);
+                        print(b" fd="); crate::framebuffer::print_u64(f as u64);
+                    });
                 }
                 reply_val(ctx.ep_cap, f as i64);
             } else {
@@ -1362,9 +1516,12 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
         }
         let basename = &name[basename_start..];
         let mut opened_initrd = false;
-        // Personality-aware initrd filter: reserved for future use.
-        // Wine handles missing musl gracefully (re-exec), so no filtering needed.
-        let skip_initrd = false;
+        // PERS_GLIBC: skip initrd entirely for lib paths — glibc processes
+        // must only find their libs in /sysroot/debian/ (VFS, dev=2).
+        // Without this, basename "libc.so.6" in initrd shadows the debian copy.
+        let skip_initrd = pers == crate::process::PERS_GLIBC
+            && (starts_with(name, b"/sysroot/debian/lib")
+                || starts_with(name, b"/sysroot/debian/usr/lib"));
 
         if !skip_initrd && !basename.is_empty() {
             let mut slot = None;
@@ -1400,18 +1557,18 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
                         if let Some(f) = fd {
                             ctx.child_fds[f] = 12;
                             ctx.initrd_files[slot] = [file_buf, sz, 0, f as u64];
-                            // Wine trace: initrd opens
-                            if ctx.pid <= 5 {
+                            trace!(Debug, FS, {
                                 print(b"IRD-HIT P"); print_u64(ctx.pid as u64);
                                 print(b" fd="); print_u64(f as u64);
                                 print(b" d=1 sz="); print_u64(sz);
-                                print(b" ["); for &b in basename { sys::debug_print(b); } print(b"]\n");
-                            }
+                                print(b" ["); for &b in basename { sys::debug_print(b); } print(b"]");
+                            });
                             if path_len >= 8 && &name[path_len-8..path_len] == b"ntdll.so" && ctx.pid < 16 {
                                 unsafe { (*crate::syscalls::mm::NTDLL_SO_FD.get())[ctx.pid] = f as u8; }
-                                print(b"NTDLL-FD P"); crate::framebuffer::print_u64(ctx.pid as u64);
-                                print(b" fd="); crate::framebuffer::print_u64(f as u64);
-                                print(b"\n");
+                                trace!(Info, FS, {
+                                    print(b"NTDLL-FD P"); crate::framebuffer::print_u64(ctx.pid as u64);
+                                    print(b" fd="); crate::framebuffer::print_u64(f as u64);
+                                });
                             }
                             reply_val(ctx.ep_cap, f as i64);
                             opened_initrd = true;
@@ -1473,10 +1630,11 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
             };
             vfs_unlock();
 
-            if ctx.pid > 1 && has_creat && vfs_result.is_none() {
-                print(b"CREAT-FAIL: ");
-                print(name);
-                print(b"\n");
+            if has_creat && vfs_result.is_none() {
+                trace!(Error, FS, {
+                    print(b"CREAT-FAIL: ");
+                    print(name);
+                });
             }
 
             match vfs_result {
@@ -1491,17 +1649,16 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
                         ctx.child_fds[f] = if is_dir { 14 } else { 13 };
                         ctx.vfs_files[vs] = [oid, size, 0, f as u64];
                         ctx.fd_flags[f] = flags;
-                        if ctx.pid >= 5 {
+                        trace!(Debug, FS, {
                             print(b"OPENAT-OK P"); print_u64(ctx.pid as u64);
                             print(b" fd="); print_u64(f as u64);
                             print(b" oid=0x"); crate::framebuffer::print_hex64(oid);
                             print(b" vs="); print_u64(vs as u64);
                             print(b" fl=0x"); crate::framebuffer::print_hex64(flags as u64);
-                            print(b"\n");
-                        }
+                        });
                         reply_val(ctx.ep_cap, f as i64);
                     } else {
-                        if ctx.pid >= 5 {
+                        trace!(Error, FS, {
                             print(b"OPENAT-EMFILE P"); print_u64(ctx.pid as u64);
                             let mut used = 0u64;
                             for s in 0..GRP_MAX_VFS { if ctx.vfs_files[s][0] != 0 { used += 1; } }
@@ -1509,8 +1666,7 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
                             let mut fd_used = 0u64;
                             for i in 3..GRP_MAX_FDS { if ctx.child_fds[i] != 0 { fd_used += 1; } }
                             print(b" fd_used="); print_u64(fd_used);
-                            print(b"\n");
-                        }
+                        });
                         reply_val(ctx.ep_cap, -EMFILE);
                     }
                 }
@@ -1579,8 +1735,11 @@ pub(crate) fn sys_fstatat(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let flags = msg.regs[3] as u32;
     let mut path = [0u8; 128];
     let path_len = ctx.guest_copy_path(path_ptr, &mut path);
-    if ctx.pid == 2 && starts_with(&path[..path_len], b"/usr/share/X11") {
-        print(b"FSTATAT-XKB P2 ["); for &b in &path[..path_len] { sys::debug_print(b); } print(b"]\n");
+    if starts_with(&path[..path_len], b"/usr/share/X11") {
+        trace!(Debug, FS, {
+            print(b"FSTATAT-XKB P"); print_u64(ctx.pid as u64);
+            print(b" ["); for &b in &path[..path_len] { sys::debug_print(b); } print(b"]");
+        });
     }
     let (path, path_len) = if path_len > 0 && path[0] != b'/' {
         let mut abs = [0u8; 256];
@@ -1856,10 +2015,11 @@ pub(crate) fn sys_access(ctx: &mut SyscallContext, msg: &IpcMsg, syscall_nr: u64
                         store.resolve_path(name, sotos_objstore::ROOT_OID).ok()
                     }).is_some();
                     vfs_unlock();
-                    if ctx.pid > 1 && name.windows(6).any(|w| w == b"config") {
-                        print(if found { b"ACCESS-OK: " } else { b"ACCESS-MISS: " });
-                        print(name);
-                        print(b"\n");
+                    if name.windows(6).any(|w| w == b"config") {
+                        trace!(Debug, FS, {
+                            print(if found { b"ACCESS-OK: " } else { b"ACCESS-MISS: " });
+                            print(name);
+                        });
                     }
                     reply_val(ctx.ep_cap, if found { 0 } else { -ENOENT });
                 }
@@ -1921,12 +2081,12 @@ pub(crate) fn sys_rename(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let old_name = &old_path[..old_len];
     let new_name = &new_path[..new_len];
 
-    if ctx.pid >= 3 {
+    trace!(Debug, FS, {
         print(b"RENAME P"); print_u64(ctx.pid as u64);
         print(b" ["); for &b in old_name { sys::debug_print(b); }
         print(b"] -> ["); for &b in new_name { sys::debug_print(b); }
-        print(b"]\n");
-    }
+        print(b"]");
+    });
 
     vfs_lock();
     let result = unsafe { shared_store() }.and_then(|store| {
@@ -1934,7 +2094,7 @@ pub(crate) fn sys_rename(ctx: &mut SyscallContext, msg: &IpcMsg) {
         let old_oid = match store.resolve_path(old_name, ROOT_OID) {
             Ok(oid) => oid,
             Err(_) => {
-                if ctx.pid >= 3 { print(b"RENAME-FAIL: old path not found\n"); }
+                trace!(Error, FS, { print(b"RENAME-FAIL: old path not found"); });
                 return None;
             }
         };
@@ -1950,11 +2110,11 @@ pub(crate) fn sys_rename(ctx: &mut SyscallContext, msg: &IpcMsg) {
                         match store.resolve_path(pp, ROOT_OID) {
                             Ok(p) => p,
                             Err(_) => {
-                                if ctx.pid >= 3 {
+                                trace!(Error, FS, {
                                     print(b"RENAME-FAIL: new parent not found [");
                                     for &b in pp { sys::debug_print(b); }
-                                    print(b"]\n");
-                                }
+                                    print(b"]");
+                                });
                                 return None;
                             }
                         }
@@ -1964,28 +2124,31 @@ pub(crate) fn sys_rename(ctx: &mut SyscallContext, msg: &IpcMsg) {
             None => (ROOT_OID, new_name),
         };
         if let Err(e) = store.rename(old_oid, new_basename, new_parent) {
-            if ctx.pid >= 3 {
+            trace!(Error, FS, {
                 print(b"RENAME-FAIL: store.rename err=[");
                 print(e.as_bytes());
-                print(b"]\n");
-            }
+                print(b"]");
+            });
             return None;
         }
         if let Some(entry) = store.stat(old_oid) {
             if entry.is_dir() {
-                print(b"REN-POSTCHECK-DIR: oid=");
-                print_u64(old_oid);
-                print(b" flags=");
-                print_u64(entry.flags as u64);
-                print(b" name=[");
-                print(entry.name_as_str());
-                print(b"]\n");
+                trace!(Debug, FS, {
+                    print(b"REN-POSTCHECK-DIR: oid=");
+                    print_u64(old_oid);
+                    print(b" flags=");
+                    print_u64(entry.flags as u64);
+                    print(b" name=[");
+                    print(entry.name_as_str());
+                    print(b"]");
+                });
             }
         }
         if store.resolve_path(old_name, ROOT_OID).is_ok() {
-            print(b"REN-OLDNAME-STILL-EXISTS: ");
-            print(old_name);
-            print(b"\n");
+            trace!(Error, FS, {
+                print(b"REN-OLDNAME-STILL-EXISTS: ");
+                print(old_name);
+            });
         }
         Some(())
     });
@@ -2042,8 +2205,11 @@ pub(crate) fn sys_statx(ctx: &mut SyscallContext, msg: &IpcMsg) {
     };
     let name = &path[..path_len];
 
-    if ctx.pid == 2 && starts_with(name, b"/usr/share/X11") {
-        print(b"STATX P2 ["); for &b in name { sys::debug_print(b); } print(b"]\n");
+    if starts_with(name, b"/usr/share/X11") {
+        trace!(Debug, FS, {
+            print(b"STATX P"); print_u64(ctx.pid as u64);
+            print(b" ["); for &b in name { sys::debug_print(b); } print(b"]");
+        });
     }
 
     // Check initrd by basename
@@ -2155,10 +2321,10 @@ pub(crate) fn sys_creat(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let path_ptr = msg.regs[0];
     let mut path = [0u8; 128];
     let path_len = ctx.guest_copy_path(path_ptr, &mut path);
-    if ctx.pid >= 3 {
+    trace!(Debug, FS, {
         print(b"CREAT P"); print_u64(ctx.pid as u64);
-        print(b" ["); for &b in &path[..path_len] { sys::debug_print(b); } print(b"]\n");
-    }
+        print(b" ["); for &b in &path[..path_len] { sys::debug_print(b); } print(b"]");
+    });
     let (path, path_len) = if path_len > 0 && path[0] != b'/' {
         let mut abs = [0u8; 256];
         let alen = resolve_with_cwd(ctx.cwd, &path[..path_len], &mut abs);
@@ -2649,10 +2815,10 @@ pub(crate) fn sys_unlink(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let mut abs = [0u8; 256];
     let alen = resolve_with_cwd(ctx.cwd, &path[..plen], &mut abs);
     let abs_name = &abs[..alen];
-    if ctx.pid >= 3 {
+    trace!(Debug, FS, {
         print(b"UNLINK P"); print_u64(ctx.pid as u64);
-        print(b" ["); for &b in abs_name { if b == 0 { break; } sys::debug_print(b); } print(b"]\n");
-    }
+        print(b" ["); for &b in abs_name { if b == 0 { break; } sys::debug_print(b); } print(b"]");
+    });
     // Unix semantics: unlink removes the name but data stays alive while
     // any fd references the OID. For Wine's tmpmap pattern (create → write →
     // unlink → mmap → share fd via SCM_RIGHTS), we must keep data accessible.
@@ -2683,11 +2849,11 @@ pub(crate) fn sys_unlinkat(ctx: &mut SyscallContext, msg: &IpcMsg) {
         (path, plen)
     };
     let name = &path[..plen];
-    if ctx.pid >= 3 {
+    trace!(Debug, FS, {
         print(b"UNLINKAT P"); print_u64(ctx.pid as u64);
         print(b" fl=0x"); crate::framebuffer::print_hex64(flags as u64);
-        print(b" ["); for &b in name { if b == 0 { break; } sys::debug_print(b); } print(b"]\n");
-    }
+        print(b" ["); for &b in name { if b == 0 { break; } sys::debug_print(b); } print(b"]");
+    });
     if flags & 0x200 != 0 {
         reply_val(ctx.ep_cap, 0);
     } else {
@@ -2726,19 +2892,19 @@ pub(crate) fn sys_renameat(ctx: &mut SyscallContext, msg: &IpcMsg) {
         resolved[..rlen].copy_from_slice(&abs[..rlen]);
         (resolved, rlen)
     } else { (newpath, nlen) };
-    if ctx.pid >= 3 {
+    trace!(Debug, FS, {
         print(b"RENAMEAT P"); print_u64(ctx.pid as u64);
         print(b" ["); for &b in &oldpath[..olen] { sys::debug_print(b); }
         print(b"] -> ["); for &b in &newpath[..nlen] { sys::debug_print(b); }
-        print(b"]\n");
-    }
+        print(b"]");
+    });
     vfs_lock();
     let result = unsafe { shared_store() }.and_then(|store| {
         use sotos_objstore::ROOT_OID;
         let oid = match store.resolve_path(&oldpath[..olen], ROOT_OID) {
             Ok(o) => o,
             Err(_) => {
-                if ctx.pid >= 3 { print(b"RENAMEAT-FAIL: old not found\n"); }
+                trace!(Error, FS, { print(b"RENAMEAT-FAIL: old not found"); });
                 return None;
             }
         };
@@ -2750,7 +2916,7 @@ pub(crate) fn sys_renameat(ctx: &mut SyscallContext, msg: &IpcMsg) {
                     match store.resolve_path(&newpath[..pos], ROOT_OID) {
                         Ok(p) => p,
                         Err(_) => {
-                            if ctx.pid >= 3 { print(b"RENAMEAT-FAIL: new parent not found\n"); }
+                            trace!(Error, FS, { print(b"RENAMEAT-FAIL: new parent not found"); });
                             return None;
                         }
                     }
@@ -2760,11 +2926,11 @@ pub(crate) fn sys_renameat(ctx: &mut SyscallContext, msg: &IpcMsg) {
             None => (ROOT_OID, &newpath[..nlen]),
         };
         if let Err(e) = store.rename(oid, fname, parent) {
-            if ctx.pid >= 3 {
+            trace!(Error, FS, {
                 print(b"RENAMEAT-FAIL: store err=[");
                 print(e.as_bytes());
-                print(b"]\n");
-            }
+                print(b"]");
+            });
             return None;
         }
         Some(())

@@ -157,11 +157,11 @@ pub(crate) fn sys_mkdir(ctx: &mut SyscallContext, msg: &IpcMsg) {
         }
     }
     vfs_unlock();
-    if ctx.pid > 1 {
-        print(b"MKDIR: ");
-        print(abs_name);
-        print(if mkdir_ok { b" OK\n" } else { b" FAIL\n" });
-    }
+    trace!(Debug, FS, {
+        print(b"MKDIR P"); print_u64(ctx.pid as u64);
+        print(b" "); print(abs_name);
+        print(if mkdir_ok { b" OK" } else { b" FAIL" });
+    });
     reply_val(ctx.ep_cap, if mkdir_ok { 0 } else { -ENOSPC });
 }
 
@@ -200,11 +200,11 @@ pub(crate) fn sys_mkdirat(ctx: &mut SyscallContext, msg: &IpcMsg) {
         }
     });
     vfs_unlock();
-    if ctx.pid > 1 {
-        print(b"MKDIR: ");
-        print(name);
-        if result.is_some() { print(b" OK\n"); } else { print(b" FAIL\n"); }
-    }
+    trace!(Debug, FS, {
+        print(b"MKDIRAT P"); print_u64(ctx.pid as u64);
+        print(b" "); print(name);
+        if result.is_some() { print(b" OK"); } else { print(b" FAIL"); }
+    });
     reply_val(ctx.ep_cap, if result.is_some() { 0 } else { -ENOSPC });
 }
 
@@ -253,10 +253,10 @@ pub(crate) fn sys_chdir(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let mut abs = [0u8; 256];
     let alen = resolve_with_cwd(ctx.cwd, name, &mut abs);
     let abs_name = &abs[..alen];
-    if ctx.pid >= 3 {
+    trace!(Debug, FS, {
         print(b"CHDIR P"); print_u64(ctx.pid as u64);
-        print(b" ["); for &b in abs_name { if b == 0 { break; } sys::debug_print(b); } print(b"]\n");
-    }
+        print(b" ["); for &b in abs_name { if b == 0 { break; } sys::debug_print(b); } print(b"]");
+    });
     let is_root = alen == 1 && abs[0] == b'/';
     let is_well_known = abs_name == b"/tmp" || abs_name == b"/home"
         || abs_name == b"/var" || abs_name == b"/usr"
@@ -289,14 +289,13 @@ pub(crate) fn sys_chdir(ctx: &mut SyscallContext, msg: &IpcMsg) {
 /// SYS_FCHDIR (81): change CWD via file descriptor.
 pub(crate) fn sys_fchdir(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let fd = msg.regs[0] as usize;
-    if ctx.pid >= 3 {
-        print(b"FCHDIR-DBG P"); print_u64(ctx.pid as u64);
+    trace!(Debug, FS, {
+        print(b"FCHDIR P"); print_u64(ctx.pid as u64);
         print(b" fd="); print_u64(fd as u64);
         if fd < crate::fd::GRP_MAX_FDS { print(b" k="); print_u64(ctx.child_fds[fd] as u64); }
         print(b" slot="); print_u64(ctx.sock_conn_id[fd] as u64);
         print(b" grp="); print_u64((ctx.pid.saturating_sub(1) * 8) as u64);
-        print(b"\n");
-    }
+    });
     if fd >= GRP_MAX_FDS || ctx.child_fds[fd] != 14 {
         reply_val(ctx.ep_cap, -EBADF);
         return;
@@ -312,19 +311,20 @@ pub(crate) fn sys_fchdir(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let mut plen = 0;
     while plen < 127 && path[plen] != 0 { plen += 1; }
     if plen == 0 {
-        print(b"FCHDIR-ENOENT P"); print_u64(ctx.pid as u64);
-        print(b" gslot="); print_u64(global_slot as u64);
-        print(b"\n");
+        trace!(Error, FS, {
+            print(b"FCHDIR-ENOENT P"); print_u64(ctx.pid as u64);
+            print(b" gslot="); print_u64(global_slot as u64);
+        });
         reply_val(ctx.ep_cap, -ENOENT);
         return;
     }
     let copy_len = plen.min(GRP_CWD_MAX - 1);
     ctx.cwd[..copy_len].copy_from_slice(&path[..copy_len]);
     ctx.cwd[copy_len] = 0;
-    if ctx.pid >= 3 {
+    trace!(Debug, FS, {
         print(b"FCHDIR P"); print_u64(ctx.pid as u64);
         print(b" fd="); print_u64(fd as u64);
-        print(b" ["); for &b in &ctx.cwd[..copy_len] { if b == 0 { break; } sys::debug_print(b); } print(b"]\n");
-    }
+        print(b" ["); for &b in &ctx.cwd[..copy_len] { if b == 0 { break; } sys::debug_print(b); } print(b"]");
+    });
     reply_val(ctx.ep_cap, 0);
 }
