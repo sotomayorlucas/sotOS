@@ -74,6 +74,9 @@ pub(crate) struct ProcessState {
 
     // Executable path for /proc/self/exe (set at exec time)
     pub exe_path: [AtomicU64; 4],       // up to 32 bytes (NUL-terminated)
+
+    // Process personality (ABI namespace): 0=DEFAULT/musl, 1=GLIBC
+    pub personality: AtomicU64,
 }
 
 impl ProcessState {
@@ -110,6 +113,7 @@ impl ProcessState {
             robust_list_len: AtomicU64::new(0),
             proc_name: [const { AtomicU64::new(0) }; 2],
             exe_path: [const { AtomicU64::new(0) }; 4],
+            personality: AtomicU64::new(0),
         }
     }
 }
@@ -121,6 +125,23 @@ pub(crate) static PROCESSES: [ProcessState; MAX_PROCS] =
 /// Init's own address space capability (from BootInfo.self_as_cap).
 /// Set once at startup, read by child_handler for CoW fork.
 pub(crate) static INIT_SELF_AS_CAP: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// Process personality (ABI namespace isolation)
+// ---------------------------------------------------------------------------
+pub(crate) const PERS_DEFAULT: u64 = 0; // musl/Alpine — searches initrd for libs
+pub(crate) const PERS_GLIBC: u64 = 1;   // glibc/Debian — skips initrd for libs
+
+pub(crate) fn get_personality(pid: usize) -> u64 {
+    if pid == 0 || pid > MAX_PROCS { return 0; }
+    PROCESSES[pid - 1].personality.load(Ordering::Acquire)
+}
+
+pub(crate) fn set_personality(pid: usize, val: u64) {
+    if pid > 0 && pid <= MAX_PROCS {
+        PROCESSES[pid - 1].personality.store(val, Ordering::Release);
+    }
+}
 
 // Signal constants
 pub(crate) const _SA_NOCLDSTOP: u64 = 1;

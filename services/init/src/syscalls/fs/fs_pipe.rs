@@ -157,7 +157,7 @@ pub(crate) fn read_unix_socket(ctx: &mut SyscallContext, fd: usize, buf_ptr: u64
 /// Handle sys_write for pipe write end (kind=11).
 pub(crate) fn write_pipe(ctx: &mut SyscallContext, fd: usize, buf_ptr: u64, len: usize) {
     let pipe_id = ctx.sock_conn_id[fd] as usize;
-    // Pipe write tracing disabled for performance
+    // Pipe write tracing (disabled for performance)
     if false && ctx.pid >= 2 && len > 60 {
         print(b"PW P"); print_u64(ctx.pid as u64);
         print(b" fd="); print_u64(fd as u64);
@@ -303,39 +303,23 @@ pub(crate) fn writev_pipe(ctx: &mut SyscallContext, fd: usize, iov_ptr: u64, iov
     let pipe_id = ctx.sock_conn_id[fd] as usize;
     let cnt = iovcnt.min(16);
     let mut total = 0usize;
-    // Pipe writev tracing for Wine IPC debugging
-    if ctx.pid >= 2 && cnt > 0 {
-        // Compute total length
+    // Pipe writev tracing — use guest_read for cross-AS processes (P5 = wineserver)
+    if ctx.pid == 5 && cnt > 0 {
+        // Read iovecs via guest_read (not raw pointer — different address space!)
         let mut tlen = 0usize;
         for j in 0..cnt {
             let e = iov_ptr + (j as u64) * 16;
             if e + 16 > 0x0000_8000_0000_0000 { break; }
-            let il = unsafe { *((e + 8) as *const u64) } as usize;
+            let il = ctx.guest_read_u64(e + 8) as usize;
             tlen += il;
         }
         print(b"PIPEV-W P"); print_u64(ctx.pid as u64);
         print(b" fd="); print_u64(fd as u64);
         print(b" pipe="); print_u64(pipe_id as u64);
         print(b" len="); print_u64(tlen as u64);
-        print(b" [");
-        let mut shown = 0usize;
-        for j in 0..cnt {
-            let e = iov_ptr + (j as u64) * 16;
-            if e + 16 > 0x0000_8000_0000_0000 { break; }
-            let base = unsafe { *(e as *const u64) };
-            let il = unsafe { *((e + 8) as *const u64) } as usize;
-            if base == 0 || il == 0 { continue; }
-            let lim = il.min(80 - shown);
-            for k in 0..lim {
-                let b = unsafe { *(base as *const u8).add(k) };
-                if b == 0x0A { print(b"\\n"); }
-                else if b >= 0x20 && b < 0x7F { sys::debug_print(b); }
-                else { print(b"."); }
-            }
-            shown += lim;
-            if shown >= 80 { break; }
-        }
-        print(b"]\n");
+        print(b" iov="); crate::framebuffer::print_hex64(iov_ptr);
+        print(b" cnt="); print_u64(cnt as u64);
+        print(b"\n");
     }
     // Compute expected total for partial-write detection
     let mut expected_total = 0usize;

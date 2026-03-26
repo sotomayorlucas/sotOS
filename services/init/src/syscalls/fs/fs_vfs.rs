@@ -13,6 +13,7 @@ use sotos_common::IpcMsg;
 use core::sync::atomic::Ordering;
 use crate::exec::{reply_val, rdtsc, starts_with,
                   format_uptime_into, format_proc_self_stat};
+use crate::process::{get_personality, PERS_GLIBC};
 use crate::process::*;
 use crate::fd::*;
 use crate::child_handler::open_virtual_file;
@@ -342,7 +343,9 @@ pub(crate) fn sys_fstat(ctx: &mut SyscallContext, msg: &IpcMsg) {
         for s in 0..GRP_MAX_INITRD {
             if ctx.initrd_files[s][3] == fd as u64 && ctx.initrd_files[s][0] != 0 {
                 size = ctx.initrd_files[s][1];
-                ino = ctx.initrd_files[s][0];
+                // Use file SIZE as stable inode — same file opened twice gets
+                // same ino so glibc ld.so detects "already loaded".
+                ino = ctx.initrd_files[s][1];
                 break;
             }
         }
@@ -433,7 +436,9 @@ pub(crate) fn sys_stat(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let basename = &name[basename_start..];
     if !basename.is_empty() {
         if let Ok(sz) = sys::initrd_read(basename.as_ptr() as u64, basename.len() as u64, 0, 0) {
-            let buf = build_linux_stat(0, sz, false);
+            // dev=1 + ino=size — must match fstat/fstatat for same initrd file
+            // so glibc ld.so recognizes already-loaded libraries
+            let buf = build_linux_stat_dev(1, sz, sz, false);
             ctx.guest_write(stat_ptr, &buf);
             reply_val(ctx.ep_cap, 0);
             return;
@@ -853,6 +858,13 @@ pub(crate) fn sys_open(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 ctx.vfs_files[vs] = [oid, size, 0, f as u64];
                 ctx.fd_flags[f] = flags;
                 if is_dir { dir_store_path(ctx, f, name); }
+                // Wine trace: VFS opens
+                if ctx.pid <= 5 && !is_dir {
+                    print(b"VFS-HIT P"); print_u64(ctx.pid as u64);
+                    print(b" fd="); print_u64(f as u64);
+                    print(b" d=2 oid="); crate::framebuffer::print_hex64(oid);
+                    print(b" ["); for &b in &name[..path_len.min(40)] { sys::debug_print(b); } print(b"]\n");
+                }
                 if path_len >= 8 && &name[path_len-8..path_len] == b"ntdll.so" && ctx.pid < 16 {
                     unsafe { (*crate::syscalls::mm::NTDLL_SO_FD.get())[ctx.pid] = f as u8; }
                     print(b"NTDLL-FD P"); crate::framebuffer::print_u64(ctx.pid as u64);
@@ -873,8 +885,11 @@ pub(crate) fn sys_open(ctx: &mut SyscallContext, msg: &IpcMsg) {
         }
         let basename = &name[basename_start..];
         let mut opened_initrd = false;
+        // Personality-aware initrd filter: reserved for future use.
+        // Wine handles missing musl gracefully (re-exec), so no filtering needed.
+        let skip_initrd = false;
 
-        if !basename.is_empty() {
+        if !skip_initrd && !basename.is_empty() {
             let mut slot = None;
             for s in 0..GRP_MAX_INITRD {
                 if ctx.initrd_files[s][0] == 0 { slot = Some(s); break; }
@@ -1224,11 +1239,67 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
             print(b"OA P"); crate::framebuffer::print_u64(ctx.pid as u64);
             print(b" ["); for &b in name { sys::debug_print(b); } print(b"]\n");
         }
-        let is_lib_path = starts_with(name, b"/lib/") || starts_with(name, b"/usr/lib/");
+        // Wine debug: log all openat results for P3 with kind + dev info
+        let _wine_trace_pid = ctx.pid;
         let oflags = OFlags::from_bits_truncate(flags as u32);
         let has_creat = oflags.contains(OFlags::CREAT);
         let has_trunc = oflags.contains(OFlags::TRUNC);
         let has_dir = oflags.contains(OFlags::DIRECTORY);
+
+        // For library paths, check initrd FIRST to avoid VFS/disk shadow.
+        // If the same .so exists in both VFS (disk, dev=2) and initrd (dev=1),
+        // glibc ld.so loads both with different identities → fatal assertion.
+        // By preferring initrd for /lib/ paths, we ensure consistent (dev, ino).
+        let initrd_first = starts_with(name, b"/lib/") || starts_with(name, b"/usr/lib/");
+        if initrd_first && !has_creat {
+            let mut bn_start = 0usize;
+            for idx in 0..path_len { if name[idx] == b'/' { bn_start = idx + 1; } }
+            let bn = &name[bn_start..];
+            if !bn.is_empty() {
+                if let Ok(sz) = sys::initrd_read(bn.as_ptr() as u64, bn.len() as u64, 0, 0) {
+                    if sz > 0 {
+                        // File exists in initrd — use initrd path (skip VFS)
+                        let mut slot = None;
+                        for s in 0..GRP_MAX_INITRD {
+                            if ctx.initrd_files[s][0] == 0 { slot = Some(s); break; }
+                        }
+                        if let Some(slot) = slot {
+                            let file_buf = ctx.initrd_file_buf_base + (slot as u64) * 0xC000000;
+                            let buf_pages = ((sz as u64 + 0xFFF) / 0x1000).min(0x3000000 / 0x1000);
+                            let mut buf_ok = true;
+                            for p in 0..buf_pages {
+                                if let Ok(f) = sys::frame_alloc() {
+                                    if sys::map(file_buf + p * 0x1000, f, 2).is_err() {
+                                        buf_ok = false; break;
+                                    }
+                                } else { buf_ok = false; break; }
+                            }
+                            if buf_ok {
+                                if let Ok(actual_sz) = sys::initrd_read(
+                                    bn.as_ptr() as u64, bn.len() as u64,
+                                    file_buf, buf_pages * 0x1000,
+                                ) {
+                                    let mut fd = None;
+                                    for i in 3..GRP_MAX_FDS { if ctx.child_fds[i] == 0 { fd = Some(i); break; } }
+                                    if let Some(f) = fd {
+                                        ctx.child_fds[f] = 12;
+                                        ctx.initrd_files[slot] = [file_buf, actual_sz, 0, f as u64];
+                                        reply_val(ctx.ep_cap, f as i64);
+                                        return;
+                                    } else {
+                                        for p in 0..buf_pages { let _ = sys::unmap_free(file_buf + p * 0x1000); }
+                                        reply_val(ctx.ep_cap, -EMFILE);
+                                        return;
+                                    }
+                                } else {
+                                    for p in 0..buf_pages { let _ = sys::unmap_free(file_buf + p * 0x1000); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Step 1: Try VFS resolve
         vfs_lock();
@@ -1264,6 +1335,13 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 ctx.vfs_files[vs] = [oid, size, 0, f as u64];
                 ctx.fd_flags[f] = flags;
                 if is_dir { dir_store_path(ctx, f, name); }
+                // Wine trace: VFS opens
+                if ctx.pid <= 5 && !is_dir {
+                    print(b"VFS-HIT P"); print_u64(ctx.pid as u64);
+                    print(b" fd="); print_u64(f as u64);
+                    print(b" d=2 oid="); crate::framebuffer::print_hex64(oid);
+                    print(b" ["); for &b in &name[..path_len.min(40)] { sys::debug_print(b); } print(b"]\n");
+                }
                 if path_len >= 8 && &name[path_len-8..path_len] == b"ntdll.so" && ctx.pid < 16 {
                     unsafe { (*crate::syscalls::mm::NTDLL_SO_FD.get())[ctx.pid] = f as u8; }
                     print(b"NTDLL-FD P"); crate::framebuffer::print_u64(ctx.pid as u64);
@@ -1284,8 +1362,11 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
         }
         let basename = &name[basename_start..];
         let mut opened_initrd = false;
+        // Personality-aware initrd filter: reserved for future use.
+        // Wine handles missing musl gracefully (re-exec), so no filtering needed.
+        let skip_initrd = false;
 
-        if !basename.is_empty() {
+        if !skip_initrd && !basename.is_empty() {
             let mut slot = None;
             for s in 0..GRP_MAX_INITRD {
                 if ctx.initrd_files[s][0] == 0 { slot = Some(s); break; }
@@ -1319,6 +1400,13 @@ pub(crate) fn sys_openat(ctx: &mut SyscallContext, msg: &IpcMsg) {
                         if let Some(f) = fd {
                             ctx.child_fds[f] = 12;
                             ctx.initrd_files[slot] = [file_buf, sz, 0, f as u64];
+                            // Wine trace: initrd opens
+                            if ctx.pid <= 5 {
+                                print(b"IRD-HIT P"); print_u64(ctx.pid as u64);
+                                print(b" fd="); print_u64(f as u64);
+                                print(b" d=1 sz="); print_u64(sz);
+                                print(b" ["); for &b in basename { sys::debug_print(b); } print(b"]\n");
+                            }
                             if path_len >= 8 && &name[path_len-8..path_len] == b"ntdll.so" && ctx.pid < 16 {
                                 unsafe { (*crate::syscalls::mm::NTDLL_SO_FD.get())[ctx.pid] = f as u8; }
                                 print(b"NTDLL-FD P"); crate::framebuffer::print_u64(ctx.pid as u64);
@@ -1515,7 +1603,9 @@ pub(crate) fn sys_fstatat(ctx: &mut SyscallContext, msg: &IpcMsg) {
                 for s in 0..GRP_MAX_INITRD {
                     if ctx.initrd_files[s][3] == fd as u64 && ctx.initrd_files[s][0] != 0 {
                         size = ctx.initrd_files[s][1];
-                        ino = ctx.initrd_files[s][0];
+                        // Use file SIZE as stable inode — same file opened twice gets
+                        // same ino so glibc ld.so detects "already loaded" (not dup load)
+                        ino = ctx.initrd_files[s][1];
                         break;
                     }
                 }
@@ -1553,7 +1643,9 @@ pub(crate) fn sys_fstatat(ctx: &mut SyscallContext, msg: &IpcMsg) {
     let basename = &name[basename_start..];
     if !basename.is_empty() {
         if let Ok(sz) = sys::initrd_read(basename.as_ptr() as u64, basename.len() as u64, 0, 0) {
-            let buf = build_linux_stat(0, sz, false);
+            // dev=1 + ino=size — must match fstat/fstatat for same initrd file
+            // so glibc ld.so recognizes already-loaded libraries
+            let buf = build_linux_stat_dev(1, sz, sz, false);
             ctx.guest_write(stat_ptr, &buf);
             reply_val(ctx.ep_cap, 0);
             return;
@@ -2561,14 +2653,17 @@ pub(crate) fn sys_unlink(ctx: &mut SyscallContext, msg: &IpcMsg) {
         print(b"UNLINK P"); print_u64(ctx.pid as u64);
         print(b" ["); for &b in abs_name { if b == 0 { break; } sys::debug_print(b); } print(b"]\n");
     }
+    // Unix semantics: unlink removes the name but data stays alive while
+    // any fd references the OID. For Wine's tmpmap pattern (create → write →
+    // unlink → mmap → share fd via SCM_RIGHTS), we must keep data accessible.
+    // Stub: return success without deleting — data preserved for open fds.
     vfs_lock();
-    let result = unsafe { shared_store() }.and_then(|store| {
+    let found = unsafe { shared_store() }.and_then(|store| {
         use sotos_objstore::ROOT_OID;
         store.resolve_path(abs_name, ROOT_OID).ok()
-            .and_then(|oid| store.delete(oid).ok())
     });
     vfs_unlock();
-    reply_val(ctx.ep_cap, if result.is_some() { 0 } else { -ENOENT });
+    reply_val(ctx.ep_cap, if found.is_some() { 0 } else { -ENOENT });
 }
 
 /// SYS_UNLINKAT (263).
@@ -2596,14 +2691,14 @@ pub(crate) fn sys_unlinkat(ctx: &mut SyscallContext, msg: &IpcMsg) {
     if flags & 0x200 != 0 {
         reply_val(ctx.ep_cap, 0);
     } else {
+        // Stub: preserve data for open fds (Wine tmpmap pattern)
         vfs_lock();
-        let result = unsafe { shared_store() }.and_then(|store| {
+        let found = unsafe { shared_store() }.and_then(|store| {
             use sotos_objstore::ROOT_OID;
             store.resolve_path(name, ROOT_OID).ok()
-                .and_then(|oid| store.delete(oid).ok())
         });
         vfs_unlock();
-        reply_val(ctx.ep_cap, if result.is_some() { 0 } else { -ENOENT });
+        reply_val(ctx.ep_cap, if found.is_some() { 0 } else { -ENOENT });
     }
 }
 

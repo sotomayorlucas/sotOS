@@ -184,6 +184,14 @@ fn sysroot_init(store: &mut ObjectStore) {
             }
         }
     }
+    // NOTE: Do NOT create /lib/x86_64-linux-gnu/ — it interferes with ld-linux's
+    // library resolution by making VFS resolve partially succeed for a path that
+    // should fall through to the initrd. The directory will be created on-demand
+    // when disk content is accessed via ls.
+    // NOTE: Do NOT provide libc.musl-x86_64.so.1 in VFS or initrd.
+    // Wine handles the missing musl gracefully: dlopen(ntdll.so) fails,
+    // Wine re-execs itself, and the second pass works without musl.
+    // If musl IS found, glibc's ld.so crashes with a dual-libc assertion.
     print(b"LUCAS: sysroot dirs initialized\n");
 }
 

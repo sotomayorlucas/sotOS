@@ -591,6 +591,7 @@ def main():
         'libunwind8': 'libunwind8',
         'liblzma5': 'liblzma5',
         'libc6': 'libc6',
+        'musl': 'musl',
     }
 
     deb_paths = {}
@@ -659,46 +660,23 @@ def main():
                     _sh.copy2(src, dst)
 
     # From libunwind8 package: libunwind.so.8
-    if 'libunwind8' in deb_paths:
-        print("  Extracting libunwind.so.8...")
-        files = extract_files_from_deb(deb_paths['libunwind8'][1], [
-            ("usr/lib/x86_64-linux-gnu/libunwind.so.8", "lib/libunwind.so.8"),
-            ("usr/lib/x86_64-linux-gnu/libunwind-x86_64.so.8", "lib/libunwind-x86_64.so.8"),
-        ], SYSROOT)
-        all_extracted.update(files)
+    # NOTE: libunwind is served from the initrd — do NOT put on disk.
+    # Having it on disk with dev=2 while initrd has it with dev=1 triggers
+    # glibc ld.so's duplicate library detection during dlopen(ntdll.so).
 
     # From liblzma5 package: liblzma.so.5 (dependency of libunwind)
-    if 'liblzma5' in deb_paths:
-        print("  Extracting liblzma.so.5...")
-        files = extract_files_from_deb(deb_paths['liblzma5'][1], [
-            ("usr/lib/x86_64-linux-gnu/liblzma.so.5", "lib/liblzma.so.5"),
-            ("lib/x86_64-linux-gnu/liblzma.so.5", "lib/liblzma.so.5"),
-        ], SYSROOT)
-        all_extracted.update(files)
+    # NOTE: liblzma is served from the initrd — same dual-identity issue.
 
     # Fetch glibc from Debian Bookworm (2.36 — supports non-page-aligned PT_LOAD)
     # Ubuntu 22.04's glibc 2.35 ld-linux rejects non-page-aligned segments in libc.so.6
-    if 'libc6' in deb_paths:
-        print("  Extracting glibc 2.36 (ld-linux + libc.so.6)...")
-        files = extract_files_from_deb(deb_paths['libc6'][1], [
-            ("lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", "lib/ld-linux-x86-64.so.2"),
-            ("lib/x86_64-linux-gnu/libc.so.6", "lib/libc.so.6"),
-        ], SYSROOT)
-        all_extracted.update(files)
-    else:
-        # Fallback: copy from project root
-        import shutil
-        for fname, dest in [
-            ("ld-linux-x86-64.so.2", "lib/ld-linux-x86-64.so.2"),
-            ("libc.so.6", "lib/libc.so.6"),
-        ]:
-            src = os.path.join(".", fname)
-            if os.path.isfile(src):
-                dst = os.path.join(SYSROOT, dest)
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst)
-                all_extracted[dest] = os.path.getsize(src)
-                print(f"  Copied {fname} -> {dest} ({os.path.getsize(src):,} bytes)")
+    # NOTE: glibc (ld-linux + libc.so.6) is served from the initrd.
+    # Do NOT put on disk — dual-identity (dev=1 vs dev=2) breaks ld.so.
+    # From musl package: libc.musl-x86_64.so.1 (Debian build, coexists with glibc)
+    # Wine's ntdll.so requires musl — Debian's musl package is built to work alongside glibc
+    # NOTE: Do NOT extract musl libc to disk — glibc's ld-linux will load it
+    # via dlopen(ntdll.so) dep resolution, causing a fatal dual-libc assertion.
+    # ntdll.so's deps (libc.so.6, libunwind.so.8) are served from the initrd.
+
     # libgcc_s from project root (if available)
     import shutil
     for fname, dest in [("libgcc_s.so.1", "lib/libgcc_s.so.1")]:

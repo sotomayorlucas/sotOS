@@ -618,8 +618,21 @@ pub(crate) fn scm_push_fd(conn: usize, direction: usize, kind: u8, conn_id: u32,
         SCM_FDS_OID[conn][direction][cnt] = oid;
         SCM_FDS_SIZE[conn][direction][cnt] = size;
         SCM_FDS_COUNT[conn][direction] = (cnt + 1) as u8;
-        true
     }
+    // Pre-increment pipe refcounts at send time (not just receive time).
+    // Prevents premature EOF: sender may close their fd before receiver
+    // pops the SCM, and without this the refcount hits 0 → PIPE_WRITE_CLOSED.
+    let p = conn_id as usize;
+    if kind == 10 && p < MAX_PIPES {
+        PIPE_READ_REFS[p].fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    }
+    if kind == 11 && p < MAX_PIPES {
+        PIPE_WRITE_REFS[p].fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    }
+    if (kind == 27 || kind == 28) && p < MAX_UNIX_CONNS {
+        UNIX_CONN_REFS[p].fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    }
+    true
 }
 
 /// Pop up to `max_pop` SCM_RIGHTS fds for a given connection+direction (receiver side).

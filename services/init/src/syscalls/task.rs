@@ -313,37 +313,17 @@ fn exit_cleanup(ctx: &mut SyscallContext, status: u64) {
     if memg < MAX_PROCS {
         unsafe { THREAD_GROUPS[memg].brk = 0; THREAD_GROUPS[memg].mmap_next = 0; }
     }
-    // Decrement pipe refcounts for any still-open pipe FDs before zeroing.
-    // This ensures PIPE_WRITE_CLOSED gets set when the last writer exits,
-    // allowing readers to see EOF instead of blocking forever.
+    // Close all open FDs properly (handles all kinds: pipes, unix sockets, eventfd, etc.)
     for f in 0..GRP_MAX_FDS {
-        let kind = ctx.child_fds[f];
-        if kind == 11 {
-            // Pipe write end — decrement write refs
-            let pipe_id = ctx.sock_conn_id[f] as usize;
-            if pipe_id < MAX_PIPES {
-                let prev = PIPE_WRITE_REFS[pipe_id].fetch_sub(1, Ordering::AcqRel);
-                if prev <= 1 {
-                    PIPE_WRITE_CLOSED[pipe_id].store(1, Ordering::Release);
-                    if PIPE_READ_CLOSED[pipe_id].load(Ordering::Acquire) != 0 {
-                        pipe_free(pipe_id);
-                    }
-                }
-            }
-        } else if kind == 10 {
-            // Pipe read end — decrement read refs
-            let pipe_id = ctx.sock_conn_id[f] as usize;
-            if pipe_id < MAX_PIPES {
-                let prev = PIPE_READ_REFS[pipe_id].fetch_sub(1, Ordering::AcqRel);
-                if prev <= 1 {
-                    PIPE_READ_CLOSED[pipe_id].store(1, Ordering::Release);
-                    if PIPE_WRITE_CLOSED[pipe_id].load(Ordering::Acquire) != 0 {
-                        pipe_free(pipe_id);
-                    }
-                }
-            }
+        if ctx.child_fds[f] != 0 {
+            super::fs::close_fd_internal(ctx, f);
         }
-        ctx.child_fds[f] = 0;
+    }
+    // Defensive: clear any stale epoll registrations not caught by close_fd_internal
+    for i in 0..MAX_EPOLL_ENTRIES {
+        ctx.epoll_reg_fd[i] = -1;
+        ctx.epoll_reg_events[i] = 0;
+        ctx.epoll_reg_data[i] = 0;
     }
     for s in 0..GRP_MAX_VFS { ctx.vfs_files[s] = [0; 4]; }
     PROCESSES[pid - 1].exit_code.store(status, Ordering::Release);
