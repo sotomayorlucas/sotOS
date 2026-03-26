@@ -46,19 +46,21 @@ fn poll_fd_readable(ctx: &SyscallContext, fd: usize) -> bool {
             unix_listener_has_pending(listener)
         }
         27 => {
-            // AF_UNIX client: readable if pipe_b (server→client) has data
+            // AF_UNIX client: readable if pipe_b has data OR msg_queue has pending
             let conn = ctx.sock_conn_id[fd] as usize;
             if conn < MAX_UNIX_CONNS {
                 let pipe_b = unsafe { UNIX_CONN_PIPE_B[conn] as usize };
                 pipe_has_data(pipe_b) || pipe_writer_closed(pipe_b)
+                    || crate::fd::msg_queue_has_pending(conn, 1) // server→client msgs
             } else { false }
         }
         28 => {
-            // AF_UNIX server: readable if pipe_a (client→server) has data
+            // AF_UNIX server: readable if pipe_a has data OR msg_queue has pending
             let conn = ctx.sock_conn_id[fd] as usize;
             if conn < MAX_UNIX_CONNS {
                 let pipe_a = unsafe { UNIX_CONN_PIPE_A[conn] as usize };
                 pipe_has_data(pipe_a) || pipe_writer_closed(pipe_a)
+                    || crate::fd::msg_queue_has_pending(conn, 0) // client→server msgs
             } else { false }
         }
         17 => true, // UDP: report readable — recvfrom does the real waiting via CMD_UDP_RECV

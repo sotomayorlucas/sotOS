@@ -694,6 +694,12 @@ pub(crate) fn msg_queue_push(conn: usize, direction: usize, len: u16, scm_count:
     }
 }
 
+/// Check if msg_queue has pending messages (for poll/epoll readability).
+pub(crate) fn msg_queue_has_pending(conn: usize, direction: usize) -> bool {
+    if conn >= MAX_UNIX_CONNS || direction > 1 { return false; }
+    unsafe { MSG_QUEUE_COUNT[conn][direction] > 0 }
+}
+
 /// Peek the next message length (for recvmsg). Returns 0 if empty.
 pub(crate) fn msg_queue_peek(conn: usize, direction: usize) -> u16 {
     if conn >= MAX_UNIX_CONNS || direction > 1 { return 0; }
