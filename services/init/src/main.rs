@@ -76,6 +76,8 @@ mod drm;
 mod xkb;
 mod seatd;
 mod udev;
+#[macro_use]
+mod trace;
 mod child_handler;
 mod lucas_handler;
 mod boot_tests;
