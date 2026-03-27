@@ -344,6 +344,10 @@ run-linux: image build-sysroot
         -no-reboot \
         -m 2048M
 
+# Build LKL (Linux Kernel Library) via WSL2
+build-lkl:
+    wsl bash -c "cd \"$$(wslpath -u '{{justfile_directory()}}')\" && bash lkl/build-lkl.sh"
+
 # Clean build artifacts
 clean:
     cargo clean
