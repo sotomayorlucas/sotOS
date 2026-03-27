@@ -1,0 +1,61 @@
+#
+# Minimal LKL (Linux Kernel Library) config for sotOS
+# Target: static liblkl.a with tmpfs, ext4, virtio-blk, virtio-net
+#
+
+# Core LKL architecture
+CONFIG_LKL=y
+
+# No loadable modules -- everything built-in
+# CONFIG_MODULES is not set
+
+# No /proc or /sys (sotOS emulates these in userspace)
+# CONFIG_PROC_FS is not set
+# CONFIG_SYSFS is not set
+
+# No debug info -- keep the binary small
+# CONFIG_DEBUG_INFO is not set
+# CONFIG_DEBUG_KERNEL is not set
+
+# Optimize for size
+CONFIG_CC_OPTIMIZE_FOR_SIZE=y
+
+# Block layer (required for virtio-blk and ext4)
+CONFIG_BLOCK=y
+
+# Virtio transport
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MMIO=y
+
+# Virtio block device
+CONFIG_VIRTIO_BLK=y
+
+# Virtio network device
+CONFIG_VIRTIO_NET=y
+
+# Filesystems
+CONFIG_TMPFS=y
+CONFIG_EXT4_FS=y
+
+# Required by ext4
+CONFIG_JBD2=y
+CONFIG_CRC16=y
+CONFIG_CRC32=y
+CONFIG_CRYPTO=y
+CONFIG_CRYPTO_CRC32C=y
+
+# Network stack (minimal, required for virtio-net)
+CONFIG_NET=y
+CONFIG_INET=y
+# CONFIG_IPV6 is not set
+
+# Disable unnecessary subsystems
+# CONFIG_SOUND is not set
+# CONFIG_USB_SUPPORT is not set
+# CONFIG_WIRELESS is not set
+# CONFIG_INPUT is not set
+# CONFIG_SELINUX is not set
+# CONFIG_SECURITY is not set
+# CONFIG_AUDIT is not set
+# CONFIG_PROFILING is not set
+# CONFIG_FTRACE is not set
