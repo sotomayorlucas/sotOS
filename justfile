@@ -129,6 +129,18 @@ run: image
         -no-reboot \
         -m 2048M
 
+# Run with WHPX hardware acceleration (12x faster boot, requires Hyper-V)
+run-fast: image create-test-disk
+    "{{QEMU}}" \
+        -accel whpx -machine q35 \
+        -drive format=raw,file={{IMAGE}} \
+        -drive if=none,format=raw,file=target/disk.img,id=disk0 \
+        -device virtio-blk-pci,drive=disk0,disable-modern=on \
+        -serial stdio \
+        -display none \
+        -no-reboot \
+        -m 2048M
+
 # Run with SMP (4 CPUs — may hang due to scheduler race, use for testing only)
 run-smp: image
     "{{QEMU}}" \

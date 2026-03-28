@@ -315,13 +315,17 @@ pub(crate) extern "C" fn child_handler() -> ! {
 
         // Trace syscalls for separate-AS child processes (P6+)
         if pid >= 6 {
-            print(b"AS-SYS P"); print_u64(pid as u64);
-            print(b" #"); print_u64(syscall_nr);
-            // Show fd for read/write/close on P7
-            if pid == 7 && (syscall_nr == 0 || syscall_nr == 1 || syscall_nr == 3) {
-                print(b" fd="); print_u64(msg.regs[0]);
+            static mut AS_TRACE_N: [u32; 16] = [0; 16];
+            let tn = if pid < 16 { unsafe { &mut AS_TRACE_N[pid] } } else { unsafe { &mut AS_TRACE_N[0] } };
+            *tn += 1;
+            if *tn <= 20 || *tn % 200 == 0 {
+                print(b"AS-SYS P"); print_u64(pid as u64);
+                print(b" #"); print_u64(syscall_nr);
+                if syscall_nr == 0 || syscall_nr == 1 || syscall_nr == 3 || syscall_nr == 7 {
+                    print(b" fd="); print_u64(msg.regs[0]);
+                }
+                print(b"\n");
             }
-            print(b"\n");
         }
         // Log P5 (wineserver) key syscalls
         if pid == 5 && (syscall_nr == 0 || syscall_nr == 1 || syscall_nr == 20
