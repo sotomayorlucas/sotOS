@@ -7,11 +7,27 @@
 //! by the bootloader. No heap allocation required.
 
 use crate::kdebug;
+use core::sync::atomic::{AtomicU32, Ordering};
 use limine::memory_map::EntryType;
 use limine::response::MemoryMapResponse;
+use sotos_common::MAX_CPUS;
 use spin::Mutex;
 
 pub const FRAME_SIZE: usize = 4096;
+
+const PERCPU_FRAME_CACHE_SIZE: usize = 32;
+
+/// Per-CPU cached frame addresses (physical).
+static mut FRAME_CACHE: [[u64; PERCPU_FRAME_CACHE_SIZE]; MAX_CPUS] =
+    [[0u64; PERCPU_FRAME_CACHE_SIZE]; MAX_CPUS];
+
+/// Number of entries currently held in each CPU's cache.
+static FRAME_CACHE_COUNT: [AtomicU32; MAX_CPUS] = {
+    const ZERO: AtomicU32 = AtomicU32::new(0);
+    [ZERO; MAX_CPUS]
+};
+
+use crate::mm::slab::current_cpu_index;
 
 /// A physical memory frame (4 KiB aligned).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,7 +257,21 @@ pub fn init(memory_map: &MemoryMapResponse, hhdm_offset: u64) {
 }
 
 /// Allocate a single physical frame.
+///
+/// Checks the current CPU's local cache first (lock-free fast path).
+/// Falls back to the global bitmap allocator when the cache is empty.
 pub fn alloc_frame() -> Option<PhysFrame> {
+    let cpu = current_cpu_index();
+    let count = FRAME_CACHE_COUNT[cpu].load(Ordering::Acquire);
+    if count > 0 {
+        let idx = (count - 1) as usize;
+        // SAFETY: only the current CPU accesses its own cache slot, and
+        // interrupts on the same CPU serialize access.
+        let addr = unsafe { FRAME_CACHE[cpu][idx] };
+        FRAME_CACHE_COUNT[cpu].store(count - 1, Ordering::Release);
+        return Some(PhysFrame::from_addr(addr));
+    }
+    // Cache empty -- fall back to global bitmap.
     ALLOCATOR.lock().as_mut()?.allocate()
 }
 
@@ -252,13 +282,48 @@ pub fn alloc_contiguous(count: usize) -> Option<PhysFrame> {
 }
 
 /// Free a previously allocated physical frame.
+///
+/// Pushes to the current CPU's local cache (lock-free fast path).
+/// When the cache is full, flushes the older half back to the global
+/// bitmap before inserting the new frame.
 pub fn free_frame(frame: PhysFrame) {
-    if let Some(alloc) = ALLOCATOR.lock().as_mut() {
-        alloc.free(frame);
+    let cpu = current_cpu_index();
+    let count = FRAME_CACHE_COUNT[cpu].load(Ordering::Acquire) as usize;
+
+    if count >= PERCPU_FRAME_CACHE_SIZE {
+        // Cache full -- flush the first half back to the global bitmap.
+        let half = PERCPU_FRAME_CACHE_SIZE / 2;
+        if let Some(alloc) = ALLOCATOR.lock().as_mut() {
+            for i in 0..half {
+                let addr = unsafe { FRAME_CACHE[cpu][i] };
+                alloc.free(PhysFrame::from_addr(addr));
+            }
+        }
+        // Compact: move the second half to the front.
+        for i in 0..(PERCPU_FRAME_CACHE_SIZE - half) {
+            unsafe {
+                FRAME_CACHE[cpu][i] = FRAME_CACHE[cpu][half + i];
+            }
+        }
+        let new_count = PERCPU_FRAME_CACHE_SIZE - half;
+        // Insert the freed frame at the new top.
+        unsafe {
+            FRAME_CACHE[cpu][new_count] = frame.addr();
+        }
+        FRAME_CACHE_COUNT[cpu].store((new_count + 1) as u32, Ordering::Release);
+        return;
     }
+
+    // Fast path: room in cache.
+    unsafe {
+        FRAME_CACHE[cpu][count] = frame.addr();
+    }
+    FRAME_CACHE_COUNT[cpu].store((count + 1) as u32, Ordering::Release);
 }
 
-/// Return the number of currently free frames.
+/// Return the number of currently free frames (bitmap + per-CPU caches).
 pub fn free_count() -> usize {
-    ALLOCATOR.lock().as_ref().map(|a| a.free_frames).unwrap_or(0)
+    let bitmap_free = ALLOCATOR.lock().as_ref().map(|a| a.free_frames).unwrap_or(0);
+    let cached: u32 = FRAME_CACHE_COUNT.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+    bitmap_free + cached as usize
 }
