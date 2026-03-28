@@ -37,7 +37,7 @@ pub fn is_percpu_ready() -> bool {
 }
 
 /// Get the current CPU index (0 during early boot).
-fn current_cpu_index() -> usize {
+pub fn current_cpu_index() -> usize {
     if PERCPU_READY.load(Ordering::Acquire) {
         crate::arch::x86_64::percpu::current_percpu().cpu_index as usize
     } else {
