@@ -318,13 +318,21 @@ pub(crate) fn signal_deliver(ep_cap: u64, pid: usize, sig: u64, child_tid: u64, 
     if sig == 0 || sig >= 32 || pid == 0 || pid > MAX_PROCS { return false; }
     let p = &PROCESSES[pid - 1];
 
-    // force_sig_fault: if SIGSEGV is re-raised while handler is active,
-    // the handler failed to fix the fault → force SIG_DFL (kill).
-    if sig == 11 && p.sig_in_handler.load(Ordering::Acquire) != 0 {
-        crate::framebuffer::print(b"SIGSEGV-FORCE-DFL P");
-        crate::framebuffer::print_u64(pid as u64);
-        crate::framebuffer::print(b" kill (handler re-raised SIGSEGV)\n");
-        return false; // fall through to default action (terminate)
+    // Wine chains multiple SIGSEGVs for Windows exception dispatch (modify
+    // ucontext → rt_sigreturn → new fault at different address). Allow up to
+    // 32 consecutive SIGSEGVs before force-killing. Counter is cleared when
+    // the child runs successfully (timer interrupt with no pending signal).
+    if sig == 11 {
+        let count = p.sig_in_handler.fetch_add(1, Ordering::AcqRel) + 1;
+        if count > 32 {
+            crate::framebuffer::print(b"SIGSEGV-FORCE-DFL P");
+            crate::framebuffer::print_u64(pid as u64);
+            crate::framebuffer::print(b" kill (32+ consecutive SIGSEGVs)\n");
+            return false;
+        }
+    } else {
+        // Non-SIGSEGV signal: clear the counter
+        p.sig_in_handler.store(0, Ordering::Release);
     }
 
     let handler = p.sig_handler[sig as usize].load(Ordering::Acquire);
@@ -413,9 +421,11 @@ pub(crate) fn signal_deliver(ep_cap: u64, pid: usize, sig: u64, child_tid: u64, 
         let mut si_buf = [0u8; SIGINFO_SIZE as usize];
         // si_signo at offset 0 (i32)
         si_buf[0..4].copy_from_slice(&(sig as i32).to_le_bytes());
-        if sig == 11 && fault_addr != 0 {
+        if sig == 11 {
+            // si_code: SEGV_MAPERR(1) for non-present, SEGV_ACCERR(2) for protection
             let si_code: i32 = if fault_code & 0x01 != 0 { 2 } else { 1 };
             si_buf[8..12].copy_from_slice(&si_code.to_le_bytes());
+            // si_addr: faulting address (can be 0 for NULL pointer dereference)
             si_buf[16..24].copy_from_slice(&fault_addr.to_le_bytes());
         }
         child_write(child_as_cap, si_rsp, &si_buf);
@@ -479,9 +489,10 @@ pub(crate) fn signal_deliver(ep_cap: u64, pid: usize, sig: u64, child_tid: u64, 
     // block the signal. Wine specifically needs SIGSEGV re-entrant delivery.
     // The old_mask is still saved in the SignalFrame for future use.
 
-    // Mark SIGSEGV as "in handler" so re-raised SIGSEGV triggers force_sig_fault.
+    // sig_in_handler now serves as a consecutive SIGSEGV counter.
+    // The counter was incremented in sig_deliver, no need to set it here.
     if sig == 11 {
-        p.sig_in_handler.store(1, Ordering::Release);
+        // already incremented above
     }
 
     // ── SIG_REDIRECT_TAG reply ──
@@ -592,7 +603,9 @@ pub(crate) fn futex_wait(addr: u64, expected: u32) -> i64 {
     while FUTEX_WOKEN[slot].load(Ordering::Acquire) == 0 {
         sys::yield_now();
         spins += 1;
-        if spins > 500_000 {
+        // 10M iterations ≈ several seconds on QEMU TCG.
+        // Wine's wineserver relies on futex_wait not timing out prematurely.
+        if spins > 10_000_000 {
             FUTEX_ADDR[slot].store(0, Ordering::Release);
             return -(linux_abi::ETIMEDOUT);
         }

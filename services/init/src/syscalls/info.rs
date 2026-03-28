@@ -315,7 +315,34 @@ pub(crate) fn sys_futex(ctx: &mut SyscallContext, msg: &IpcMsg) {
             let result = futex_wake(key, val);
             reply_val(ctx.ep_cap, result);
         }
-        _ => reply_val(ctx.ep_cap, 0), // other ops: stub
+        9 => { // FUTEX_WAIT_BITSET — same as FUTEX_WAIT but with bitset mask
+            let mut buf = [0u8; 4];
+            ctx.guest_read(uaddr, &mut buf);
+            let current = u32::from_le_bytes(buf);
+            if current != val {
+                reply_val(ctx.ep_cap, -EAGAIN);
+            } else {
+                let key = if ctx.child_as_cap != 0 {
+                    match sotos_common::sys::pte_read(ctx.child_as_cap, uaddr & !0xFFF) {
+                        Ok((phys, _flags)) => phys | (uaddr & 0xFFF),
+                        Err(_) => uaddr,
+                    }
+                } else { uaddr };
+                let result = futex_wait(key, val);
+                reply_val(ctx.ep_cap, result);
+            }
+        }
+        _ => {
+            // Log unknown futex ops to diagnose "unexpected error code"
+            crate::framebuffer::print(b"FUTEX-UNK P");
+            crate::framebuffer::print_u64(ctx.pid as u64);
+            crate::framebuffer::print(b" op=");
+            crate::framebuffer::print_u64(op as u64);
+            crate::framebuffer::print(b" raw=");
+            crate::framebuffer::print_u64(msg.regs[1]);
+            crate::framebuffer::print(b"\n");
+            reply_val(ctx.ep_cap, -ENOSYS);
+        }
     }
 }
 
