@@ -9,6 +9,7 @@
 pub mod elf;
 pub mod linux_abi;
 pub mod spsc;
+pub mod trace;
 pub mod typed_channel;
 
 // ---------------------------------------------------------------

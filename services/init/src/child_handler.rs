@@ -25,12 +25,47 @@ use crate::syscalls::net as syscalls_net;
 use crate::syscalls::signal as syscalls_signal;
 use crate::syscalls::info as syscalls_info;
 use crate::syscalls::task as syscalls_task;
+use crate::LKL_EP_CAP;
 
 // Re-export from submodules so external `use crate::child_handler::X` still works.
 pub(crate) use crate::fork::clone_child_trampoline;
 pub(crate) use crate::virtual_files::{open_virtual_file, fill_random};
 
 const MAP_WRITABLE: u64 = 2;
+const EIO: i64 = 5;
+
+/// Forward a syscall to the LKL server via IPC and relay the result back.
+///
+/// The forwarded message packs the Linux syscall number in `tag` and the six
+/// syscall arguments in `regs[0..6]`. `regs[6]` carries the child pid and
+/// `regs[7]` carries the child address-space capability so LKL can perform
+/// vm_read/vm_write on the child's memory (e.g. for path buffers, stat structs).
+fn forward_to_lkl(ep_cap: u64, lkl_ep: u64, syscall_nr: u64,
+                  msg: &sotos_common::IpcMsg, pid: usize, child_as_cap: u64)
+{
+    let fwd = sotos_common::IpcMsg {
+        tag: syscall_nr,
+        regs: [
+            msg.regs[0],        // arg1 (rdi)
+            msg.regs[1],        // arg2 (rsi)
+            msg.regs[2],        // arg3 (rdx)
+            msg.regs[3],        // arg4 (r10)
+            msg.regs[4],        // arg5 (r8)
+            msg.regs[5],        // arg6 (r9)
+            pid as u64,         // child pid
+            child_as_cap,       // child AS cap for vm_read/vm_write
+        ],
+    };
+
+    match sys::call(lkl_ep, &fwd) {
+        Ok(reply) => {
+            reply_val(ep_cap, reply.regs[0] as i64);
+        }
+        Err(_) => {
+            reply_val(ep_cap, -EIO);
+        }
+    }
+}
 
 /// Per-pid retry counters to suppress repeated pipe-retry log lines.
 /// Index by pid (0..MAX_PROCS). Incremented when PIPE_RETRY_TAG sent,
@@ -292,6 +327,60 @@ pub(crate) extern "C" fn child_handler() -> ! {
             print(b"WS5 #"); print_u64(syscall_nr);
             print(b" fd="); print_u64(msg.regs[0]);
             print(b"\n");
+        }
+
+        // ── LKL forwarding ──
+        // When lkl-server is running, forward complex syscalls to the real
+        // Linux 6.6 kernel instead of emulating them manually. Keep process
+        // management (fork/exec/exit/wait), memory (brk/mmap), and signals
+        // local — LKL can't manage sotOS address spaces or capabilities.
+        // ── LKL forwarding ──
+        // When lkl-server is running, forward FS/net/time/sync syscalls to
+        // the real Linux 6.6 kernel. Keep process mgmt (fork/exec/exit/wait),
+        // memory (brk/mmap), and signals local.
+        let lkl_ep = LKL_EP_CAP.load(Ordering::Acquire);
+        if lkl_ep != 0 {
+            let forwarded = match syscall_nr {
+                // File I/O
+                SYS_READ | SYS_WRITE | SYS_OPEN | SYS_CLOSE |
+                SYS_STAT | SYS_FSTAT | SYS_LSTAT | SYS_LSEEK |
+                SYS_READV | SYS_WRITEV | SYS_PREAD64 | SYS_PWRITE64 |
+                SYS_ACCESS | SYS_PIPE | SYS_PIPE2 |
+                SYS_DUP | SYS_DUP2 | SYS_DUP3 | SYS_FCNTL | SYS_IOCTL |
+                SYS_GETCWD | SYS_CHDIR |
+                SYS_MKDIR | SYS_RMDIR | SYS_UNLINK | SYS_RENAME |
+                SYS_OPENAT | SYS_FSTATAT | SYS_READLINKAT |
+                SYS_FACCESSAT | SYS_MKDIRAT | SYS_UNLINKAT |
+                SYS_RENAMEAT | SYS_RENAMEAT2 | SYS_GETDENTS64 |
+                SYS_FSYNC | SYS_FDATASYNC | SYS_FTRUNCATE | SYS_CHMOD |
+                // Poll/select/epoll
+                SYS_POLL | SYS_PPOLL | SYS_SELECT | SYS_PSELECT6 |
+                SYS_EPOLL_CREATE | SYS_EPOLL_CREATE1 | SYS_EPOLL_CTL |
+                SYS_EPOLL_WAIT | SYS_EPOLL_PWAIT |
+                // Networking
+                SYS_SOCKET | SYS_CONNECT | SYS_BIND | SYS_LISTEN |
+                SYS_ACCEPT | SYS_ACCEPT4 |
+                SYS_SENDTO | SYS_SENDMSG | SYS_RECVFROM | SYS_RECVMSG |
+                SYS_GETSOCKOPT | SYS_SETSOCKOPT |
+                SYS_GETSOCKNAME | SYS_GETPEERNAME | SYS_SHUTDOWN |
+                SYS_SOCKETPAIR |
+                // Special FDs
+                SYS_EVENTFD | SYS_EVENTFD2 |
+                SYS_TIMERFD_CREATE | SYS_TIMERFD_SETTIME | SYS_TIMERFD_GETTIME |
+                SYS_MEMFD_CREATE |
+                SYS_INOTIFY_INIT1 | SYS_INOTIFY_ADD_WATCH | SYS_INOTIFY_RM_WATCH |
+                // System info + time
+                SYS_UNAME | SYS_SYSINFO |
+                SYS_GETTIMEOFDAY | SYS_CLOCK_GETTIME | SYS_CLOCK_GETRES |
+                SYS_NANOSLEEP | SYS_CLOCK_NANOSLEEP |
+                SYS_GETRANDOM | SYS_FUTEX
+                => {
+                    forward_to_lkl(ep_cap, lkl_ep, syscall_nr, &msg, pid, child_as_cap);
+                    true
+                }
+                _ => false,
+            };
+            if forwarded { continue; }
         }
 
         match syscall_nr {
@@ -764,6 +853,18 @@ pub(crate) extern "C" fn child_handler() -> ! {
                         {
                             if let Ok(f) = sys::frame_alloc() {
                                 let _ = sys::map_into(exec_target_as, 0x10000, f, 0);
+                            }
+                        }
+                        // For Wine (glibc) children: set CWD to drive_c so Wine
+                        // can find DOS drive mapping (fixes "could not find DOS drive" stall)
+                        if crate::exec::LAST_EXEC_PERSONALITY.load(Ordering::Acquire)
+                            == crate::process::PERS_GLIBC
+                        {
+                            let drive_c = b"/root/.wine/drive_c";
+                            unsafe {
+                                let grp = &mut crate::fd::THREAD_GROUPS[fdg];
+                                grp.cwd[..drive_c.len()].copy_from_slice(drive_c);
+                                grp.cwd[drive_c.len()] = 0;
                             }
                         }
                         EXEC_LOCK.store(0, Ordering::Release);

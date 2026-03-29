@@ -137,6 +137,11 @@ pub(crate) static LUCAS_EP_CAP: AtomicU64 = AtomicU64::new(0);
 /// Net service IPC endpoint cap — looked up via svc_lookup("net").
 pub(crate) static NET_EP_CAP: AtomicU64 = AtomicU64::new(0);
 
+/// LKL server IPC endpoint cap — looked up via svc_lookup("lkl").
+/// When non-zero, child_handler forwards syscalls to lkl-server (real Linux 6.6 kernel)
+/// instead of using the built-in LUCAS emulation.
+pub(crate) static LKL_EP_CAP: AtomicU64 = AtomicU64::new(0);
+
 // ---------------------------------------------------------------------------
 // Root capability indices (must match kernel create_init_caps() order)
 // ---------------------------------------------------------------------------
@@ -264,6 +269,20 @@ pub extern "C" fn _start() -> ! {
         }
         Err(_) => {
             print(b"INIT: net service not found (networking disabled)\n");
+        }
+    }
+
+    // --- Phase 5b: Look up LKL server endpoint ---
+    let lkl_name = b"lkl";
+    match sys::svc_lookup(lkl_name.as_ptr() as u64, lkl_name.len() as u64) {
+        Ok(cap) => {
+            LKL_EP_CAP.store(cap, Ordering::Release);
+            print(b"INIT: LKL endpoint found (cap=");
+            print_u64(cap);
+            print(b"), forwarding enabled\n");
+        }
+        Err(_) => {
+            print(b"INIT: LKL not found, using LUCAS emulation\n");
         }
     }
 
