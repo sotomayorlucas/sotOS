@@ -32,13 +32,49 @@ pub(crate) use crate::fork::clone_child_trampoline;
 pub(crate) use crate::virtual_files::{open_virtual_file, fill_random};
 
 const MAP_WRITABLE: u64 = 2;
-/// Forward a syscall directly to LKL (in-process, no IPC).
-fn forward_to_lkl(ep_cap: u64, syscall_nr: u64,
-                  msg: &sotos_common::IpcMsg, pid: usize, child_as_cap: u64)
+
+// ── LKL FD ownership tracking ──
+// Bitset per process: bit N set ⇒ guest fd N is managed by LKL, not LUCAS.
+// 128 fds per process (2 × u64).
+use crate::process::MAX_PROCS;
+static mut LKL_FDS: [[u64; 2]; MAX_PROCS] = [[0u64; 2]; MAX_PROCS];
+
+#[inline]
+fn lkl_fd_set(pid: usize, fd: i64) {
+    if fd >= 0 && (fd as usize) < 128 && pid > 0 && pid <= MAX_PROCS {
+        let i = pid - 1;
+        unsafe { LKL_FDS[i][(fd as usize) / 64] |= 1u64 << ((fd as usize) % 64); }
+    }
+}
+#[inline]
+fn lkl_fd_clear(pid: usize, fd: i64) {
+    if fd >= 0 && (fd as usize) < 128 && pid > 0 && pid <= MAX_PROCS {
+        let i = pid - 1;
+        unsafe { LKL_FDS[i][(fd as usize) / 64] &= !(1u64 << ((fd as usize) % 64)); }
+    }
+}
+#[inline]
+fn lkl_fd_is_set(pid: usize, fd: u64) -> bool {
+    if (fd as usize) >= 128 || pid == 0 || pid > MAX_PROCS { return false; }
+    let i = pid - 1;
+    unsafe { LKL_FDS[i][(fd as usize) / 64] & (1u64 << ((fd as usize) % 64)) != 0 }
+}
+
+/// Forward a syscall to LKL, return the result (caller decides when to reply).
+#[inline]
+fn forward_to_lkl_ret(syscall_nr: u64,
+                      msg: &sotos_common::IpcMsg, pid: usize, child_as_cap: u64) -> i64
 {
     let args = [msg.regs[0], msg.regs[1], msg.regs[2],
                 msg.regs[3], msg.regs[4], msg.regs[5]];
-    let ret = lkl::syscall(syscall_nr, &args, child_as_cap, pid);
+    lkl::syscall(syscall_nr, &args, child_as_cap, pid)
+}
+
+/// Forward a syscall directly to LKL and reply immediately.
+fn forward_to_lkl(ep_cap: u64, syscall_nr: u64,
+                  msg: &sotos_common::IpcMsg, pid: usize, child_as_cap: u64)
+{
+    let ret = forward_to_lkl_ret(syscall_nr, msg, pid, child_as_cap);
     reply_val(ep_cap, ret);
 }
 
@@ -241,6 +277,9 @@ pub(crate) extern "C" fn child_handler() -> ! {
             },
         };
 
+        // Poll LKL readiness (no-op once already ready)
+        lkl::poll_ready();
+
         // Cache the kernel thread ID for async signal injection
         let kernel_tid = msg.regs[6];
         if kernel_tid != 0 {
@@ -308,50 +347,122 @@ pub(crate) extern "C" fn child_handler() -> ! {
             print(b"\n");
         }
 
-        // ── LKL forwarding ──
-        // When lkl-server is running, forward complex syscalls to the real
-        // Linux 6.6 kernel instead of emulating them manually. Keep process
-        // management (fork/exec/exit/wait), memory (brk/mmap), and signals
-        // local — LKL can't manage sotOS address spaces or capabilities.
         // ── LKL forwarding (direct in-process call, no IPC) ──
-        // LKL handles: FS, time, sync, uname, random.
-        // LUCAS keeps: process mgmt, memory, signals, thread mgmt.
+        // LKL handles: FS, networking, time, sync, uname, random.
+        // LUCAS keeps: process mgmt (fork/exec/exit/wait), memory (brk/mmap),
+        //              signals, thread mgmt, stdin/stdout/stderr.
+        //
+        // Category A: Always forward (no fd arg, or creates new fd).
+        // Category B: Route based on FD ownership (LKL vs LUCAS bitset).
         if lkl::LKL_READY.load(Ordering::Acquire) {
             let forwarded = match syscall_nr {
-                // File I/O
-                SYS_READ | SYS_WRITE | SYS_OPEN | SYS_CLOSE |
-                SYS_STAT | SYS_FSTAT | SYS_LSTAT | SYS_LSEEK |
-                SYS_ACCESS | SYS_OPENAT | SYS_FSTATAT | SYS_READLINKAT |
-                SYS_FACCESSAT | SYS_MKDIRAT | SYS_UNLINKAT |
-                SYS_GETCWD | SYS_CHDIR |
+                // ── Category A: path-only syscalls (always LKL) ──
+                SYS_STAT | SYS_LSTAT | SYS_ACCESS | SYS_GETCWD | SYS_CHDIR |
                 SYS_MKDIR | SYS_RMDIR | SYS_UNLINK | SYS_RENAME |
-                SYS_GETDENTS64 | SYS_FTRUNCATE |
-                SYS_FSYNC | SYS_FDATASYNC | SYS_CHMOD |
-                SYS_PIPE | SYS_PIPE2 | SYS_DUP | SYS_DUP2 | SYS_DUP3 |
-                SYS_FCNTL | SYS_IOCTL |
-                SYS_PREAD64 | SYS_PWRITE64 | SYS_READV | SYS_WRITEV |
-                // Networking
-                SYS_SOCKET | SYS_CONNECT | SYS_BIND | SYS_LISTEN |
-                SYS_ACCEPT | SYS_ACCEPT4 | SYS_SOCKETPAIR |
-                SYS_SENDTO | SYS_SENDMSG | SYS_RECVFROM | SYS_RECVMSG |
-                SYS_GETSOCKOPT | SYS_SETSOCKOPT |
-                SYS_GETSOCKNAME | SYS_GETPEERNAME | SYS_SHUTDOWN |
-                // Poll/epoll
-                SYS_POLL | SYS_PPOLL | SYS_SELECT | SYS_PSELECT6 |
-                SYS_EPOLL_CREATE | SYS_EPOLL_CREATE1 | SYS_EPOLL_CTL |
-                SYS_EPOLL_WAIT | SYS_EPOLL_PWAIT |
-                // Special FDs
-                SYS_EVENTFD | SYS_EVENTFD2 |
-                SYS_TIMERFD_CREATE | SYS_TIMERFD_SETTIME | SYS_TIMERFD_GETTIME |
-                SYS_MEMFD_CREATE |
-                SYS_INOTIFY_INIT1 | SYS_INOTIFY_ADD_WATCH | SYS_INOTIFY_RM_WATCH |
-                // Sync + time + info
-                SYS_FUTEX |
+                SYS_CHMOD | SYS_FSTATAT | SYS_READLINKAT |
+                SYS_FACCESSAT | SYS_MKDIRAT | SYS_UNLINKAT => {
+                    forward_to_lkl(ep_cap, syscall_nr, &msg, pid, child_as_cap);
+                    true
+                }
+                // ── Category A: info/time syscalls (always LKL) ──
+                // Note: SYS_FUTEX stays in LUCAS — bridge_lock would deadlock on FUTEX_WAIT.
                 SYS_UNAME | SYS_SYSINFO | SYS_GETRANDOM |
                 SYS_GETTIMEOFDAY | SYS_CLOCK_GETTIME | SYS_CLOCK_GETRES |
-                SYS_NANOSLEEP | SYS_CLOCK_NANOSLEEP
-                => {
+                SYS_NANOSLEEP | SYS_CLOCK_NANOSLEEP => {
                     forward_to_lkl(ep_cap, syscall_nr, &msg, pid, child_as_cap);
+                    true
+                }
+                // ── Category A: fd-creating syscalls → forward + mark fd ──
+                SYS_OPEN | SYS_OPENAT => {
+                    let ret = forward_to_lkl_ret(syscall_nr, &msg, pid, child_as_cap);
+                    if ret >= 0 { lkl_fd_set(pid, ret); }
+                    reply_val(ep_cap, ret);
+                    true
+                }
+                SYS_SOCKET | SYS_EPOLL_CREATE | SYS_EPOLL_CREATE1 |
+                SYS_EVENTFD | SYS_EVENTFD2 |
+                SYS_TIMERFD_CREATE | SYS_MEMFD_CREATE |
+                SYS_INOTIFY_INIT1 => {
+                    let ret = forward_to_lkl_ret(syscall_nr, &msg, pid, child_as_cap);
+                    if ret >= 0 { lkl_fd_set(pid, ret); }
+                    reply_val(ep_cap, ret);
+                    true
+                }
+                SYS_ACCEPT | SYS_ACCEPT4 => {
+                    let ret = forward_to_lkl_ret(syscall_nr, &msg, pid, child_as_cap);
+                    if ret >= 0 { lkl_fd_set(pid, ret); }
+                    reply_val(ep_cap, ret);
+                    true
+                }
+                SYS_PIPE | SYS_PIPE2 => {
+                    let ret = forward_to_lkl_ret(syscall_nr, &msg, pid, child_as_cap);
+                    if ret == 0 {
+                        // Read back the two fds written to guest memory
+                        let ptr = msg.regs[0] as *const [i32; 2];
+                        let fds = unsafe { *ptr };
+                        lkl_fd_set(pid, fds[0] as i64);
+                        lkl_fd_set(pid, fds[1] as i64);
+                    }
+                    reply_val(ep_cap, ret);
+                    true
+                }
+                SYS_SOCKETPAIR => {
+                    let ret = forward_to_lkl_ret(syscall_nr, &msg, pid, child_as_cap);
+                    if ret == 0 {
+                        let ptr = msg.regs[3] as *const [i32; 2];
+                        let fds = unsafe { *ptr };
+                        lkl_fd_set(pid, fds[0] as i64);
+                        lkl_fd_set(pid, fds[1] as i64);
+                    }
+                    reply_val(ep_cap, ret);
+                    true
+                }
+                // ── Category B: fd-bearing syscalls → route by ownership ──
+                SYS_READ | SYS_WRITE | SYS_LSEEK | SYS_FSTAT |
+                SYS_PREAD64 | SYS_PWRITE64 | SYS_READV | SYS_WRITEV |
+                SYS_FTRUNCATE | SYS_FSYNC | SYS_FDATASYNC |
+                SYS_GETDENTS64 | SYS_FCNTL | SYS_IOCTL |
+                SYS_CONNECT | SYS_BIND | SYS_LISTEN | SYS_SHUTDOWN |
+                SYS_SENDTO | SYS_SENDMSG | SYS_RECVFROM | SYS_RECVMSG |
+                SYS_GETSOCKOPT | SYS_SETSOCKOPT |
+                SYS_GETSOCKNAME | SYS_GETPEERNAME |
+                SYS_EPOLL_CTL |
+                SYS_TIMERFD_SETTIME | SYS_TIMERFD_GETTIME |
+                SYS_INOTIFY_ADD_WATCH | SYS_INOTIFY_RM_WATCH
+                if lkl_fd_is_set(pid, msg.regs[0]) => {
+                    forward_to_lkl(ep_cap, syscall_nr, &msg, pid, child_as_cap);
+                    true
+                }
+                // epoll_wait/pwait: epfd is regs[0]
+                SYS_EPOLL_WAIT | SYS_EPOLL_PWAIT
+                if lkl_fd_is_set(pid, msg.regs[0]) => {
+                    forward_to_lkl(ep_cap, syscall_nr, &msg, pid, child_as_cap);
+                    true
+                }
+                // poll/ppoll/select/pselect6: mixed fds, too complex to route
+                // per-fd — forward only if LKL has ANY fds (best effort)
+                SYS_POLL | SYS_PPOLL | SYS_SELECT | SYS_PSELECT6
+                if pid > 0 && pid <= MAX_PROCS &&
+                   unsafe { LKL_FDS[pid-1][0] | LKL_FDS[pid-1][1] } != 0 => {
+                    forward_to_lkl(ep_cap, syscall_nr, &msg, pid, child_as_cap);
+                    true
+                }
+                SYS_CLOSE if lkl_fd_is_set(pid, msg.regs[0]) => {
+                    let ret = forward_to_lkl_ret(syscall_nr, &msg, pid, child_as_cap);
+                    if ret == 0 { lkl_fd_clear(pid, msg.regs[0] as i64); }
+                    reply_val(ep_cap, ret);
+                    true
+                }
+                SYS_DUP if lkl_fd_is_set(pid, msg.regs[0]) => {
+                    let ret = forward_to_lkl_ret(syscall_nr, &msg, pid, child_as_cap);
+                    if ret >= 0 { lkl_fd_set(pid, ret); }
+                    reply_val(ep_cap, ret);
+                    true
+                }
+                SYS_DUP2 | SYS_DUP3 if lkl_fd_is_set(pid, msg.regs[0]) => {
+                    let ret = forward_to_lkl_ret(syscall_nr, &msg, pid, child_as_cap);
+                    if ret >= 0 { lkl_fd_set(pid, ret); }
+                    reply_val(ep_cap, ret);
                     true
                 }
                 _ => false,

@@ -61,7 +61,7 @@ static inline long xlat_syscall_x86_to_lkl(long x86_nr)
     case 63:  return 160;  /* uname */
     case 72:  return 25;   /* fcntl */
     case 77:  return 81;   /* ftruncate */
-    case 78:  return 17;   /* getdents → getcwd? no, getdents64=61 */
+    case 78:  return 61;   /* getdents → getdents64 */
     case 79:  return 17;   /* getcwd */
     case 80:  return 49;   /* chdir */
     case 83:  return 34;   /* mkdir → mkdirat */
@@ -83,14 +83,20 @@ static inline long xlat_syscall_x86_to_lkl(long x86_nr)
     case 269: return 48;   /* faccessat */
     case 302: return 261;  /* prlimit64 */
     case 318: return 278;  /* getrandom */
+    case 74:  return 82;   /* fsync */
+    case 75:  return 83;   /* fdatasync */
+    case 84:  return 35;   /* rmdir → unlinkat(AT_REMOVEDIR) */
+    case 90:  return 53;   /* chmod → fchmodat */
     /* epoll */
     case 213: return 20;   /* epoll_create → epoll_create1 */
-    case 232: return 20;   /* epoll_create1 */
+    case 232: return 22;   /* epoll_wait → epoll_pwait */
     case 233: return 21;   /* epoll_ctl */
     case 281: return 22;   /* epoll_pwait */
     /* poll/select */
     case 7:   return 73;   /* poll → ppoll */
     case 23:  return 72;   /* select → pselect6 */
+    case 270: return 72;   /* pselect6 */
+    case 271: return 73;   /* ppoll */
     /* signals */
     case 13:  return 134;  /* rt_sigaction */
     case 14:  return 135;  /* rt_sigprocmask */
@@ -98,6 +104,26 @@ static inline long xlat_syscall_x86_to_lkl(long x86_nr)
     case 35:  return 101;  /* nanosleep */
     case 131: return 132;  /* sigaltstack */
     case 186: return 178;  /* gettid */
+    /* pipe/dup/misc */
+    case 229: return 114;  /* clock_getres */
+    case 230: return 115;  /* clock_nanosleep */
+    case 258: return 34;   /* mkdirat */
+    case 263: return 35;   /* unlinkat */
+    case 288: return 242;  /* accept4 */
+    case 284: return 19;   /* eventfd → eventfd2 */
+    case 290: return 19;   /* eventfd2 */
+    case 291: return 20;   /* epoll_create1 */
+    case 292: return 24;   /* dup3 */
+    case 293: return 59;   /* pipe2 */
+    case 294: return 26;   /* inotify_init1 */
+    case 254: return 27;   /* inotify_add_watch */
+    case 255: return 28;   /* inotify_rm_watch */
+    case 283: return 85;   /* timerfd_create */
+    case 286: return 86;   /* timerfd_settime */
+    case 287: return 87;   /* timerfd_gettime */
+    case 319: return 279;  /* memfd_create */
+    case 202: return 98;   /* futex */
+    case 439: return 48;   /* faccessat2 → faccessat */
     default:  return -1;   /* unknown — fall back to LUCAS emulation */
     }
 }
