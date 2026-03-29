@@ -34,6 +34,8 @@
 
 extern crate alloc;
 
+pub mod errno_map;
 pub mod procfs;
+pub mod signal_map;
 pub mod syscall_table;
 pub mod translate;
