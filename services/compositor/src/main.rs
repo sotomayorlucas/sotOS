@@ -2,9 +2,11 @@
 //!
 //! A minimal Wayland compositor that:
 //! - Registers as "compositor" via service registry
-//! - Accepts Wayland client connections over AF_UNIX (via IPC)
-//! - Implements core Wayland protocol: wl_display, wl_registry,
-//!   wl_compositor, wl_shm, xdg_wm_base, wl_seat
+//! - Accepts Wayland client connections over IPC
+//! - Parses Wayland binary wire protocol messages from IPC data
+//! - Dispatches to object handlers (wl_display, wl_registry,
+//!   wl_compositor, wl_shm, xdg_wm_base, wl_surface, xdg_surface,
+//!   xdg_toplevel, wl_seat)
 //! - Renders client buffers to the framebuffer
 //! - Forwards keyboard/mouse input as Wayland events
 
@@ -16,9 +18,13 @@ mod render;
 mod input;
 
 use sotos_common::sys;
-use sotos_common::{BootInfo, BOOT_INFO_ADDR, SyncUnsafeCell};
+use sotos_common::{BootInfo, IpcMsg, BOOT_INFO_ADDR, SyncUnsafeCell};
 
 use render::Framebuffer;
+use wayland::{
+    ClientObjects, WlMessage, DispatchResult,
+    WL_MSG_TAG, WL_CONNECT_TAG, IPC_DATA_MAX,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -45,6 +51,9 @@ const BG_COLOR: u32 = 0xFF2D2D3D;
 /// Title bar height in pixels.
 const TITLE_BAR_HEIGHT: u32 = 24;
 
+/// IPC recv_timeout in scheduler ticks (~10ms at 100Hz = 1 tick).
+const IPC_POLL_TICKS: u32 = 1;
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -54,15 +63,8 @@ struct WlClient {
     active: bool,
     /// IPC endpoint for this client.
     endpoint_cap: u64,
-    /// Client's wl_registry object ID.
-    registry_id: u32,
-    /// Bound object IDs per global.
-    compositor_id: u32,
-    shm_id: u32,
-    xdg_wm_base_id: u32,
-    seat_id: u32,
-    pointer_id: u32,
-    keyboard_id: u32,
+    /// Per-client object ID tracking for wire protocol dispatch.
+    objects: ClientObjects,
 }
 
 impl WlClient {
@@ -70,13 +72,7 @@ impl WlClient {
         Self {
             active: false,
             endpoint_cap: 0,
-            registry_id: 0,
-            compositor_id: 0,
-            shm_id: 0,
-            xdg_wm_base_id: 0,
-            seat_id: 0,
-            pointer_id: 0,
-            keyboard_id: 0,
+            objects: ClientObjects::empty(),
         }
     }
 }
@@ -105,7 +101,7 @@ impl Surface {
 }
 
 // ---------------------------------------------------------------------------
-// Global compositor state (no heap — all fixed-size)
+// Global compositor state (no heap -- all fixed-size)
 // ---------------------------------------------------------------------------
 
 static FB: SyncUnsafeCell<Framebuffer> = SyncUnsafeCell::new(Framebuffer::empty());
@@ -149,6 +145,24 @@ fn print_hex(val: u64) {
     for i in (0..16).rev() {
         let nibble = ((val >> (i * 4)) & 0xF) as usize;
         sys::debug_print(hex[nibble]);
+    }
+}
+
+fn print_u32_dec(mut val: u32) {
+    if val == 0 {
+        sys::debug_print(b'0');
+        return;
+    }
+    let mut buf = [0u8; 10];
+    let mut i = 0;
+    while val > 0 && i < 10 {
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        sys::debug_print(buf[i]);
     }
 }
 
@@ -208,13 +222,13 @@ pub extern "C" fn _start() -> ! {
     print(b"compositor: waiting for clients on IPC\n");
 
     // Passive: block on IPC endpoint waiting for Wayland client connections.
-    // Do NOT touch framebuffer or KB/MOUSE rings until a client connects —
+    // Do NOT touch framebuffer or KB/MOUSE rings until a client connects --
     // the serial console and LUCAS shell own those resources until then.
     loop {
-        // Block until a client sends an IPC message to our endpoint.
         match sys::recv(ep_cap) {
-            Ok(_msg) => {
+            Ok(msg) => {
                 print(b"compositor: client connected, activating\n");
+                handle_new_connection(ep_cap, &msg);
                 break;
             }
             Err(_) => {
@@ -223,7 +237,7 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // First client connected — take over the framebuffer.
+    // First client connected -- take over the framebuffer.
     unsafe {
         let fb = &mut *FB.get();
         fb.clear(BG_COLOR);
@@ -231,8 +245,11 @@ pub extern "C" fn _start() -> ! {
         *CURSOR_Y.get() = (fb.height / 2) as i32;
     }
 
-    // Active compositing loop (SDF: 60 Hz fixed-rate production).
+    // Active compositing loop with IPC polling.
     loop {
+        // Poll for IPC messages (non-blocking with short timeout).
+        poll_ipc(ep_cap);
+
         // Process input (may set damage flag).
         while let Some(scancode) = input::read_kb_scancode() {
             handle_keyboard(scancode);
@@ -255,6 +272,268 @@ pub extern "C" fn _start() -> ! {
         } else {
             sys::yield_now();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IPC message handling
+// ---------------------------------------------------------------------------
+
+/// Poll the IPC endpoint for incoming messages without blocking for long.
+fn poll_ipc(ep_cap: u64) {
+    // Use recv_timeout to avoid blocking the compositing loop.
+    match sys::recv_timeout(ep_cap, IPC_POLL_TICKS) {
+        Ok(msg) => {
+            process_ipc_message(ep_cap, &msg);
+        }
+        Err(_) => {
+            // Timeout or error -- no message pending, continue.
+        }
+    }
+}
+
+/// Process a single IPC message: either a new connection or a wire protocol message.
+/// Note: WL_CONNECT_TAG check must come before WL_MSG_TAG because
+/// WL_CONNECT_TAG's low 16 bits happen to equal WL_MSG_TAG.
+fn process_ipc_message(ep_cap: u64, msg: &IpcMsg) {
+    if msg.tag == WL_CONNECT_TAG {
+        handle_new_connection(ep_cap, msg);
+        return;
+    }
+
+    if (msg.tag & 0xFFFF) == WL_MSG_TAG {
+        handle_wire_message(ep_cap, msg);
+        return;
+    }
+
+    // Unknown tag -- treat as connection attempt.
+    handle_new_connection(ep_cap, msg);
+}
+
+/// Register a new client connection.
+fn handle_new_connection(ep_cap: u64, _msg: &IpcMsg) {
+    let clients = unsafe { &mut *CLIENTS.get() };
+    for i in 0..MAX_CLIENTS {
+        if !clients[i].active {
+            clients[i].active = true;
+            clients[i].endpoint_cap = ep_cap;
+            clients[i].objects = ClientObjects::empty();
+            print(b"compositor: client ");
+            print_u32_dec(i as u32);
+            print(b" connected\n");
+
+            // Send an acknowledgment reply so the client unblocks.
+            let mut reply = IpcMsg::empty();
+            reply.tag = WL_CONNECT_TAG;
+            reply.regs[0] = 1; // success
+            let _ = sys::send(ep_cap, &reply);
+            return;
+        }
+    }
+    // No free slots -- reject.
+    print(b"compositor: no free client slots\n");
+    let mut reply = IpcMsg::empty();
+    reply.tag = WL_CONNECT_TAG;
+    reply.regs[0] = 0; // failure
+    let _ = sys::send(ep_cap, &reply);
+}
+
+/// Handle an incoming Wayland wire protocol message.
+fn handle_wire_message(ep_cap: u64, msg: &IpcMsg) {
+    // Extract raw bytes from IPC registers.
+    let mut wire_buf = [0u8; IPC_DATA_MAX];
+    let wire_len = wayland::ipc_to_wire(msg, &mut wire_buf);
+    if wire_len < 8 {
+        // Too short for a Wayland header -- send empty reply.
+        let _ = sys::send(ep_cap, &IpcMsg::empty());
+        return;
+    }
+
+    // Parse the Wayland message header.
+    let mut wl_msg = WlMessage::empty();
+    let consumed = match wl_msg.parse_header(&wire_buf[..wire_len]) {
+        Some(n) => n,
+        None => {
+            print(b"compositor: malformed wayland msg\n");
+            let _ = sys::send(ep_cap, &IpcMsg::empty());
+            return;
+        }
+    };
+
+    print(b"compositor: wl obj=");
+    print_u32_dec(wl_msg.object_id);
+    print(b" op=");
+    print_u32_dec(wl_msg.opcode as u32);
+    print(b" sz=");
+    print_u32_dec(wl_msg.size as u32);
+    print(b"\n");
+
+    // Find which client this came from (first active client on this endpoint).
+    let client_idx = find_client(ep_cap);
+    if client_idx >= MAX_CLIENTS {
+        print(b"compositor: msg from unknown client\n");
+        let _ = sys::send(ep_cap, &IpcMsg::empty());
+        return;
+    }
+
+    // Dispatch the message.
+    let result = unsafe {
+        let clients = &mut *CLIENTS.get();
+        let serial = &mut *CONFIGURE_SERIAL.get();
+        wayland::dispatch_message(&wl_msg, &mut clients[client_idx].objects, serial)
+    };
+
+    // Apply state changes from the dispatch result.
+    apply_dispatch_result(client_idx, &result);
+
+    // If there are remaining bytes in the buffer (multiple messages packed
+    // into one IPC transfer), parse them too.
+    let mut offset = consumed;
+    while offset + 8 <= wire_len {
+        let mut next_msg = WlMessage::empty();
+        match next_msg.parse_header(&wire_buf[offset..wire_len]) {
+            Some(n) => {
+                let next_result = unsafe {
+                    let clients = &mut *CLIENTS.get();
+                    let serial = &mut *CONFIGURE_SERIAL.get();
+                    wayland::dispatch_message(&next_msg, &mut clients[client_idx].objects, serial)
+                };
+                apply_dispatch_result(client_idx, &next_result);
+                // Send events for this sub-message inline.
+                send_events(ep_cap, &next_result);
+                offset += n;
+            }
+            None => break,
+        }
+    }
+
+    // Send response events for the first (or only) message.
+    send_events(ep_cap, &result);
+}
+
+/// Send response events back to the client via IPC.
+fn send_events(ep_cap: u64, result: &DispatchResult) {
+    if result.event_count == 0 {
+        // Always send a reply so the client unblocks (even if no events).
+        let _ = sys::send(ep_cap, &IpcMsg::empty());
+        return;
+    }
+
+    // Pack events into IPC reply.
+    let reply = wayland::events_to_ipc(&result.events, result.event_count);
+    let _ = sys::send(ep_cap, &reply);
+}
+
+/// Find the client index for the given endpoint capability.
+fn find_client(ep_cap: u64) -> usize {
+    let clients = unsafe { &*CLIENTS.get() };
+    for i in 0..MAX_CLIENTS {
+        if clients[i].active && clients[i].endpoint_cap == ep_cap {
+            return i;
+        }
+    }
+    // If no client found, use the first active client as fallback.
+    // This handles the case where all clients share the same service endpoint.
+    for i in 0..MAX_CLIENTS {
+        if clients[i].active {
+            return i;
+        }
+    }
+    MAX_CLIENTS // sentinel: no client found
+}
+
+/// Apply state changes from a dispatch result to the global compositor state.
+fn apply_dispatch_result(client_idx: usize, result: &DispatchResult) {
+    // New surface created?
+    if result.new_surface_id != 0 {
+        let surfaces = unsafe { &mut *SURFACES.get() };
+        for i in 0..MAX_SURFACES {
+            if !surfaces[i].active {
+                surfaces[i].active = true;
+                surfaces[i].surface_id = result.new_surface_id;
+                surfaces[i].client_idx = client_idx;
+                surfaces[i].buffer_idx = None;
+                surfaces[i].committed = false;
+                print(b"compositor: new surface ");
+                print_u32_dec(result.new_surface_id);
+                print(b"\n");
+                break;
+            }
+        }
+    }
+
+    // Surface attach?
+    if result.attach.0 != 0 {
+        let (surface_id, buffer_id) = result.attach;
+        let surfaces = unsafe { &mut *SURFACES.get() };
+        let buffers = unsafe { &*BUFFERS.get() };
+        for i in 0..MAX_SURFACES {
+            if surfaces[i].active && surfaces[i].surface_id == surface_id {
+                // Find the buffer index.
+                for bi in 0..MAX_BUFFERS {
+                    if buffers[bi].active && buffers[bi].buffer_id == buffer_id {
+                        surfaces[i].buffer_idx = Some(bi);
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // Surface committed?
+    if result.committed_surface_id != 0 {
+        let surfaces = unsafe { &mut *SURFACES.get() };
+        for i in 0..MAX_SURFACES {
+            if surfaces[i].active && surfaces[i].surface_id == result.committed_surface_id {
+                surfaces[i].committed = true;
+                mark_damage();
+                break;
+            }
+        }
+    }
+
+    // New toplevel?
+    let (tl_id, xdg_id, wl_surf_id) = result.new_toplevel;
+    if tl_id != 0 {
+        let toplevels = unsafe { &mut *TOPLEVELS.get() };
+        for i in 0..MAX_TOPLEVELS {
+            if !toplevels[i].active {
+                toplevels[i].active = true;
+                toplevels[i].toplevel_id = tl_id;
+                toplevels[i].xdg_surface_id = xdg_id;
+                toplevels[i].wl_surface_id = wl_surf_id;
+                toplevels[i].x = 50 + (i as i32 * 30); // cascade
+                toplevels[i].y = 50 + (i as i32 * 30) + TITLE_BAR_HEIGHT as i32;
+                toplevels[i].width = 640;
+                toplevels[i].height = 480;
+                print(b"compositor: new toplevel ");
+                print_u32_dec(tl_id);
+                print(b"\n");
+                mark_damage();
+                break;
+            }
+        }
+    }
+
+    // Title update?
+    let (title_tl_id, ref title_buf, title_len) = result.title_update;
+    if title_tl_id != 0 && title_len > 0 {
+        let toplevels = unsafe { &mut *TOPLEVELS.get() };
+        for i in 0..MAX_TOPLEVELS {
+            if toplevels[i].active && toplevels[i].toplevel_id == title_tl_id {
+                let copy_len = title_len.min(64);
+                toplevels[i].title[..copy_len].copy_from_slice(&title_buf[..copy_len]);
+                toplevels[i].title_len = copy_len;
+                mark_damage();
+                break;
+            }
+        }
+    }
+
+    // Damage reported?
+    if result.damage {
+        mark_damage();
     }
 }
 
@@ -356,23 +635,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         let file = loc.file().as_bytes();
         for &b in file { sys::debug_print(b); }
         print(b":");
-        // Print line number (simple decimal)
-        let mut line = loc.line();
-        let mut buf = [0u8; 10];
-        let mut i = 0;
-        if line == 0 {
-            sys::debug_print(b'0');
-        } else {
-            while line > 0 && i < 10 {
-                buf[i] = b'0' + (line % 10) as u8;
-                line /= 10;
-                i += 1;
-            }
-            while i > 0 {
-                i -= 1;
-                sys::debug_print(buf[i]);
-            }
-        }
+        print_u32_dec(loc.line());
     }
     print(b"\n");
     loop { sys::yield_now(); }
