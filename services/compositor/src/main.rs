@@ -45,6 +45,12 @@ const MAX_POOLS: usize = 16;
 /// Maximum SHM buffers.
 const MAX_BUFFERS: usize = 32;
 
+/// Base virtual address for SHM pool mappings in compositor's AS.
+const POOL_BASE: u64 = 0x8000000;
+
+/// Maximum size per pool (1 MiB).
+const MAX_POOL_SIZE: usize = 1024 * 1024;
+
 /// Desktop background color (dark blue-gray).
 const BG_COLOR: u32 = 0xFF2D2D3D;
 
@@ -121,6 +127,15 @@ static CURSOR_Y: SyncUnsafeCell<i32> = SyncUnsafeCell::new(0);
 /// Configure serial counter.
 static CONFIGURE_SERIAL: SyncUnsafeCell<u32> = SyncUnsafeCell::new(1);
 
+/// Global event serial counter (for input events sent to clients).
+static EVENT_SERIAL: SyncUnsafeCell<u32> = SyncUnsafeCell::new(100);
+
+/// Index of the focused (keyboard-receiving) client, or MAX_CLIENTS if none.
+static FOCUSED_CLIENT: SyncUnsafeCell<usize> = SyncUnsafeCell::new(MAX_CLIENTS);
+
+/// Index of the focused toplevel (for keyboard routing), or MAX_TOPLEVELS if none.
+static FOCUSED_TOPLEVEL: SyncUnsafeCell<usize> = SyncUnsafeCell::new(MAX_TOPLEVELS);
+
 /// TSC of last composed frame (SDF: fixed token production rate).
 static LAST_FRAME_TSC: SyncUnsafeCell<u64> = SyncUnsafeCell::new(0);
 /// Damage flag: set when any visual state changes.
@@ -177,6 +192,20 @@ fn rdtsc() -> u64 {
 
 fn mark_damage() {
     unsafe { *DAMAGE.get() = true; }
+}
+
+fn next_event_serial() -> u32 {
+    unsafe {
+        let s = &mut *EVENT_SERIAL.get();
+        let val = *s;
+        *s = val.wrapping_add(1);
+        val
+    }
+}
+
+/// Millisecond timestamp derived from TSC (approximate, 2 GHz assumed).
+fn tsc_millis() -> u32 {
+    (rdtsc() / 2_000_000) as u32
 }
 
 #[unsafe(no_mangle)]
@@ -531,6 +560,124 @@ fn apply_dispatch_result(client_idx: usize, result: &DispatchResult) {
         }
     }
 
+    // New SHM pool? Allocate pages in compositor's address space.
+    let (pool_id, pool_size) = result.new_pool;
+    if pool_id != 0 && pool_size > 0 {
+        let pools = unsafe { &mut *POOLS.get() };
+        for pi in 0..MAX_POOLS {
+            if !pools[pi].active {
+                let clamped_size = (pool_size as usize).min(MAX_POOL_SIZE);
+                let pages = (clamped_size + 0xFFF) / 0x1000;
+                let pool_vaddr = POOL_BASE + (pi as u64) * MAX_POOL_SIZE as u64;
+
+                let mut ok = true;
+                for p in 0..pages {
+                    let vaddr = pool_vaddr + (p as u64) * 0x1000;
+                    match sys::frame_alloc() {
+                        Ok(frame_cap) => {
+                            // flags: bit 1 = WRITABLE
+                            if sys::map(vaddr, frame_cap, 0x2).is_err() {
+                                print(b"compositor: pool map failed\n");
+                                ok = false;
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            print(b"compositor: pool frame_alloc failed\n");
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+
+                if ok {
+                    pools[pi].active = true;
+                    pools[pi].pool_id = pool_id;
+                    pools[pi].size = pool_size;
+                    pools[pi].mapped_vaddr = pool_vaddr;
+                    // Zero the pool memory
+                    let dst = pool_vaddr as *mut u8;
+                    for i in 0..(pages * 0x1000) {
+                        unsafe { dst.add(i).write_volatile(0); }
+                    }
+                    print(b"compositor: pool ");
+                    print_u32_dec(pool_id);
+                    print(b" mapped at ");
+                    print_hex(pool_vaddr);
+                    print(b" (");
+                    print_u32_dec(pages as u32);
+                    print(b" pages)\n");
+                }
+                break;
+            }
+        }
+    }
+
+    // New SHM buffer? Store in BUFFERS array with correct pool_idx.
+    let (ref new_buf, pool_object_id) = result.new_buffer;
+    if new_buf.buffer_id != 0 {
+        let buffers = unsafe { &mut *BUFFERS.get() };
+        let pools = unsafe { &*POOLS.get() };
+        // Find the pool index by pool_object_id.
+        let mut found_pool_idx = MAX_POOLS;
+        for pi in 0..MAX_POOLS {
+            if pools[pi].active && pools[pi].pool_id == pool_object_id {
+                found_pool_idx = pi;
+                break;
+            }
+        }
+        if found_pool_idx < MAX_POOLS {
+            for bi in 0..MAX_BUFFERS {
+                if !buffers[bi].active {
+                    buffers[bi].active = true;
+                    buffers[bi].buffer_id = new_buf.buffer_id;
+                    buffers[bi].pool_idx = found_pool_idx;
+                    buffers[bi].offset = new_buf.offset;
+                    buffers[bi].width = new_buf.width;
+                    buffers[bi].height = new_buf.height;
+                    buffers[bi].stride = new_buf.stride;
+                    buffers[bi].format = new_buf.format;
+                    print(b"compositor: buffer ");
+                    print_u32_dec(new_buf.buffer_id);
+                    print(b" (");
+                    print_u32_dec(new_buf.width);
+                    print(b"x");
+                    print_u32_dec(new_buf.height);
+                    print(b") in pool ");
+                    print_u32_dec(pool_object_id);
+                    print(b"\n");
+                    break;
+                }
+            }
+        } else {
+            print(b"compositor: buffer references unknown pool ");
+            print_u32_dec(pool_object_id);
+            print(b"\n");
+        }
+    }
+
+    // When a new toplevel is created, auto-focus the first one.
+    if tl_id != 0 {
+        unsafe {
+            let focused_tl = &mut *FOCUSED_TOPLEVEL.get();
+            let focused_cl = &mut *FOCUSED_CLIENT.get();
+            if *focused_tl >= MAX_TOPLEVELS {
+                // Find the toplevel we just created.
+                let tls = &*TOPLEVELS.get();
+                for i in 0..MAX_TOPLEVELS {
+                    if tls[i].active && tls[i].toplevel_id == tl_id {
+                        *focused_tl = i;
+                        *focused_cl = client_idx;
+                        print(b"compositor: focused toplevel ");
+                        print_u32_dec(tl_id);
+                        print(b"\n");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     // Damage reported?
     if result.damage {
         mark_damage();
@@ -549,25 +696,189 @@ fn handle_keyboard(scancode: u8) {
 
     let state = if is_release { 0u32 } else { 1u32 };
 
-    // Send wl_keyboard::key to focused client's keyboard.
-    // (Simplified: send to first client with a keyboard binding.)
-    let _ = (keycode, state); // TODO: send via IPC once clients connect
+    // Send wl_keyboard::key event to the focused client.
+    unsafe {
+        let focused_cl = *FOCUSED_CLIENT.get();
+        if focused_cl >= MAX_CLIENTS { return; }
+
+        let clients = &*CLIENTS.get();
+        if !clients[focused_cl].active { return; }
+
+        let keyboard_id = clients[focused_cl].objects.keyboard_id;
+        if keyboard_id == 0 { return; }
+
+        let serial = next_event_serial();
+        let time = tsc_millis();
+
+        // Build wl_keyboard::key event (opcode 3)
+        // Args: serial(u32), time(u32), key(u32), state(u32)
+        let mut ev = wayland::WlEvent::new();
+        ev.begin(keyboard_id, 3); // wl_keyboard::key
+        ev.put_u32(serial);
+        ev.put_u32(time);
+        ev.put_u32(keycode);
+        ev.put_u32(state);
+        ev.finish();
+
+        let ipc_reply = wayland::wire_to_ipc(&ev);
+        let _ = sys::send(clients[focused_cl].endpoint_cap, &ipc_reply);
+    }
 
     mark_damage();
 }
 
 fn handle_mouse(packet: input::MousePacket) {
+    let (cursor_x, cursor_y);
     unsafe {
         let fb = &*FB.get();
         let cx = &mut *CURSOR_X.get();
         let cy = &mut *CURSOR_Y.get();
         *cx = (*cx + packet.dx).max(0).min(fb.width as i32 - 1);
         *cy = (*cy + packet.dy).max(0).min(fb.height as i32 - 1);
+        cursor_x = *cx;
+        cursor_y = *cy;
     }
 
     mark_damage();
 
-    // TODO: hit-test toplevels, send wl_pointer::motion/button/frame events
+    // Hit-test: find which toplevel the cursor is over.
+    let toplevels = unsafe { &*TOPLEVELS.get() };
+    let mut hit_tl_idx: usize = MAX_TOPLEVELS;
+    // Iterate in reverse so topmost (last-created) windows get priority.
+    let mut i = MAX_TOPLEVELS;
+    while i > 0 {
+        i -= 1;
+        let tl = &toplevels[i];
+        if !tl.active { continue; }
+        // Toplevel bounds: (tl.x, tl.y - TITLE_BAR_HEIGHT) to (tl.x + width, tl.y + height).
+        let x0 = tl.x;
+        let y0 = tl.y - TITLE_BAR_HEIGHT as i32;
+        let x1 = tl.x + tl.width as i32;
+        let y1 = tl.y + tl.height as i32;
+        if cursor_x >= x0 && cursor_x < x1 && cursor_y >= y0 && cursor_y < y1 {
+            hit_tl_idx = i;
+            break;
+        }
+    }
+
+    // Update focus if a toplevel was clicked (any button pressed).
+    if hit_tl_idx < MAX_TOPLEVELS && packet.buttons != 0 {
+        let tl = &toplevels[hit_tl_idx];
+        unsafe {
+            *FOCUSED_TOPLEVEL.get() = hit_tl_idx;
+            // Find the client that owns this toplevel via its surface.
+            let surfaces = &*SURFACES.get();
+            for si in 0..MAX_SURFACES {
+                if surfaces[si].active && surfaces[si].surface_id == tl.wl_surface_id {
+                    *FOCUSED_CLIENT.get() = surfaces[si].client_idx;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Send pointer events to the client that owns the hit toplevel.
+    if hit_tl_idx < MAX_TOPLEVELS {
+        let tl = &toplevels[hit_tl_idx];
+        // Find the client owning this toplevel's surface.
+        let surfaces = unsafe { &*SURFACES.get() };
+        let mut target_client_idx = MAX_CLIENTS;
+        for si in 0..MAX_SURFACES {
+            if surfaces[si].active && surfaces[si].surface_id == tl.wl_surface_id {
+                target_client_idx = surfaces[si].client_idx;
+                break;
+            }
+        }
+        if target_client_idx < MAX_CLIENTS {
+            let clients = unsafe { &*CLIENTS.get() };
+            let cl = &clients[target_client_idx];
+            if cl.active && cl.objects.pointer_id != 0 {
+                let pointer_id = cl.objects.pointer_id;
+                let ep = cl.endpoint_cap;
+                let time = tsc_millis();
+
+                // Compute surface-local coordinates.
+                // The client content area starts at (tl.x, tl.y) -- below the title bar.
+                let surface_x = cursor_x - tl.x;
+                let surface_y = cursor_y - tl.y;
+
+                // Wayland fixed-point: value * 256 (wl_fixed_t is 24.8 format).
+                let fx = (surface_x * 256) as i32;
+                let fy = (surface_y * 256) as i32;
+
+                // Build wl_pointer::motion event (opcode 1)
+                // Args: time(u32), surface_x(fixed), surface_y(fixed)
+                let mut ev = wayland::WlEvent::new();
+                ev.begin(pointer_id, 1); // wl_pointer::motion
+                ev.put_u32(time);
+                ev.put_i32(fx);
+                ev.put_i32(fy);
+                ev.finish();
+
+                // Check for button events (PS/2: bit0=left, bit1=right, bit2=middle).
+                // We track previous button state to detect press/release edges.
+                static PREV_BUTTONS: SyncUnsafeCell<u8> = SyncUnsafeCell::new(0);
+                let prev = unsafe { *PREV_BUTTONS.get() };
+                let cur = packet.buttons;
+
+                // Wayland button codes: left=0x110 (BTN_LEFT), right=0x111, middle=0x112.
+                let button_map: [(u8, u32); 3] = [
+                    (0x01, 0x110), // left
+                    (0x02, 0x111), // right
+                    (0x04, 0x112), // middle
+                ];
+
+                // We need to send motion + optional button events + frame.
+                // Pack them into a contiguous buffer and send all at once.
+                let mut events_buf: [wayland::WlEvent; 6] = [const { wayland::WlEvent::new() }; 6];
+
+                // Motion event first.
+                events_buf[0] = ev;
+                let mut ev_count = 1usize;
+
+                // Button events for edges.
+                for &(mask, code) in &button_map {
+                    let was_pressed = prev & mask != 0;
+                    let is_pressed = cur & mask != 0;
+                    if was_pressed != is_pressed && ev_count < 5 {
+                        let serial = next_event_serial();
+                        let state = if is_pressed { 1u32 } else { 0u32 };
+                        let mut btn_ev = wayland::WlEvent::new();
+                        btn_ev.begin(pointer_id, 2); // wl_pointer::button
+                        btn_ev.put_u32(serial);
+                        btn_ev.put_u32(time);
+                        btn_ev.put_u32(code);
+                        btn_ev.put_u32(state);
+                        btn_ev.finish();
+                        events_buf[ev_count] = btn_ev;
+                        ev_count += 1;
+                    }
+                }
+
+                // wl_pointer::frame event (opcode 5) -- no arguments.
+                if ev_count < 6 {
+                    let mut frame_ev = wayland::WlEvent::new();
+                    frame_ev.begin(pointer_id, 5); // wl_pointer::frame
+                    frame_ev.finish();
+                    events_buf[ev_count] = frame_ev;
+                    ev_count += 1;
+                }
+
+                unsafe { *PREV_BUTTONS.get() = cur; }
+
+                // Send all pointer events packed into one IPC message.
+                let mut packed_events: [wayland::WlEvent; wayland::MAX_EVENTS] =
+                    [const { wayland::WlEvent::new() }; wayland::MAX_EVENTS];
+                for idx in 0..ev_count.min(wayland::MAX_EVENTS) {
+                    packed_events[idx].buf[..events_buf[idx].len]
+                        .copy_from_slice(&events_buf[idx].buf[..events_buf[idx].len]);
+                    packed_events[idx].len = events_buf[idx].len;
+                }
+                let ipc_reply = wayland::events_to_ipc(&packed_events, ev_count);
+                let _ = sys::send(ep, &ipc_reply);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -581,6 +892,7 @@ fn compose() {
         let surfaces = &*SURFACES.get();
         let buffers = &*BUFFERS.get();
         let pools = &*POOLS.get();
+        let focused_tl = *FOCUSED_TOPLEVEL.get();
 
         // Clear background (needed since we only redraw on damage).
         fb.clear(BG_COLOR);
@@ -590,14 +902,20 @@ fn compose() {
             let tl = &toplevels[i];
             if !tl.active { continue; }
 
-            // Draw title bar.
-            fb.draw_title_bar(
+            // Title bar color: highlight focused toplevel.
+            let bar_color = if i == focused_tl { 0xFF5577AA } else { 0xFF404040 };
+            fb.fill_rect(
                 tl.x, tl.y - TITLE_BAR_HEIGHT as i32,
-                tl.width,
-                &tl.title[..tl.title_len],
+                tl.width, TITLE_BAR_HEIGHT,
+                bar_color,
             );
+            // Close button (top-right corner of title bar).
+            let close_x = tl.x + tl.width as i32 - 20;
+            let close_y = tl.y - TITLE_BAR_HEIGHT as i32 + 4;
+            fb.fill_rect(close_x, close_y, 16, 16, 0xFFFF5555);
 
             // Find the surface and its buffer.
+            let mut found_buffer = false;
             for si in 0..MAX_SURFACES {
                 let surf = &surfaces[si];
                 if !surf.active || surf.surface_id != tl.wl_surface_id { continue; }
@@ -612,14 +930,40 @@ fn compose() {
                     if pool_idx < MAX_POOLS && pools[pool_idx].active {
                         let pool = &pools[pool_idx];
                         let src = (pool.mapped_vaddr + buf.offset as u64) as *const u32;
+
+                        // If pool memory is all zeros (client hasn't written yet),
+                        // fill with a test pattern so the window is visible.
+                        let first_pixel = (pool.mapped_vaddr + buf.offset as u64) as *const u32;
+                        if first_pixel.read_volatile() == 0 {
+                            // Fill with a gradient test pattern.
+                            let dst = (pool.mapped_vaddr + buf.offset as u64) as *mut u32;
+                            let src_pprow = buf.stride / 4;
+                            for row in 0..buf.height {
+                                for col in 0..buf.width {
+                                    let r = ((col * 255) / buf.width.max(1)) as u32;
+                                    let g = ((row * 255) / buf.height.max(1)) as u32;
+                                    let b = 0x88u32;
+                                    let pixel = 0xFF000000 | (r << 16) | (g << 8) | b;
+                                    dst.add((row * src_pprow + col) as usize)
+                                        .write_volatile(pixel);
+                                }
+                            }
+                        }
+
                         fb.blit(tl.x, tl.y, buf.width, buf.height, src, buf.stride);
+                        found_buffer = true;
                     }
                 }
                 break;
             }
+
+            // If no buffer attached yet, draw a placeholder fill.
+            if !found_buffer {
+                fb.fill_rect(tl.x, tl.y, tl.width, tl.height, 0xFF333355);
+            }
         }
 
-        // Draw cursor on top.
+        // Draw cursor on top of everything.
         fb.draw_cursor(*CURSOR_X.get(), *CURSOR_Y.get());
     }
 }

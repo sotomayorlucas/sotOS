@@ -395,11 +395,15 @@ initrd-lkl: build-user-lkl build-shell build-kbd build-net build-nvme build-xhci
 image-lkl: build initrd-lkl
     python scripts/mkimage.py --kernel {{KERNEL}} --initrd {{INITRD}} --output {{IMAGE}} --size 512
 
-# Run with LKL server (virtio-blk + virtio-net)
-run-lkl: image-lkl create-test-disk
+# Create a 64 MiB ext4 disk image (requires WSL with Ubuntu)
+create-ext4-disk:
+    [ -f target/ext4.img ] || wsl -d Ubuntu -- bash -c "dd if=/dev/zero of=/mnt/c/Users/sotom/sotOS/target/ext4.img bs=1M count=64 && mkfs.ext4 -F /mnt/c/Users/sotom/sotOS/target/ext4.img"
+
+# Run with LKL server (ext4 disk + virtio-net)
+run-lkl: image-lkl create-ext4-disk
     "{{QEMU}}" \
         -drive format=raw,file={{IMAGE}} \
-        -drive if=none,format=raw,file=target/disk.img,id=disk0 \
+        -drive if=none,format=raw,file=target/ext4.img,id=disk0 \
         -device virtio-blk-pci,drive=disk0,disable-modern=on \
         -netdev user,id=net0,dns=8.8.8.8 \
         -device virtio-net-pci,netdev=net0,disable-modern=on \

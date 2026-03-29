@@ -19,6 +19,7 @@
 
 #ifdef HAS_LKL
 #include <lkl.h>
+#include <lkl_host.h>
 #include <lkl/asm/host_ops.h>
 #else
 #include "lkl_stub.h"

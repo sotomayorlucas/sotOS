@@ -22,7 +22,7 @@ else
   $(info LKL not found — building in stub mode)
 endif
 
-SRCS := lkl_bridge.c host_ops.c allocator.c guest_mem.c libc_stubs.c
+SRCS := lkl_bridge.c host_ops.c allocator.c guest_mem.c libc_stubs.c disk_backend.c
 OBJS := $(SRCS:.c=.o)
 
 TARGET := liblkl_fused.a
