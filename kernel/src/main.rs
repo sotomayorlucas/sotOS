@@ -676,9 +676,9 @@ fn load_initrd(cr3: u64) {
     initrd::set_initrd(initrd_phys, module.size());
 
     // Single-pass CPIO scan for all service binaries (matroid optimization).
-    let names = ["init", "shell", "vmm", "kbd", "net", "nvme", "xhci", "compositor"];
+    let names = ["init", "shell", "vmm", "kbd", "net", "nvme", "xhci", "compositor", "hello-gui"];
     let found = initrd::find_all(module_data, &names);
-    // Indices: 0=init, 1=shell, 2=vmm, 3=kbd, 4=net, 5=nvme, 6=xhci, 7=compositor
+    // Indices: 0=init, 1=shell, 2=vmm, 3=kbd, 4=net, 5=nvme, 6=xhci, 7=compositor, 8=hello-gui
 
     let elf_data = match found[0] {
         Some(d) => d,
@@ -754,6 +754,10 @@ fn load_initrd(cr3: u64) {
     if let Some(comp_data) = found[7] {
         kdebug!("  initrd: found 'compositor' ({} bytes)", comp_data.len());
         load_compositor_process(comp_data, cr3);
+    }
+    if let Some(gui_data) = found[8] {
+        kdebug!("  initrd: found 'hello-gui' ({} bytes)", gui_data.len());
+        load_hello_gui_process(gui_data);
     }
 }
 
@@ -1059,7 +1063,9 @@ fn load_compositor_process(comp_data: &[u8], init_cr3: u64) {
 
 /// Write BootInfo for the compositor process.
 ///
-/// Cap 0: IPC endpoint (for client connections). Also maps framebuffer if available.
+/// Cap 0: IPC endpoint (for client connections).
+/// Cap 1: AddrSpace (compositor's own CR3) -- for shm_map into self.
+/// Also maps framebuffer if available.
 fn write_compositor_boot_info(comp_as: &mm::paging::AddressSpace) {
     use sotos_common::{BOOT_INFO_ADDR, BOOT_INFO_MAGIC, BootInfo};
 
@@ -1072,13 +1078,59 @@ fn write_compositor_boot_info(comp_as: &mm::paging::AddressSpace) {
     ).expect("failed to create compositor endpoint cap");
     kdebug!("  compositor cap {}: endpoint (client connections)", ep_cap.raw());
 
+    // Cap 1: AddrSpace for compositor's own CR3 (needed for shm_map into self).
+    let comp_as_cap = cap::insert(
+        cap::CapObject::AddrSpace { cr3: comp_as.cr3() },
+        cap::Rights::ALL, None,
+    ).expect("failed to create compositor AS cap");
+    kdebug!("  compositor cap {}: addr_space (self, cr3={:#x})", comp_as_cap.raw(), comp_as.cr3());
+
     let mut info = BootInfo::empty();
     info.magic = BOOT_INFO_MAGIC;
-    info.cap_count = 1;
+    info.cap_count = 2;
     info.caps[0] = ep_cap.raw() as u64;
+    info.caps[1] = comp_as_cap.raw() as u64;
+    info.self_as_cap = comp_as_cap.raw() as u64;
 
     map_framebuffer(comp_as, &mut info);
 
     write_bootinfo(phys, &info);
-    kdebug!("  compositor bootinfo: 1 cap at {:#x}", BOOT_INFO_ADDR);
+    kdebug!("  compositor bootinfo: 2 caps at {:#x}", BOOT_INFO_ADDR);
+}
+
+/// Load the hello-gui Wayland test client as a separate process.
+fn load_hello_gui_process(gui_data: &[u8]) {
+    let proc = match load_service(&ProcessSpec { name: "hello-gui", data: gui_data, stack_pages: 4 }) {
+        Some(p) => p,
+        None => return,
+    };
+    write_hello_gui_boot_info(&proc.addr_space);
+    proc.spawn();
+    kdebug!("  hello-gui: separate process, cr3={:#x}", proc.cr3);
+}
+
+/// Write BootInfo for hello-gui process.
+///
+/// Cap 0: AddrSpace (hello-gui's own CR3) -- for shm_map into self.
+/// No IPC endpoint needed (it looks up the compositor via svc_lookup).
+fn write_hello_gui_boot_info(gui_as: &mm::paging::AddressSpace) {
+    use sotos_common::{BOOT_INFO_ADDR, BOOT_INFO_MAGIC, BootInfo};
+
+    let phys = alloc_bootinfo_page(gui_as, "hello-gui");
+
+    // Cap 0: AddrSpace for hello-gui's own CR3 (needed for shm_map).
+    let gui_as_cap = cap::insert(
+        cap::CapObject::AddrSpace { cr3: gui_as.cr3() },
+        cap::Rights::ALL, None,
+    ).expect("failed to create hello-gui AS cap");
+    kdebug!("  hello-gui cap {}: addr_space (self, cr3={:#x})", gui_as_cap.raw(), gui_as.cr3());
+
+    let mut info = BootInfo::empty();
+    info.magic = BOOT_INFO_MAGIC;
+    info.cap_count = 1;
+    info.caps[0] = gui_as_cap.raw() as u64;
+    info.self_as_cap = gui_as_cap.raw() as u64;
+
+    write_bootinfo(phys, &info);
+    kdebug!("  hello-gui bootinfo: 1 cap at {:#x}", BOOT_INFO_ADDR);
 }

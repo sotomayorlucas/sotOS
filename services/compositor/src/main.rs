@@ -23,7 +23,7 @@ use sotos_common::{BootInfo, IpcMsg, BOOT_INFO_ADDR, SyncUnsafeCell};
 use render::Framebuffer;
 use wayland::{
     ClientObjects, WlMessage, DispatchResult,
-    WL_MSG_TAG, WL_CONNECT_TAG, IPC_DATA_MAX,
+    WL_MSG_TAG, WL_CONNECT_TAG, WL_SHM_POOL_TAG, IPC_DATA_MAX,
 };
 
 // ---------------------------------------------------------------------------
@@ -119,6 +119,9 @@ static POOLS: SyncUnsafeCell<[wayland::shm::ShmPool; MAX_POOLS]> =
     SyncUnsafeCell::new([const { wayland::shm::ShmPool::empty() }; MAX_POOLS]);
 static BUFFERS: SyncUnsafeCell<[wayland::shm::ShmBuffer; MAX_BUFFERS]> =
     SyncUnsafeCell::new([const { wayland::shm::ShmBuffer::empty() }; MAX_BUFFERS]);
+
+/// Compositor's own AS capability (for shm_map into self).
+static SELF_AS_CAP: SyncUnsafeCell<u64> = SyncUnsafeCell::new(0);
 
 /// Mouse cursor position.
 static CURSOR_X: SyncUnsafeCell<i32> = SyncUnsafeCell::new(0);
@@ -240,6 +243,17 @@ pub extern "C" fn _start() -> ! {
     print(b"x");
     print_hex(boot_info.fb_height as u64);
     print(b"\n");
+
+    // Read self AS cap from BootInfo (cap[1]).
+    let self_as_cap = boot_info.self_as_cap;
+    if self_as_cap != 0 {
+        unsafe { *SELF_AS_CAP.get() = self_as_cap; }
+        print(b"compositor: self_as_cap=");
+        print_hex(self_as_cap);
+        print(b"\n");
+    } else {
+        print(b"compositor: WARNING: no self_as_cap, SHM sharing disabled\n");
+    }
 
     // Register as "compositor" service.
     let ep_cap = boot_info.caps[0]; // endpoint for IPC
@@ -446,7 +460,32 @@ fn handle_wire_message(ep_cap: u64, msg: &IpcMsg) {
 }
 
 /// Send response events back to the client via IPC.
+/// If a new SHM pool was created, sends the SHM handle so the client can map it.
 fn send_events(ep_cap: u64, result: &DispatchResult) {
+    // If a new SHM pool was created, send the SHM handle as the reply.
+    // The client needs this to call shm_map() and map the pool into its AS.
+    let (pool_id, pool_size, _) = result.new_pool;
+    if pool_id != 0 && pool_size > 0 {
+        // Look up the pool to get the SHM handle.
+        let pools = unsafe { &*POOLS.get() };
+        for pi in 0..MAX_POOLS {
+            if pools[pi].active && pools[pi].pool_id == pool_id {
+                let reply = wayland::shm_pool_reply(
+                    pools[pi].shm_handle,
+                    pools[pi].page_count,
+                    pool_id,
+                );
+                print(b"compositor: sending SHM handle ");
+                print_u32_dec(pools[pi].shm_handle as u32);
+                print(b" to client for pool ");
+                print_u32_dec(pool_id);
+                print(b"\n");
+                let _ = sys::send(ep_cap, &reply);
+                return;
+            }
+        }
+    }
+
     if result.event_count == 0 {
         // Always send a reply so the client unblocks (even if no events).
         let _ = sys::send(ep_cap, &IpcMsg::empty());
@@ -565,48 +604,81 @@ fn apply_dispatch_result(client_idx: usize, result: &DispatchResult) {
         }
     }
 
-    // New SHM pool? Allocate pages in compositor's address space.
-    let (pool_id, pool_size) = result.new_pool;
+    // New SHM pool? Use kernel SHM for cross-process sharing.
+    let (pool_id, pool_size, client_shm_hint) = result.new_pool;
     if pool_id != 0 && pool_size > 0 {
         let pools = unsafe { &mut *POOLS.get() };
+        let self_as_cap = unsafe { *SELF_AS_CAP.get() };
         for pi in 0..MAX_POOLS {
             if !pools[pi].active {
                 let clamped_size = (pool_size as usize).min(MAX_POOL_SIZE);
                 let pages = (clamped_size + 0xFFF) / 0x1000;
                 let pool_vaddr = POOL_BASE + (pi as u64) * MAX_POOL_SIZE as u64;
 
-                let mut ok = true;
-                for p in 0..pages {
-                    let vaddr = pool_vaddr + (p as u64) * 0x1000;
-                    match sys::frame_alloc() {
-                        Ok(frame_cap) => {
-                            // flags: bit 1 = WRITABLE
-                            if sys::map(vaddr, frame_cap, 0x2).is_err() {
-                                print(b"compositor: pool map failed\n");
+                // Check if client already created the SHM object (fd >= 0 is
+                // the kernel SHM handle). If so, reuse it. Otherwise create one.
+                let shm_handle = if client_shm_hint >= 0 {
+                    // Client pre-created the SHM; just use its handle.
+                    client_shm_hint as u64
+                } else {
+                    // Compositor creates the SHM object.
+                    match sys::shm_create(pages as u64) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            print(b"compositor: shm_create failed: ");
+                            print_hex(e as u64);
+                            print(b"\n");
+                            break;
+                        }
+                    }
+                };
+
+                // Map the SHM into compositor's AS.
+                let map_ok = if self_as_cap != 0 {
+                    // flags: bit 0 = writable
+                    match sys::shm_map(shm_handle, self_as_cap, pool_vaddr, 1) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            print(b"compositor: shm_map failed: ");
+                            print_hex(e as u64);
+                            print(b"\n");
+                            false
+                        }
+                    }
+                } else {
+                    // Fallback: allocate frames directly (no sharing).
+                    let mut ok = true;
+                    for p in 0..pages {
+                        let vaddr = pool_vaddr + (p as u64) * 0x1000;
+                        match sys::frame_alloc() {
+                            Ok(frame_cap) => {
+                                if sys::map(vaddr, frame_cap, 0x2).is_err() {
+                                    print(b"compositor: pool map failed\n");
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                print(b"compositor: pool frame_alloc failed\n");
                                 ok = false;
                                 break;
                             }
                         }
-                        Err(_) => {
-                            print(b"compositor: pool frame_alloc failed\n");
-                            ok = false;
-                            break;
-                        }
                     }
-                }
+                    ok
+                };
 
-                if ok {
+                if map_ok {
                     pools[pi].active = true;
                     pools[pi].pool_id = pool_id;
+                    pools[pi].shm_handle = shm_handle;
+                    pools[pi].page_count = pages as u32;
                     pools[pi].size = pool_size;
                     pools[pi].mapped_vaddr = pool_vaddr;
-                    // Zero the pool memory
-                    let dst = pool_vaddr as *mut u8;
-                    for i in 0..(pages * 0x1000) {
-                        unsafe { dst.add(i).write_volatile(0); }
-                    }
                     print(b"compositor: pool ");
                     print_u32_dec(pool_id);
+                    print(b" shm_handle=");
+                    print_u32_dec(shm_handle as u32);
                     print(b" mapped at ");
                     print_hex(pool_vaddr);
                     print(b" (");
@@ -1024,25 +1096,9 @@ fn compose() {
                         let pool = &pools[pool_idx];
                         let src = (pool.mapped_vaddr + buf.offset as u64) as *const u32;
 
-                        // If pool memory is all zeros (client hasn't written yet),
-                        // fill with a test pattern so the window is visible.
-                        let first_pixel = (pool.mapped_vaddr + buf.offset as u64) as *const u32;
-                        if first_pixel.read_volatile() == 0 {
-                            // Fill with a gradient test pattern.
-                            let dst = (pool.mapped_vaddr + buf.offset as u64) as *mut u32;
-                            let src_pprow = buf.stride / 4;
-                            for row in 0..buf.height {
-                                for col in 0..buf.width {
-                                    let r = ((col * 255) / buf.width.max(1)) as u32;
-                                    let g = ((row * 255) / buf.height.max(1)) as u32;
-                                    let b = 0x88u32;
-                                    let pixel = 0xFF000000 | (r << 16) | (g << 8) | b;
-                                    dst.add((row * src_pprow + col) as usize)
-                                        .write_volatile(pixel);
-                                }
-                            }
-                        }
-
+                        // Blit directly from the shared pool memory.
+                        // With real SHM, the client writes pixels here and the
+                        // compositor reads them -- no test pattern needed.
                         fb.blit(tl.x, tl.y, buf.width, buf.height, src, buf.stride);
                         found_buffer = true;
                     }

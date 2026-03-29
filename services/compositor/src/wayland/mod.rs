@@ -34,6 +34,12 @@ pub const WL_MSG_TAG: u64 = 0x574C; // "WL"
 /// IPC tag for a new client connection request.
 pub const WL_CONNECT_TAG: u64 = 0x574C_434F; // "WLCO"
 
+/// IPC tag for SHM pool creation response.
+/// regs[0] = shm_handle (kernel SHM object index)
+/// regs[1] = page_count (number of 4K pages)
+/// regs[2] = pool_id (Wayland object ID of the wl_shm_pool)
+pub const WL_SHM_POOL_TAG: u64 = 0x574C_5348; // "WLSH"
+
 /// Maximum bytes carried per IPC message (8 regs * 8 bytes).
 pub const IPC_DATA_MAX: usize = 64;
 
@@ -273,6 +279,17 @@ pub fn events_to_ipc(events: &[WlEvent; MAX_EVENTS], count: usize) -> IpcMsg {
     reply
 }
 
+/// Build an IPC reply carrying the SHM pool handle for cross-process mapping.
+/// The client receives this and calls shm_map() to map the shared pages.
+pub fn shm_pool_reply(shm_handle: u64, page_count: u32, pool_id: u32) -> IpcMsg {
+    let mut reply = IpcMsg::empty();
+    reply.tag = WL_SHM_POOL_TAG;
+    reply.regs[0] = shm_handle;
+    reply.regs[1] = page_count as u64;
+    reply.regs[2] = pool_id as u64;
+    reply
+}
+
 // ---------------------------------------------------------------------------
 // Object ID lookup types for dispatch
 // ---------------------------------------------------------------------------
@@ -444,8 +461,10 @@ pub struct DispatchResult {
     pub title_update: (u32, [u8; 64], usize),
     /// Set if damage was reported on a surface.
     pub damage: bool,
-    /// If a new SHM pool was created: (pool_id, size). size=0 means no pool.
-    pub new_pool: (u32, u32),
+    /// If a new SHM pool was created: (pool_id, size, fd/shm_hint). size=0 means no pool.
+    /// The third element carries the fd from the client's create_pool request
+    /// (used as an SHM handle hint if the client pre-created the SHM).
+    pub new_pool: (u32, u32, i32),
     /// If a new SHM buffer was created: the buffer + pool_object_id. buffer_id=0 means none.
     pub new_buffer: (shm::ShmBuffer, u32),
 }
@@ -461,7 +480,7 @@ impl DispatchResult {
             new_toplevel: (0, 0, 0),
             title_update: (0, [0u8; 64], 0),
             damage: false,
-            new_pool: (0, 0),
+            new_pool: (0, 0, -1),
             new_buffer: (shm::ShmBuffer::empty(), 0),
         }
     }
@@ -560,10 +579,11 @@ pub fn dispatch_message(
 
     // 4. wl_shm
     if id == objs.shm_id && objs.shm_id != 0 {
-        if let Some((pool_id, _fd, size)) = shm::handle_create_pool(msg) {
+        if let Some((pool_id, fd, size)) = shm::handle_create_pool(msg) {
             objs.add_shm_pool(pool_id);
             // Signal the caller to allocate pool memory.
-            result.new_pool = (pool_id, size);
+            // fd carries the client's SHM handle hint (if client pre-created it).
+            result.new_pool = (pool_id, size, fd);
         }
         return result;
     }
