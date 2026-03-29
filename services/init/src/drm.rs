@@ -39,6 +39,8 @@ const DRM_IOCTL_MODE_GETPROPERTY: u8  = 0xAA;
 const DRM_IOCTL_MODE_GETPLANERESOURCES: u8 = 0xB5;
 const DRM_IOCTL_MODE_GETPLANE: u8     = 0xB6;
 const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u8 = 0xB9;
+const DRM_IOCTL_GEM_CLOSE: u8        = 0x09;
+const DRM_IOCTL_MODE_GETFB: u8       = 0xAD;
 
 /// DRM ioctl type byte ('d' = 0x64).
 const DRM_IOCTL_TYPE: u8 = 0x64;
@@ -151,6 +153,10 @@ static DRM_NEXT_FB_ID: SyncUnsafeCell<u32>  = SyncUnsafeCell::new(1);
 // a drm_event_vblank response for the next read() on the DRM fd.
 static DRM_FLIP_PENDING: SyncUnsafeCell<bool> = SyncUnsafeCell::new(false);
 static DRM_FLIP_USER_DATA: SyncUnsafeCell<u64> = SyncUnsafeCell::new(0);
+static DRM_FLIP_SEQUENCE: SyncUnsafeCell<u32> = SyncUnsafeCell::new(0);
+
+// Currently active FB on the CRTC (updated by SETCRTC and PAGE_FLIP).
+static DRM_CRTC_FB_ID: SyncUnsafeCell<u32> = SyncUnsafeCell::new(0);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -165,6 +171,24 @@ fn fb_info() -> (u32, u32, u32, u32) {
 /// Align `v` up to the next multiple of `align` (must be power-of-two).
 fn align_up(v: u32, align: u32) -> u32 {
     (v + align - 1) & !(align - 1)
+}
+
+/// Find the dumb buffer slot index backing a given fb_id.
+/// Returns None if fb_id is not found or has no matching dumb buffer.
+fn find_dumb_for_fb(fb_id: u32) -> Option<usize> {
+    let fbs = unsafe { &*DRM_FBS.get() };
+    let dumbs = unsafe { &*DRM_DUMBS.get() };
+    for fb in fbs.iter() {
+        if fb.active && fb.fb_id == fb_id {
+            for (i, d) in dumbs.iter().enumerate() {
+                if d.active && d.handle == fb.dumb_handle {
+                    return Some(i);
+                }
+            }
+            return None;
+        }
+    }
+    None
 }
 
 /// Fill a 68-byte drm_mode_modeinfo struct for the current framebuffer mode.
@@ -243,7 +267,8 @@ fn blit_dumb_to_fb(ctx: &SyscallContext, dumb: &DrmDumbBuffer) {
     let (fb_w, fb_h, fb_pitch, _) = fb_info();
     let copy_h = (dumb.height).min(fb_h) as usize;
     let copy_row_bytes = ((dumb.width).min(fb_w) as usize) * 4; // 32 bpp
-    let mut row_buf = [0u8; 4096]; // up to 1024 pixels * 4 = 4096
+    // 8192 bytes supports up to 2048 pixels wide at 32bpp.
+    let mut row_buf = [0u8; 8192];
     for y in 0..copy_h {
         let src = dumb.mmap_vaddr + (y as u64) * (dumb.pitch as u64);
         let dst = FB_USER_BASE + (y as u64) * (fb_pitch as u64);
@@ -303,6 +328,8 @@ pub(crate) fn drm_ioctl(ctx: &mut SyscallContext, cmd: u64, arg: u64) -> i64 {
         DRM_IOCTL_MODE_GETPLANERESOURCES => ioctl_get_plane_resources(ctx, arg),
         DRM_IOCTL_MODE_GETPLANE     => ioctl_get_plane(ctx, arg),
         DRM_IOCTL_MODE_OBJ_GETPROPERTIES => ioctl_obj_get_properties(ctx, arg),
+        DRM_IOCTL_GEM_CLOSE         => 0, // gem close: no-op for dumb buffers
+        DRM_IOCTL_MODE_GETFB        => ioctl_get_fb(ctx, arg),
         _ => {
             print(b"DRM-IOCTL unknown nr=0x");
             print_hex64(nr as u64);
@@ -489,8 +516,9 @@ fn ioctl_get_crtc(ctx: &mut SyscallContext, arg: u64) -> i64 {
     let mut buf = [0u8; 104];
     ctx.guest_read(arg, &mut buf);
 
+    let active_fb = unsafe { *DRM_CRTC_FB_ID.get() };
     buf[12..16].copy_from_slice(&1u32.to_le_bytes()); // crtc_id = 1
-    buf[16..20].copy_from_slice(&0u32.to_le_bytes()); // fb_id = 0 (no fb bound yet)
+    buf[16..20].copy_from_slice(&active_fb.to_le_bytes()); // fb_id = currently active FB
     buf[20..24].copy_from_slice(&0u32.to_le_bytes()); // x = 0
     buf[24..28].copy_from_slice(&0u32.to_le_bytes()); // y = 0
     buf[28..32].copy_from_slice(&256u32.to_le_bytes()); // gamma_size = 256
@@ -517,18 +545,10 @@ fn ioctl_set_crtc(ctx: &mut SyscallContext, arg: u64) -> i64 {
     print(b"\n");
 
     if fb_id != 0 {
-        let fbs = unsafe { &*DRM_FBS.get() };
-        let dumbs = unsafe { &*DRM_DUMBS.get() };
-        for fb in fbs.iter() {
-            if fb.active && fb.fb_id == fb_id {
-                for d in dumbs.iter() {
-                    if d.active && d.handle == fb.dumb_handle {
-                        blit_dumb_to_fb(ctx, d);
-                        break;
-                    }
-                }
-                break;
-            }
+        unsafe { *DRM_CRTC_FB_ID.get() = fb_id; }
+        if let Some(idx) = find_dumb_for_fb(fb_id) {
+            let dumbs = unsafe { &*DRM_DUMBS.get() };
+            blit_dumb_to_fb(ctx, &dumbs[idx]);
         }
     }
     0
@@ -861,6 +881,43 @@ fn ioctl_add_fb2(ctx: &mut SyscallContext, arg: u64) -> i64 {
     0
 }
 
+/// DRM_IOCTL_MODE_GETFB (0xAD)
+///
+/// struct drm_mode_fb_cmd {
+///     __u32 fb_id;    // 0 (in)
+///     __u32 width;    // 4 (out)
+///     __u32 height;   // 8 (out)
+///     __u32 pitch;    // 12 (out)
+///     __u32 bpp;      // 16 (out)
+///     __u32 depth;    // 20 (out)
+///     __u32 handle;   // 24 (out)
+/// };
+fn ioctl_get_fb(ctx: &mut SyscallContext, arg: u64) -> i64 {
+    let mut buf = [0u8; 28];
+    ctx.guest_read(arg, &mut buf);
+    let fb_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+
+    let fbs = unsafe { &*DRM_FBS.get() };
+    for fb in fbs.iter() {
+        if fb.active && fb.fb_id == fb_id {
+            buf[4..8].copy_from_slice(&fb.width.to_le_bytes());
+            buf[8..12].copy_from_slice(&fb.height.to_le_bytes());
+            if let Some(idx) = find_dumb_for_fb(fb_id) {
+                let d = &unsafe { &*DRM_DUMBS.get() }[idx];
+                buf[12..16].copy_from_slice(&d.pitch.to_le_bytes());
+                buf[16..20].copy_from_slice(&d.bpp.to_le_bytes());
+                // XRGB8888 has 32bpp but only 24 color depth bits
+                let depth: u32 = if d.bpp == 32 { 24 } else { d.bpp };
+                buf[20..24].copy_from_slice(&depth.to_le_bytes());
+                buf[24..28].copy_from_slice(&d.handle.to_le_bytes());
+            }
+            ctx.guest_write(arg, &buf);
+            return 0;
+        }
+    }
+    -22 // EINVAL
+}
+
 /// DRM_IOCTL_MODE_RMFB (0xAF)
 /// Argument is a pointer to __u32 fb_id.
 fn ioctl_rm_fb(ctx: &mut SyscallContext, arg: u64) -> i64 {
@@ -899,23 +956,22 @@ fn ioctl_page_flip(ctx: &mut SyscallContext, arg: u64) -> i64 {
     let flags = u32::from_le_bytes(buf[8..12].try_into().unwrap());
     let user_data = u64::from_le_bytes(buf[16..24].try_into().unwrap());
 
-    let fbs = unsafe { &*DRM_FBS.get() };
-    let dumbs = unsafe { &*DRM_DUMBS.get() };
-    for fb in fbs.iter() {
-        if fb.active && fb.fb_id == fb_id {
-            for d in dumbs.iter() {
-                if d.active && d.handle == fb.dumb_handle {
-                    blit_dumb_to_fb(ctx, d);
-                    break;
-                }
-            }
-            break;
-        }
+    // Real DRM returns -EBUSY if a flip event is still pending.
+    if flags & 0x01 != 0 && unsafe { *DRM_FLIP_PENDING.get() } {
+        return -16; // EBUSY
+    }
+
+    unsafe { *DRM_CRTC_FB_ID.get() = fb_id; }
+
+    if let Some(idx) = find_dumb_for_fb(fb_id) {
+        let dumbs = unsafe { &*DRM_DUMBS.get() };
+        blit_dumb_to_fb(ctx, &dumbs[idx]);
     }
 
     // If PAGE_FLIP_EVENT flag (0x01) is set, queue a vblank event for read().
     if flags & 0x01 != 0 {
         unsafe {
+            *DRM_FLIP_SEQUENCE.get() += 1;
             *DRM_FLIP_PENDING.get() = true;
             *DRM_FLIP_USER_DATA.get() = user_data;
         }
@@ -1304,11 +1360,16 @@ pub(crate) fn drm_mmap(ctx: &mut SyscallContext, mmap_offset: u64, _size: u64, b
 /// };
 pub(crate) fn drm_read(ctx: &SyscallContext, buf_ptr: u64, len: usize) -> i64 {
     let pending = unsafe { *DRM_FLIP_PENDING.get() };
-    if !pending || len < 32 {
-        return 0; // No event or buffer too small
+    if !pending {
+        // No event pending. Return -EAGAIN so callers know to poll/retry.
+        return -11; // EAGAIN
+    }
+    if len < 32 {
+        return -22; // EINVAL — buffer too small for drm_event_vblank
     }
 
     let user_data = unsafe { *DRM_FLIP_USER_DATA.get() };
+    let sequence = unsafe { *DRM_FLIP_SEQUENCE.get() };
 
     // Build drm_event_vblank (32 bytes)
     let mut ev = [0u8; 32];
@@ -1322,8 +1383,8 @@ pub(crate) fn drm_read(ctx: &SyscallContext, buf_ptr: u64, len: usize) -> i64 {
     let tv_usec = (usec_total % 1_000_000) as u32;
     ev[16..20].copy_from_slice(&tv_sec.to_le_bytes());
     ev[20..24].copy_from_slice(&tv_usec.to_le_bytes());
-    ev[24..28].copy_from_slice(&1u32.to_le_bytes()); // sequence (monotonic counter)
-    ev[28..32].copy_from_slice(&1u32.to_le_bytes()); // crtc_id = 1
+    ev[24..28].copy_from_slice(&sequence.to_le_bytes()); // monotonic sequence counter
+    ev[28..32].copy_from_slice(&1u32.to_le_bytes());     // crtc_id = 1
 
     ctx.guest_write(buf_ptr, &ev);
 
