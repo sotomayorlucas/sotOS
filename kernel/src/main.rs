@@ -134,6 +134,7 @@ extern "C" fn kmain() -> ! {
     // Serial MUST be first — we need debug output before anything else.
     arch::serial::init();
     kprintln!("sotOS v0.1.0 — microkernel booting...");
+    kprintln!("  sotBSD/STYX exokernel v0.1.0");
 
     if !BASE_REVISION.is_supported() {
         kprintln!("FATAL: Limine base revision not supported");
@@ -189,6 +190,7 @@ extern "C" fn kmain() -> ! {
 
     // Capability system.
     cap::init();
+    kprintln!("[sot] === Project STYX exokernel layer active ===");
     kinfo!(sotos_common::trace::cat::IPC, "[ok] Capabilities");
 
     // Scheduler.

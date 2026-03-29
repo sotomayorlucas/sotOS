@@ -39,7 +39,7 @@ pub fn sot_fork(parent_cr3: u64, parent_caps: &[u64]) -> Result<SotChildDomain, 
     let policy =
         DOMAIN_POLICY_NET | DOMAIN_POLICY_FS_WRITE | DOMAIN_POLICY_FORK | DOMAIN_POLICY_EXEC;
 
-    let domain_id = sys::sot_domain_create(parent_cr3, policy).map_err(map_kernel_err)? as u32;
+    let domain_id = sys::sot_domain_create(policy, parent_cr3).map_err(map_kernel_err)? as u32;
 
     let mut caps = [0u64; MAX_DOMAIN_CAPS];
     let mut cap_count = 0u32;
@@ -86,7 +86,7 @@ pub fn sot_exec(
             let path_len = binary_path.len() as u64;
             if let Err(e) = sys::so_invoke(cap, SO_METHOD_READ, path_ptr, path_len) {
                 let _ = sys::tx_abort(tx_id);
-                let _ = sys::so_revoke(cap, domain_id as u64);
+                let _ = sys::so_revoke(cap);
                 return Err(map_kernel_err(e));
             }
         }
@@ -111,7 +111,7 @@ pub fn sot_exec(
 /// Create a typed byte-stream channel (replaces raw pipe).
 /// Returns `(read_cap, write_cap)`.
 pub fn sot_pipe() -> Result<(u64, u64), i64> {
-    let packed = sys::sot_channel_create(CHANNEL_TYPE_STREAM, 1).map_err(map_kernel_err)?;
+    let packed = sys::sot_channel_create(CHANNEL_TYPE_STREAM).map_err(map_kernel_err)?;
 
     let read_cap = packed & 0xFFFF_FFFF;
     let write_cap = packed >> 32;
@@ -171,7 +171,7 @@ pub fn sot_write(file_cap: u64, buf: &[u8]) -> Result<usize, i64> {
 /// Close a file by revoking its capability.
 pub fn sot_close(file_cap: u64) -> Result<(), i64> {
     sot_provenance_record(0, OP_CLOSE, file_cap);
-    sys::so_revoke(file_cap, 0).map_err(map_kernel_err)
+    sys::so_revoke(file_cap).map_err(map_kernel_err)
 }
 
 // ---------------------------------------------------------------------------
@@ -237,5 +237,5 @@ pub fn sot_provenance_record(domain_id: u32, operation: u16, so_id: u64) {
 
 /// Enter a domain (switch the current thread's active domain context).
 pub fn sot_domain_enter(domain_id: u32) -> Result<(), i64> {
-    sys::sot_domain_enter(domain_id as u64).map_err(map_kernel_err)
+    sys::sot_domain_enter(domain_id as u64, 0).map_err(map_kernel_err)
 }

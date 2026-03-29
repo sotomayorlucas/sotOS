@@ -1418,4 +1418,51 @@ pub mod sys {
     pub fn signal_inject(tid: u64, sig: u64) -> Result<(), i64> {
         check_unit(syscall2(super::SYS_SIGNAL_INJECT, tid, sig))
     }
+
+    // ---- SOT Exokernel Primitives (syscalls 300-310) ----
+
+    #[inline(always)]
+    pub fn so_create(type_id: u64, policy: u64) -> Result<u64, i64> {
+        check_val(syscall2(super::Syscall::SoCreate as u64, type_id, policy))
+    }
+    #[inline(always)]
+    pub fn so_invoke(cap: u64, method: u64, arg0: u64, arg1: u64) -> Result<u64, i64> {
+        check_val(syscall4(super::Syscall::SoInvoke as u64, cap, method, arg0, arg1))
+    }
+    #[inline(always)]
+    pub fn so_grant(cap: u64, target_domain: u64, rights_mask: u64) -> Result<u64, i64> {
+        check_val(syscall3(super::Syscall::SoGrant as u64, cap, target_domain, rights_mask))
+    }
+    #[inline(always)]
+    pub fn so_revoke(cap: u64) -> Result<(), i64> {
+        check_unit(syscall1(super::Syscall::SoRevoke as u64, cap))
+    }
+    #[inline(always)]
+    pub fn so_observe(cap: u64, observer_cap: u64) -> Result<(), i64> {
+        check_unit(syscall2(super::Syscall::SoObserve as u64, cap, observer_cap))
+    }
+    #[inline(always)]
+    pub fn sot_domain_create(policy: u64, cr3: u64) -> Result<u64, i64> {
+        check_val(syscall2(super::Syscall::SotDomainCreate as u64, policy, cr3))
+    }
+    #[inline(always)]
+    pub fn sot_domain_enter(domain_cap: u64, entry_cap: u64) -> Result<(), i64> {
+        check_unit(syscall2(super::Syscall::SotDomainEnter as u64, domain_cap, entry_cap))
+    }
+    #[inline(always)]
+    pub fn sot_channel_create(protocol: u64) -> Result<u64, i64> {
+        check_val(syscall1(super::Syscall::SotChannelCreate as u64, protocol))
+    }
+    #[inline(always)]
+    pub fn tx_begin(tier: u64) -> Result<u64, i64> {
+        check_val(syscall1(super::Syscall::TxBegin as u64, tier))
+    }
+    #[inline(always)]
+    pub fn tx_commit(tx_id: u64) -> Result<(), i64> {
+        check_unit(syscall1(super::Syscall::TxCommit as u64, tx_id))
+    }
+    #[inline(always)]
+    pub fn tx_abort(tx_id: u64) -> Result<(), i64> {
+        check_unit(syscall1(super::Syscall::TxAbort as u64, tx_id))
+    }
 }
