@@ -1,9 +1,9 @@
-//! SOT Secure Object system — trait, types, and adapters.
+//! SOT (Secure Object Transactional) exokernel subsystem.
 //!
-//! This module defines the `SecureObject` trait that every kernel-managed
-//! resource implements, along with the type system (SOType, SOId, Policy,
-//! SOVersion) and the adapter bridging the existing capability objects.
+//! This module implements the core SOT primitives: Secure Objects,
+//! capability epoch tracking, transactions, provenance, and domains.
 
+pub mod cap_epoch;
 pub mod so;
 pub mod types;
 
