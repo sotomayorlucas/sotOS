@@ -35,6 +35,10 @@ exclude = [
     "services/drm-test",
     "services/hello-gui",
     "libs/sotos-testlib",
+    "tests/integration",
+    "tests/security",
+    "tests/posix",
+    "tests/deception",
 ]
 
 [profile.dev]
