@@ -28,6 +28,7 @@ mod pool;
 mod sched;
 mod shm;
 mod svc_registry;
+mod sot;
 mod sync;
 mod syscall;
 pub mod trace;
