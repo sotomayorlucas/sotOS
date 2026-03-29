@@ -268,3 +268,17 @@ pub fn domain_lookup(id: u32) -> bool {
     let table = DOMAINS.lock();
     table.slots.iter().any(|s| s.as_ref().map_or(false, |d| d.id == id))
 }
+
+/// Get the entry capability for a domain (its IPC endpoint).
+/// Returns the entry_cap if set, or Err if domain not found.
+pub fn domain_entry_cap(id: u32) -> Result<u32, DomainError> {
+    let table = DOMAINS.lock();
+    for slot in table.slots.iter() {
+        if let Some(d) = slot {
+            if d.id == id {
+                return d.entry_cap.ok_or(DomainError::InvalidState);
+            }
+        }
+    }
+    Err(DomainError::NotFound)
+}

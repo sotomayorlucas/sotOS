@@ -74,7 +74,7 @@ fn write_reply_to_frame(frame: &mut TrapFrame, reply: &Message) {
 /// Resolve a domain's entry endpoint to a raw endpoint id.
 /// Returns the raw endpoint handle or writes an error to the frame.
 fn resolve_domain_endpoint(frame: &mut TrapFrame, proxy_domain: u32) -> Option<u32> {
-    let ep_cap = domain::domain_entry_cap(proxy_domain)?;
+    let ep_cap = domain::domain_entry_cap(proxy_domain).ok()?;
     match cap::validate(ep_cap, Rights::READ.or(Rights::WRITE)) {
         Ok(CapObject::Endpoint { id }) => Some(id),
         _ => {
