@@ -73,7 +73,8 @@ impl CapObjectAdapter {
             CapObject::Notification { .. } => SOType::Notification,
             CapObject::Domain { .. } => SOType::Domain,
             CapObject::AddrSpace { .. } => SOType::AddrSpace,
-            CapObject::Null => SOType::Capability, // Null slot maps to Capability type
+            CapObject::Interposed { .. } => SOType::Capability,
+            CapObject::Null => SOType::Capability,
         }
     }
 }
