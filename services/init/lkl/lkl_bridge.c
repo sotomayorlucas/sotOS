@@ -28,10 +28,60 @@ static char g_path_buf[4096];
 static char g_data_buf[4096];
 static char g_stat_buf[256];
 
-static int lkl_ready = 0;
+static volatile int lkl_ready = 0;
+
+#ifdef HAS_LKL
+static struct lkl_host_operations g_host_ops;
+
+/* Boot thread: runs lkl_start_kernel on a separate sotOS thread so init
+ * can continue to the shell while the Linux kernel boots in background. */
+static void lkl_boot_thread_fn(void *arg)
+{
+    (void)arg;
+    serial_puts("[lkl-boot] starting kernel (background)...\n");
+    int rc = lkl_start_kernel("mem=64M loglevel=3");
+    if (rc < 0) {
+        serial_puts("[lkl-boot] lkl_start_kernel FAILED\n");
+        sys_thread_exit();
+    }
+    serial_puts("[lkl-boot] Linux kernel running!\n");
+
+    /* Smoke test */
+    struct { char s[65]; char n[65]; char r[65]; char v[65]; char m[65]; char d[65]; } uts;
+    memset(&uts, 0, sizeof(uts));
+    long params[6] = {(long)&uts, 0, 0, 0, 0, 0};
+    long urc = lkl_syscall(160, params);
+    if (urc == 0) {
+        serial_puts("[lkl-boot] uname: ");
+        serial_puts(uts.s);
+        serial_puts(" ");
+        serial_puts(uts.r);
+        serial_puts("\n");
+    }
+
+    lkl_ready = 1;
+    serial_puts("[lkl-boot] ready — forwarding enabled\n");
+    sys_thread_exit();
+}
+
+/* Boot thread entry: naked asm stub for stack alignment + call. */
+static volatile uint64_t boot_thread_fn_ptr;
+__asm__(
+    ".globl lkl_boot_trampoline\n"
+    "lkl_boot_trampoline:\n"
+    "    and $-16, %rsp\n"
+    "    xor %edi, %edi\n"           /* arg = NULL */
+    "    movabs $boot_thread_fn_ptr, %rax\n"
+    "    movq (%rax), %rax\n"
+    "    call *%rax\n"
+    "    ud2\n"
+);
+extern void lkl_boot_trampoline(void);
+#endif
 
 /* ---------------------------------------------------------------
- * lkl_bridge_init — called once from Rust main.rs at boot
+ * lkl_bridge_init — called once from Rust main.rs at boot.
+ * Returns immediately. LKL boots in background thread.
  * --------------------------------------------------------------- */
 int lkl_bridge_init(void)
 {
@@ -42,44 +92,44 @@ int lkl_bridge_init(void)
     }
 
 #ifdef HAS_LKL
-    static struct lkl_host_operations host_ops;
-    volatile char *p = (volatile char *)&host_ops;
-    for (unsigned long i = 0; i < sizeof(host_ops); i++) p[i] = 0;
-    host_ops_init(&host_ops);
+    volatile char *p = (volatile char *)&g_host_ops;
+    for (unsigned long i = 0; i < sizeof(g_host_ops); i++) p[i] = 0;
+    host_ops_init(&g_host_ops);
 
-    serial_puts("[lkl-bridge] starting Linux kernel...\n");
-    int rc = lkl_init(&host_ops);
+    int rc = lkl_init(&g_host_ops);
     if (rc < 0) {
         serial_puts("[lkl-bridge] lkl_init failed\n");
         return rc;
     }
+    serial_puts("[lkl-bridge] lkl_init OK, spawning boot thread...\n");
 
-    rc = lkl_start_kernel("mem=64M loglevel=3");
-    if (rc < 0) {
-        serial_puts("[lkl-bridge] lkl_start_kernel failed\n");
-        return rc;
+    /* Spawn boot thread: allocate 64KB stack, create thread */
+    boot_thread_fn_ptr = (uint64_t)lkl_boot_thread_fn;
+    #define LKL_BOOT_STACK_BASE 0x34200000ULL
+    #define LKL_BOOT_STACK_PAGES 16
+    for (int i = 0; i < LKL_BOOT_STACK_PAGES; i++) {
+        uint64_t frame = sys_frame_alloc();
+        if ((int64_t)frame < 0) {
+            serial_puts("[lkl-bridge] stack frame_alloc failed\n");
+            return -12;
+        }
+        sys_map(LKL_BOOT_STACK_BASE + i * 0x1000, frame, 2 /* MAP_WRITABLE */);
     }
-    serial_puts("[lkl-bridge] Linux kernel running\n");
-
-    /* Smoke test */
-    struct { char s[65]; char n[65]; char r[65]; char v[65]; char m[65]; char d[65]; } uts;
-    memset(&uts, 0, sizeof(uts));
-    long params[6] = {(long)&uts, 0, 0, 0, 0, 0};
-    long urc = lkl_syscall(160 /* __lkl__NR_uname */, params);
-    if (urc == 0) {
-        serial_puts("[lkl-bridge] uname: ");
-        serial_puts(uts.s);
-        serial_puts(" ");
-        serial_puts(uts.r);
-        serial_puts("\n");
+    uint64_t stack_top = LKL_BOOT_STACK_BASE + LKL_BOOT_STACK_PAGES * 0x1000;
+    int64_t tid = sys_thread_create(
+        (uint64_t)lkl_boot_trampoline, stack_top, 0);
+    if (tid < 0) {
+        serial_puts("[lkl-bridge] thread_create failed\n");
+        return (int)tid;
     }
-
-    lkl_ready = 1;
-#else
-    serial_puts("[lkl-bridge] stub mode (no HAS_LKL)\n");
-    lkl_ready = 0;
-#endif
+    serial_puts("[lkl-bridge] boot thread spawned (tid=");
+    serial_put_dec((uint64_t)tid);
+    serial_puts("), init continues\n");
     return 0;
+#else
+    serial_puts("[lkl-bridge] stub mode\n");
+    return 0;
+#endif
 }
 
 /* ---------------------------------------------------------------

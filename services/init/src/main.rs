@@ -138,10 +138,6 @@ pub(crate) static LUCAS_EP_CAP: AtomicU64 = AtomicU64::new(0);
 /// Net service IPC endpoint cap — looked up via svc_lookup("net").
 pub(crate) static NET_EP_CAP: AtomicU64 = AtomicU64::new(0);
 
-/// LKL server IPC endpoint cap — looked up via svc_lookup("lkl").
-/// When non-zero, child_handler forwards syscalls to lkl-server (real Linux 6.6 kernel)
-/// instead of using the built-in LUCAS emulation.
-pub(crate) static LKL_EP_CAP: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Root capability indices (must match kernel create_init_caps() order)
@@ -273,7 +269,10 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // --- Phase 5b: Initialize LKL (Linux 6.6 kernel as in-process backend) ---
+    // --- Phase 5b: LKL (Linux 6.6 kernel as in-process backend) ---
+    // LKL fusion requires SMP (-smp 2+) — kernel threads starve on single CPU.
+    // On single CPU, LKL stays dormant (LKL_READY=false, all syscalls go to LUCAS).
+    // To enable: boot with -smp 2 and LKL auto-activates when kernel finishes booting.
     lkl::init();
 
     // --- Phase 6: Userspace process spawning ---
