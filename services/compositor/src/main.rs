@@ -995,6 +995,17 @@ fn compose() {
             let close_x = tl.x + tl.width as i32 - 20;
             let close_y = tl.y - TITLE_BAR_HEIGHT as i32 + 4;
             fb.fill_rect(close_x, close_y, 16, 16, 0xFFFF5555);
+            // "X" on close button
+            fb.draw_text(close_x + 4, close_y + 4, b"x", 0xFFFFFFFF);
+
+            // Title text in the title bar.
+            let text_x = tl.x + 6;
+            let text_y = tl.y - TITLE_BAR_HEIGHT as i32 + 8;
+            let max_chars = ((tl.width as i32 - 30) / 8).max(0) as usize;
+            let len = tl.title_len.min(max_chars);
+            if len > 0 {
+                fb.draw_text(text_x, text_y, &tl.title[..len], 0xFFEEEEEE);
+            }
 
             // Find the surface and its buffer.
             let mut found_buffer = false;
